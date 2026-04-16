@@ -109,6 +109,7 @@ class WebRTCClient: NSObject {
 
   func muteAudio(_ mute: Bool) {
     localAudioTrack?.isEnabled = !mute
+    NSLog("[WebRTC] Local mic %@", mute ? "muted" : "live")
   }
 
   func close() {

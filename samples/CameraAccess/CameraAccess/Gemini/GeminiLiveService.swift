@@ -22,6 +22,8 @@ class GeminiLiveService: ObservableObject {
   var onOutputTranscription: ((String) -> Void)?
   var onToolCall: ((GeminiToolCall) -> Void)?
   var onToolCallCancellation: ((GeminiToolCallCancellation) -> Void)?
+  var onSocketOpened: (() -> Void)?
+  var onSocketClosed: ((String?) -> Void)?
 
   // Latency tracking
   private var lastUserSpeechEnd: Date?
@@ -33,6 +35,9 @@ class GeminiLiveService: ObservableObject {
   private let delegate = WebSocketDelegate()
   private var urlSession: URLSession!
   private let sendQueue = DispatchQueue(label: "gemini.send", qos: .userInitiated)
+  private var latestVideoFrameBase64: String?
+
+  var lastVideoFrameBase64: String? { latestVideoFrameBase64 }
 
   init() {
     let config = URLSessionConfiguration.default
@@ -54,6 +59,7 @@ class GeminiLiveService: ObservableObject {
       self.delegate.onOpen = { [weak self] protocol_ in
         guard let self else { return }
         Task { @MainActor in
+          self.onSocketOpened?()
           self.connectionState = .settingUp
           self.sendSetupMessage()
           self.startReceiving()
@@ -67,6 +73,7 @@ class GeminiLiveService: ObservableObject {
           self.resolveConnect(success: false)
           self.connectionState = .disconnected
           self.isModelSpeaking = false
+          self.onSocketClosed?("Connection closed (code \(code.rawValue): \(reasonStr))")
           self.onDisconnected?("Connection closed (code \(code.rawValue): \(reasonStr))")
         }
       }
@@ -78,6 +85,7 @@ class GeminiLiveService: ObservableObject {
           self.resolveConnect(success: false)
           self.connectionState = .error(msg)
           self.isModelSpeaking = false
+          self.onSocketClosed?(msg)
           self.onDisconnected?(msg)
         }
       }
@@ -110,6 +118,8 @@ class GeminiLiveService: ObservableObject {
     delegate.onError = nil
     onToolCall = nil
     onToolCallCancellation = nil
+    onSocketOpened = nil
+    onSocketClosed = nil
     connectionState = .disconnected
     isModelSpeaking = false
     resolveConnect(success: false)
@@ -136,6 +146,7 @@ class GeminiLiveService: ObservableObject {
     sendQueue.async { [weak self] in
       guard let jpegData = image.jpegData(compressionQuality: GeminiConfig.videoJPEGQuality) else { return }
       let base64 = jpegData.base64EncodedString()
+      self?.latestVideoFrameBase64 = base64
       let json: [String: Any] = [
         "realtimeInput": [
           "video": [
@@ -206,7 +217,17 @@ class GeminiLiveService: ObservableObject {
           let string = String(data: data, encoding: .utf8) else {
       return
     }
-    webSocketTask?.send(.string(string)) { _ in }
+    webSocketTask?.send(.string(string)) { [weak self] error in
+      guard let self, let error else { return }
+      Task { @MainActor in
+        NSLog("[Gemini] WebSocket send failed: %@", error.localizedDescription)
+        self.resolveConnect(success: false)
+        self.connectionState = .error("WebSocket send failed: \(error.localizedDescription)")
+        self.isModelSpeaking = false
+        self.onSocketClosed?(error.localizedDescription)
+        self.onDisconnected?(error.localizedDescription)
+      }
+    }
   }
 
   private func startReceiving() {
@@ -248,6 +269,20 @@ class GeminiLiveService: ObservableObject {
       return
     }
 
+    // Server-provided error payload
+    if let errorObj = json["error"] as? [String: Any] {
+      let status = errorObj["status"] as? String ?? "UNKNOWN"
+      let message = errorObj["message"] as? String ?? "Unknown Gemini server error"
+      let full = "Gemini setup error [\(status)]: \(message)"
+      NSLog("[Gemini] %@", full)
+      connectionState = .error(full)
+      isModelSpeaking = false
+      resolveConnect(success: false)
+      onSocketClosed?(full)
+      onDisconnected?(full)
+      return
+    }
+
     // Setup complete
     if json["setupComplete"] != nil {
       connectionState = .ready
@@ -261,6 +296,7 @@ class GeminiLiveService: ObservableObject {
       let seconds = timeLeft?["seconds"] as? Int ?? 0
       connectionState = .disconnected
       isModelSpeaking = false
+      onSocketClosed?("Server closing (time left: \(seconds)s)")
       onDisconnected?("Server closing (time left: \(seconds)s)")
       return
     }

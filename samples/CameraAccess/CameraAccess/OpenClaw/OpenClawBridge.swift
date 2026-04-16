@@ -60,7 +60,7 @@ class OpenClawBridge: ObservableObject {
   func resetSession() {
     sessionKey = OpenClawBridge.newSessionKey()
     conversationHistory = []
-    NSLog("[OpenClaw] New session: %@", sessionKey)
+    NSLog("[OpenClaw] New agent session started")
   }
 
   private static func newSessionKey() -> String {
@@ -101,7 +101,7 @@ class OpenClawBridge: ObservableObject {
       "stream": false
     ]
 
-    NSLog("[OpenClaw] Sending %d messages in conversation", conversationHistory.count)
+    NSLog("[OpenClaw] Sending conversation with %d messages", conversationHistory.count)
 
     do {
       request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -110,8 +110,7 @@ class OpenClawBridge: ObservableObject {
 
       guard let statusCode = httpResponse?.statusCode, (200...299).contains(statusCode) else {
         let code = httpResponse?.statusCode ?? 0
-        let bodyStr = String(data: data, encoding: .utf8) ?? "no body"
-        NSLog("[OpenClaw] Chat failed: HTTP %d - %@", code, String(bodyStr.prefix(200)))
+        NSLog("[OpenClaw] Chat failed with HTTP %d", code)
         lastToolCallStatus = .failed(toolName, "HTTP \(code)")
         return .failure("Agent returned HTTP \(code)")
       }
@@ -123,14 +122,14 @@ class OpenClawBridge: ObservableObject {
          let content = message["content"] as? String {
         // Append assistant response to history for continuity
         conversationHistory.append(["role": "assistant", "content": content])
-        NSLog("[OpenClaw] Agent result: %@", String(content.prefix(200)))
+        NSLog("[OpenClaw] Agent response received")
         lastToolCallStatus = .completed(toolName)
         return .success(content)
       }
 
       let raw = String(data: data, encoding: .utf8) ?? "OK"
       conversationHistory.append(["role": "assistant", "content": raw])
-      NSLog("[OpenClaw] Agent raw: %@", String(raw.prefix(200)))
+      NSLog("[OpenClaw] Agent raw response received")
       lastToolCallStatus = .completed(toolName)
       return .success(raw)
     } catch {

@@ -2,7 +2,11 @@ import Foundation
 import WebRTC
 
 enum WebRTCConfig {
-  static let signalingServerURL = Secrets.webrtcSignalingURL
+  static var signalBaseURL: String { GeminiConfig.signalBaseURL }
+
+  static var signalingServerURL: String {
+    normalizedWebSocketURL(from: signalBaseURL)
+  }
 
   static let stunServers = [
     "stun:stun.l.google.com:19302",
@@ -13,15 +17,14 @@ enum WebRTCConfig {
   static let maxFramerate = 24
 
   static var isConfigured: Bool {
-    return !signalingServerURL.isEmpty
-      && signalingServerURL != "ws://YOUR_MAC_IP:8080"
+    let trimmed = signalBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !trimmed.isEmpty
+      && !trimmed.contains("YOUR_")
   }
 
   /// Derive the HTTP base URL from the WebSocket signaling URL.
   static var httpBaseURL: String {
-    return signalingServerURL
-      .replacingOccurrences(of: "wss://", with: "https://")
-      .replacingOccurrences(of: "ws://", with: "http://")
+    normalizedHTTPURL(from: signalBaseURL)
   }
 
   /// Fetch TURN credentials from the signaling server.
@@ -63,5 +66,35 @@ enum WebRTCConfig {
     }
 
     return servers
+  }
+
+  private static func normalizedWebSocketURL(from raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return trimmed }
+    if trimmed.hasPrefix("wss://") || trimmed.hasPrefix("ws://") {
+      return trimmed
+    }
+    if trimmed.hasPrefix("https://") {
+      return "wss://" + String(trimmed.dropFirst("https://".count))
+    }
+    if trimmed.hasPrefix("http://") {
+      return "ws://" + String(trimmed.dropFirst("http://".count))
+    }
+    return "wss://\(trimmed)"
+  }
+
+  private static func normalizedHTTPURL(from raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return trimmed }
+    if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
+      return trimmed
+    }
+    if trimmed.hasPrefix("wss://") {
+      return "https://" + String(trimmed.dropFirst("wss://".count))
+    }
+    if trimmed.hasPrefix("ws://") {
+      return "http://" + String(trimmed.dropFirst("ws://".count))
+    }
+    return "https://\(trimmed)"
   }
 }
