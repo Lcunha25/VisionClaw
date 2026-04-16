@@ -2,7 +2,8 @@ import Foundation
 
 enum GeminiConfig {
   static let websocketBaseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-  static let model = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+  // Use a model that exists for this API key and supports native audio interactions.
+  static let model = "models/gemini-2.5-flash-native-audio-latest"
 
   static let inputAudioSampleRate: Double = 16000
   static let outputAudioSampleRate: Double = 24000
@@ -15,37 +16,29 @@ enum GeminiConfig {
   static var systemInstruction: String { SettingsManager.shared.geminiSystemPrompt }
 
   static let defaultSystemInstruction = """
-    You are an AI assistant for someone wearing Meta Ray-Ban smart glasses. You can see through their camera and have a voice conversation. Keep responses concise and natural.
+    You are a visual SOP auditing model for smart glasses sessions.
 
-    CRITICAL: You have NO memory, NO storage, and NO ability to take actions on your own. You cannot remember things, keep lists, set reminders, search the web, send messages, or do anything persistent. You are ONLY a voice interface.
+    Your job is to analyze incoming camera frames and provide concise audit observations about the current SOP step.
 
-    You have exactly ONE tool: execute. This connects you to a powerful personal assistant that can do anything -- send messages, search the web, manage lists, set reminders, create notes, research topics, control smart home devices, interact with apps, and much more.
-
-    ALWAYS use execute when the user asks you to:
-    - Send a message to someone (any platform: WhatsApp, Telegram, iMessage, Slack, etc.)
-    - Search or look up anything (web, local info, facts, news)
-    - Add, create, or modify anything (shopping lists, reminders, notes, todos, events)
-    - Research, analyze, or draft anything
-    - Control or interact with apps, devices, or services
-    - Remember or store any information for later
-
-    Be detailed in your task description. Include all relevant context: names, content, platforms, quantities, etc. The assistant works better with complete information.
-
-    NEVER pretend to do these things yourself.
-
-    IMPORTANT: Before calling execute, ALWAYS speak a brief acknowledgment first. For example:
-    - "Sure, let me add that to your shopping list." then call execute.
-    - "Got it, searching for that now." then call execute.
-    - "On it, sending that message." then call execute.
-    Never call execute silently -- the user needs verbal confirmation that you heard them and are working on it. The tool may take several seconds to complete, so the acknowledgment lets them know something is happening.
-
-    For messages, confirm recipient and content before delegating unless clearly urgent.
+    Rules:
+    - Focus only on visual evidence in the frame.
+    - Do not claim actions were completed unless visually supported.
+    - If evidence is insufficient, state uncertainty clearly.
+    - Keep responses short, factual, and audit-oriented.
+    - Do not provide general assistant/task-execution behavior.
     """
 
   // User-configurable values (Settings screen overrides, falling back to Secrets.swift)
+  static var deviceID: String { SettingsManager.shared.deviceID }
+  static var workerLoginCode: String { SettingsManager.shared.workerLoginCode }
   static var apiKey: String { SettingsManager.shared.geminiAPIKey }
+  static var opsBaseURL: String { SettingsManager.shared.opsBaseURL }
+  static var adminBaseURL: String { SettingsManager.shared.adminBaseURL }
+  static var signalBaseURL: String { SettingsManager.shared.signalBaseURL }
   static var openClawHost: String { SettingsManager.shared.openClawHost }
   static var openClawPort: Int { SettingsManager.shared.openClawPort }
+  static var openClawTailscaleIP: String { SettingsManager.shared.openClawTailscaleIP }
+  static var openClawBearerToken: String { SettingsManager.shared.openClawBearerToken }
   static var openClawHookToken: String { SettingsManager.shared.openClawHookToken }
   static var openClawGatewayToken: String { SettingsManager.shared.openClawGatewayToken }
 
@@ -56,6 +49,16 @@ enum GeminiConfig {
 
   static var isConfigured: Bool {
     return apiKey != "YOUR_GEMINI_API_KEY" && !apiKey.isEmpty
+  }
+
+  static var isOpsConfigured: Bool {
+    let trimmed = opsBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !trimmed.isEmpty && !trimmed.contains("YOUR_")
+  }
+
+  static var isAdminConfigured: Bool {
+    let trimmed = adminBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !trimmed.isEmpty && !trimmed.contains("YOUR_")
   }
 
   static var isOpenClawConfigured: Bool {

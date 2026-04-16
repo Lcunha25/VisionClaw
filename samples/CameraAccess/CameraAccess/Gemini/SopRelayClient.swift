@@ -1,0 +1,1609 @@
+import Foundation
+
+private extension KeyedDecodingContainer {
+  func decodeFirstString(forKeys keys: [K]) throws -> String? {
+    for key in keys {
+      if let stringValue = try decodeIfPresent(String.self, forKey: key),
+         !stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return stringValue
+      }
+    }
+    return nil
+  }
+
+  func decodeLossyInt(forKeys keys: [K]) throws -> Int? {
+    for key in keys {
+      if let intValue = try? decodeIfPresent(Int.self, forKey: key) {
+        return intValue
+      }
+      if let stringValue = try? decodeIfPresent(String.self, forKey: key),
+         !stringValue.isEmpty {
+        if let intValue = Int(stringValue) {
+          return intValue
+        }
+        if let doubleValue = Double(stringValue) {
+          return Int(doubleValue.rounded(.down))
+        }
+      }
+      if let doubleValue = try? decodeIfPresent(Double.self, forKey: key) {
+        return Int(doubleValue.rounded(.down))
+      }
+    }
+    return nil
+  }
+
+  func decodeLossyBool(forKeys keys: [K]) throws -> Bool? {
+    for key in keys {
+      if let boolValue = try? decodeIfPresent(Bool.self, forKey: key) {
+        return boolValue
+      }
+      if let intValue = try? decodeIfPresent(Int.self, forKey: key) {
+        return intValue != 0
+      }
+      if let stringValue = try? decodeIfPresent(String.self, forKey: key),
+         !stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        switch stringValue.lowercased() {
+        case "true", "1", "yes", "active":
+          return true
+        case "false", "0", "no", "inactive":
+          return false
+        default:
+          continue
+        }
+      }
+    }
+    return nil
+  }
+}
+
+private func canonicalLucasSopTitle(for sopID: String) -> String? {
+  switch sopID {
+  case "22222222-2222-2222-2222-222222222222":
+    return "Cold Chain Verification SOP"
+  case "a1000001-0000-0000-0000-000000000001":
+    return "Burger Assembly"
+  case "a1000002-0000-0000-0000-000000000002":
+    return "Fries Assembly"
+  case "a1000003-0000-0000-0000-000000000003":
+    return "Drink Prep"
+  default:
+    return nil
+  }
+}
+
+private func canonicalLucasPackageTitle(for packageID: String?) -> String? {
+  guard let packageID else { return nil }
+  switch packageID {
+  case "33333333-3333-3333-3333-333333333333":
+    return "Inbound Cold Chain Audit"
+  case "b2000001-0000-0000-0000-000000000001":
+    return "QSR Value Meal Order"
+  default:
+    return nil
+  }
+}
+
+private func canonicalLucasSopSortOrder(for sopID: String) -> Int? {
+  switch sopID {
+  case "22222222-2222-2222-2222-222222222222":
+    return 1
+  case "a1000001-0000-0000-0000-000000000001":
+    return 2
+  case "a1000002-0000-0000-0000-000000000002":
+    return 3
+  case "a1000003-0000-0000-0000-000000000003":
+    return 4
+  default:
+    return nil
+  }
+}
+
+struct BackendWorker: Identifiable, Decodable, Equatable {
+  let id: String
+  let loginCode: String?
+  let displayName: String
+  let role: String?
+  let status: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case loginCode = "login_code"
+    case loginCodeCamel = "loginCode"
+    case displayName = "display_name"
+    case displayNameCamel = "displayName"
+    case name
+    case role
+    case status
+    case active
+  }
+
+  init(
+    id: String,
+    loginCode: String?,
+    displayName: String,
+    role: String?,
+    status: String?
+  ) {
+    self.id = id
+    self.loginCode = loginCode
+    self.displayName = displayName
+    self.role = role
+    self.status = status
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    loginCode = try container.decodeFirstString(forKeys: [.loginCode, .loginCodeCamel])
+    displayName =
+      try container.decodeFirstString(forKeys: [.displayName, .displayNameCamel, .name])
+      ?? "Unassigned Worker"
+    role = try container.decodeIfPresent(String.self, forKey: .role)
+    status =
+      try container.decodeIfPresent(String.self, forKey: .status)
+      ?? ((try container.decodeLossyBool(forKeys: [.active]) ?? false) ? "active" : nil)
+  }
+}
+
+struct BackendDevice: Identifiable, Decodable, Equatable {
+  let id: String
+  let workerID: String?
+  let platform: String?
+  let deviceLabel: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case workerID = "worker_id"
+    case workerIDCamel = "workerId"
+    case platform
+    case deviceLabel = "device_label"
+    case deviceLabelCamel = "deviceLabel"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    workerID = try container.decodeFirstString(forKeys: [.workerID, .workerIDCamel])
+    platform = try container.decodeIfPresent(String.self, forKey: .platform)
+    deviceLabel = try container.decodeFirstString(forKeys: [.deviceLabel, .deviceLabelCamel])
+  }
+}
+
+struct BackendPackage: Identifiable, Decodable, Equatable {
+  let id: String
+  let title: String
+  let description: String?
+  let outcome: String?
+  let version: Int?
+  let status: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case title
+    case name
+    case description
+    case outcome
+    case version
+    case status
+  }
+
+  init(
+    id: String,
+    title: String,
+    description: String?,
+    outcome: String?,
+    version: Int?,
+    status: String?
+  ) {
+    self.id = id
+    self.title = title
+    self.description = description
+    self.outcome = outcome
+    self.version = version
+    self.status = status
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    title =
+      try container.decodeIfPresent(String.self, forKey: .title)
+      ?? container.decodeIfPresent(String.self, forKey: .name)
+      ?? "Untitled Package"
+    description = try container.decodeIfPresent(String.self, forKey: .description)
+    outcome = try container.decodeIfPresent(String.self, forKey: .outcome)
+    version = try container.decodeLossyInt(forKeys: [.version])
+    status = try container.decodeIfPresent(String.self, forKey: .status)
+  }
+}
+
+struct BackendAssignedPackage: Identifiable, Decodable, Equatable {
+  let id: String
+  let title: String
+  let description: String?
+  let outcome: String?
+  let version: Int?
+  let shiftName: String?
+  let active: Bool?
+  let packageRunID: String?
+  let packageRunStatus: String?
+  let packageRunStartedAt: String?
+  let packageRunCompletedAt: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case packageID = "package_id"
+    case packageIDCamel = "packageId"
+    case title
+    case packageTitle = "package_title"
+    case packageTitleCamel = "packageTitle"
+    case description
+    case packageDescription = "package_description"
+    case packageDescriptionCamel = "packageDescription"
+    case outcome
+    case packageOutcome = "package_outcome"
+    case packageOutcomeCamel = "packageOutcome"
+    case version
+    case packageVersion = "package_version"
+    case packageVersionCamel = "packageVersion"
+    case shiftName = "shift_name"
+    case shiftNameCamel = "shiftName"
+    case active
+    case packageRunID = "package_run_id"
+    case packageRunIDCamel = "packageRunId"
+    case packageRunStatus = "package_run_status"
+    case packageRunStatusCamel = "packageRunStatus"
+    case packageRunStartedAt = "package_run_started_at"
+    case packageRunStartedAtCamel = "packageRunStartedAt"
+    case packageRunCompletedAt = "package_run_completed_at"
+    case packageRunCompletedAtCamel = "packageRunCompletedAt"
+  }
+
+  init(
+    id: String,
+    title: String,
+    description: String?,
+    outcome: String?,
+    version: Int?,
+    shiftName: String?,
+    active: Bool?,
+    packageRunID: String?,
+    packageRunStatus: String?,
+    packageRunStartedAt: String?,
+    packageRunCompletedAt: String?
+  ) {
+    self.id = id
+    self.title = title
+    self.description = description
+    self.outcome = outcome
+    self.version = version
+    self.shiftName = shiftName
+    self.active = active
+    self.packageRunID = packageRunID
+    self.packageRunStatus = packageRunStatus
+    self.packageRunStartedAt = packageRunStartedAt
+    self.packageRunCompletedAt = packageRunCompletedAt
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let rawID =
+      try container.decodeFirstString(forKeys: [.id, .packageID, .packageIDCamel])
+      ?? UUID().uuidString
+    let rawTitle =
+      try container.decodeFirstString(forKeys: [.title, .packageTitle, .packageTitleCamel])
+      ?? canonicalLucasPackageTitle(for: rawID)
+      ?? "Untitled Package"
+
+    self.init(
+      id: rawID,
+      title: rawTitle,
+      description: try container.decodeFirstString(forKeys: [.description, .packageDescription, .packageDescriptionCamel]),
+      outcome: try container.decodeFirstString(forKeys: [.outcome, .packageOutcome, .packageOutcomeCamel]),
+      version: try container.decodeLossyInt(forKeys: [.version, .packageVersion, .packageVersionCamel]),
+      shiftName: try container.decodeFirstString(forKeys: [.shiftName, .shiftNameCamel]),
+      active: try container.decodeLossyBool(forKeys: [.active]),
+      packageRunID: try container.decodeFirstString(forKeys: [.packageRunID, .packageRunIDCamel]),
+      packageRunStatus: try container.decodeFirstString(forKeys: [.packageRunStatus, .packageRunStatusCamel]),
+      packageRunStartedAt: try container.decodeFirstString(forKeys: [.packageRunStartedAt, .packageRunStartedAtCamel]),
+      packageRunCompletedAt: try container.decodeFirstString(forKeys: [.packageRunCompletedAt, .packageRunCompletedAtCamel])
+    )
+  }
+}
+
+struct BackendShift: Identifiable, Decodable, Equatable {
+  let id: String
+  let packageID: String?
+  let shiftName: String?
+  let startsAt: String?
+  let endsAt: String?
+  let active: Bool?
+  let package: BackendPackage?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case packageID = "package_id"
+    case packageIDCamel = "packageId"
+    case shiftName = "shift_name"
+    case shiftNameCamel = "shiftName"
+    case startsAt = "starts_at"
+    case startsAtCamel = "startsAt"
+    case endsAt = "ends_at"
+    case endsAtCamel = "endsAt"
+    case active
+    case package
+  }
+
+  init(
+    id: String,
+    packageID: String?,
+    shiftName: String?,
+    startsAt: String?,
+    endsAt: String?,
+    active: Bool?,
+    package: BackendPackage?
+  ) {
+    self.id = id
+    self.packageID = packageID
+    self.shiftName = shiftName
+    self.startsAt = startsAt
+    self.endsAt = endsAt
+    self.active = active
+    self.package = package
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    packageID = try container.decodeFirstString(forKeys: [.packageID, .packageIDCamel])
+    shiftName = try container.decodeFirstString(forKeys: [.shiftName, .shiftNameCamel])
+    startsAt = try container.decodeFirstString(forKeys: [.startsAt, .startsAtCamel])
+    endsAt = try container.decodeFirstString(forKeys: [.endsAt, .endsAtCamel])
+    active = try container.decodeLossyBool(forKeys: [.active])
+    package = try container.decodeIfPresent(BackendPackage.self, forKey: .package)
+  }
+}
+
+struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
+  let id: String
+  let order: Int
+  let title: String
+  let description: String
+  let duration: String
+  let validation: String
+  let critical: Bool
+  let aiPrompt: String
+  let expectedObjects: [String]
+  let allowManualComplete: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case order
+    case name
+    case title
+    case label
+    case step
+    case item
+    case description
+    case duration
+    case validation
+    case critical
+    case aiPrompt = "ai_prompt"
+    case aiPromptCamel = "aiPrompt"
+    case expectedObjects = "expected_objects"
+    case expectedObjectsCamel = "expectedObjects"
+    case allowManualComplete = "allow_manual_complete"
+    case allowManualCompleteCamel = "allowManualComplete"
+  }
+
+  init(
+    id: String,
+    order: Int,
+    title: String,
+    description: String = "",
+    duration: String = "30s",
+    validation: String = "visual",
+    critical: Bool = false,
+    aiPrompt: String? = nil,
+    expectedObjects: [String] = [],
+    allowManualComplete: Bool = true
+  ) {
+    self.id = id
+    self.order = order
+    self.title = title
+    self.description = description
+    self.duration = duration
+    self.validation = validation
+    self.critical = critical
+    self.aiPrompt = aiPrompt ?? "Look at the image and confirm whether \"\(title)\" has been completed."
+    self.expectedObjects = expectedObjects
+    self.allowManualComplete = allowManualComplete
+  }
+
+  init(from decoder: Decoder) throws {
+    if let single = try? decoder.singleValueContainer(),
+       let raw = try? single.decode(String.self) {
+      self.init(
+        id: raw.lowercased().replacingOccurrences(of: "[^a-z0-9]+", with: "_", options: .regularExpression),
+        order: 0,
+        title: raw
+      )
+      return
+    }
+
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let name = try container.decodeIfPresent(String.self, forKey: .name)
+    let fallbackTitle = try container.decodeIfPresent(String.self, forKey: .title)
+    let label = try container.decodeIfPresent(String.self, forKey: .label)
+    let step = try container.decodeIfPresent(String.self, forKey: .step)
+    let item = try container.decodeIfPresent(String.self, forKey: .item)
+    let resolvedTitle = name ?? fallbackTitle ?? label ?? step ?? item ?? "Untitled Step"
+    let resolvedID =
+      try container.decodeIfPresent(String.self, forKey: .id)
+      ?? resolvedTitle.lowercased().replacingOccurrences(of: "[^a-z0-9]+", with: "_", options: .regularExpression)
+    let expectedObjects =
+      try container.decodeIfPresent([String].self, forKey: .expectedObjects)
+      ?? container.decodeIfPresent([String].self, forKey: .expectedObjectsCamel)
+      ?? []
+    self.init(
+      id: resolvedID,
+      order: try container.decodeIfPresent(Int.self, forKey: .order) ?? 0,
+      title: resolvedTitle,
+      description: try container.decodeIfPresent(String.self, forKey: .description) ?? "",
+      duration: try container.decodeIfPresent(String.self, forKey: .duration) ?? "30s",
+      validation: try container.decodeIfPresent(String.self, forKey: .validation) ?? "visual",
+      critical: try container.decodeIfPresent(Bool.self, forKey: .critical) ?? false,
+      aiPrompt:
+        try container.decodeIfPresent(String.self, forKey: .aiPrompt)
+        ?? container.decodeIfPresent(String.self, forKey: .aiPromptCamel),
+      expectedObjects: expectedObjects.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+      allowManualComplete:
+        try container.decodeIfPresent(Bool.self, forKey: .allowManualComplete)
+        ?? container.decodeIfPresent(Bool.self, forKey: .allowManualCompleteCamel)
+        ?? true
+    )
+  }
+}
+
+struct WorkerQueueItem: Identifiable, Decodable, Equatable {
+  let shiftAssignmentID: String?
+  let workerID: String?
+  let workerName: String?
+  let packageID: String?
+  let packageTitle: String?
+  let packageRunID: String?
+  let packageVersion: Int?
+  let sopID: String
+  let sopTitle: String
+  let sopVersion: Int?
+  let steps: [WorkerQueueStep]
+  let shiftName: String?
+  let sourceType: String
+  let sortOrder: Int
+  let required: Bool
+  let active: Bool?
+  let startsAt: String?
+  let endsAt: String?
+
+  var id: String { "\(packageRunID ?? packageID ?? sourceType):\(sopID)" }
+  var stepTitles: [String] { steps.map(\.title) }
+
+  private enum CodingKeys: String, CodingKey {
+    case shiftAssignmentID = "shift_assignment_id"
+    case shiftAssignmentIDCamel = "shiftAssignmentId"
+    case workerID = "worker_id"
+    case workerIDCamel = "workerId"
+    case workerName = "worker_name"
+    case workerNameCamel = "workerName"
+    case packageID = "package_id"
+    case packageIDCamel = "packageId"
+    case packageTitle = "package_title"
+    case packageTitleCamel = "packageTitle"
+    case packageRunID = "package_run_id"
+    case packageRunIDCamel = "packageRunId"
+    case packageVersion = "package_version"
+    case packageVersionCamel = "packageVersion"
+    case sopID = "sop_id"
+    case sopIDCamel = "sopId"
+    case sopTitle = "sop_title"
+    case sopTitleCamel = "sopTitle"
+    case sopVersion = "sop_version"
+    case sopVersionCamel = "sopVersion"
+    case steps
+    case shiftName = "shift_name"
+    case shiftNameCamel = "shiftName"
+    case sourceType = "source_type"
+    case sourceTypeCamel = "sourceType"
+    case sortOrder = "sort_order"
+    case sortOrderCamel = "sortOrder"
+    case required
+    case active
+    case startsAt = "starts_at"
+    case startsAtCamel = "startsAt"
+    case scheduledFor = "scheduledFor"
+    case endsAt = "ends_at"
+    case endsAtCamel = "endsAt"
+    case completedAtCamel = "completedAt"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    guard let decodedSopID = try container.decodeFirstString(forKeys: [.sopID, .sopIDCamel]) else {
+      throw DecodingError.keyNotFound(
+        CodingKeys.sopID,
+        DecodingError.Context(
+          codingPath: decoder.codingPath,
+          debugDescription: "Missing sop_id/sopId in worker queue item."
+        )
+      )
+    }
+    shiftAssignmentID = try container.decodeFirstString(forKeys: [.shiftAssignmentID, .shiftAssignmentIDCamel])
+    workerID = try container.decodeFirstString(forKeys: [.workerID, .workerIDCamel])
+    workerName = try container.decodeFirstString(forKeys: [.workerName, .workerNameCamel])
+    packageID = try container.decodeFirstString(forKeys: [.packageID, .packageIDCamel])
+    packageTitle =
+      try container.decodeFirstString(forKeys: [.packageTitle, .packageTitleCamel])
+      ?? canonicalLucasPackageTitle(for: packageID)
+    packageRunID = try container.decodeFirstString(forKeys: [.packageRunID, .packageRunIDCamel])
+    packageVersion = try container.decodeLossyInt(forKeys: [.packageVersion, .packageVersionCamel])
+    sopID = decodedSopID
+    sopTitle =
+      try container.decodeFirstString(forKeys: [.sopTitle, .sopTitleCamel])
+      ?? canonicalLucasSopTitle(for: decodedSopID)
+      ?? "Assigned SOP"
+    sopVersion = try container.decodeLossyInt(forKeys: [.sopVersion, .sopVersionCamel])
+    shiftName =
+      try container.decodeFirstString(forKeys: [.shiftName, .shiftNameCamel])
+      ?? "Morning"
+    sourceType =
+      try container.decodeFirstString(forKeys: [.sourceType, .sourceTypeCamel])
+      ?? (packageID == nil ? "standalone" : "package")
+    sortOrder =
+      try container.decodeLossyInt(forKeys: [.sortOrder, .sortOrderCamel])
+      ?? canonicalLucasSopSortOrder(for: decodedSopID)
+      ?? 0
+    required = try container.decodeLossyBool(forKeys: [.required]) ?? true
+    active = try container.decodeLossyBool(forKeys: [.active])
+    startsAt = try container.decodeFirstString(forKeys: [.startsAt, .startsAtCamel, .scheduledFor])
+    endsAt = try container.decodeFirstString(forKeys: [.endsAt, .endsAtCamel, .completedAtCamel])
+
+    if let direct = try container.decodeIfPresent([String].self, forKey: .steps) {
+      steps = direct.enumerated().map { index, title in
+        WorkerQueueStep(
+          id: "\(decodedSopID)-\(index + 1)",
+          order: index + 1,
+          title: title
+        )
+      }
+    } else if let richSteps = try container.decodeIfPresent([WorkerQueueStep].self, forKey: .steps) {
+      steps = richSteps.enumerated().map { index, step in
+        WorkerQueueStep(
+          id: step.id,
+          order: step.order == 0 ? index + 1 : step.order,
+          title: step.title,
+          description: step.description,
+          duration: step.duration,
+          validation: step.validation,
+          critical: step.critical,
+          aiPrompt: step.aiPrompt,
+          expectedObjects: step.expectedObjects,
+          allowManualComplete: step.allowManualComplete
+        )
+      }
+    } else {
+      steps = []
+    }
+  }
+}
+
+struct BootstrapPayload: Decodable, Equatable {
+  let worker: BackendWorker
+  let device: BackendDevice?
+  let shift: BackendShift?
+  let queue: [WorkerQueueItem]
+  let assignedPackages: [BackendAssignedPackage]
+  let workerSessionToken: String?
+  let workerSessionExpiresAt: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case worker
+    case device
+    case shift
+    case queue
+    case assignedPackages = "assigned_packages"
+    case assignedPackagesCamel = "assignedPackages"
+    case packages
+    case workerSessionToken = "worker_session_token"
+    case workerSessionTokenCamel = "workerSessionToken"
+    case workerToken = "worker_token"
+    case sessionToken = "session_token"
+    case sessionTokenCamel = "sessionToken"
+    case token
+    case workerSessionExpiresAt = "worker_session_expires_at"
+    case workerSessionExpiresAtCamel = "workerSessionExpiresAt"
+    case sessionExpiresAt = "session_expires_at"
+    case sessionExpiresAtCamel = "sessionExpiresAt"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    worker = try container.decode(BackendWorker.self, forKey: .worker)
+    device = try container.decodeIfPresent(BackendDevice.self, forKey: .device)
+    shift = try container.decodeIfPresent(BackendShift.self, forKey: .shift)
+    queue = try container.decodeIfPresent([WorkerQueueItem].self, forKey: .queue) ?? []
+    let directAssignedPackages =
+      try container.decodeIfPresent([BackendAssignedPackage].self, forKey: .assignedPackages)
+    let camelAssignedPackages =
+      try container.decodeIfPresent([BackendAssignedPackage].self, forKey: .assignedPackagesCamel)
+    let packageList =
+      try container.decodeIfPresent([BackendAssignedPackage].self, forKey: .packages)
+    assignedPackages =
+      directAssignedPackages
+      ?? camelAssignedPackages
+      ?? packageList
+      ?? BootstrapPayload.deriveAssignedPackages(shift: shift, queue: queue)
+
+    let tokenFromWorkerSession =
+      try container.decodeIfPresent(String.self, forKey: .workerSessionToken)
+    let tokenFromWorkerSessionCamel =
+      try container.decodeIfPresent(String.self, forKey: .workerSessionTokenCamel)
+    let tokenFromWorkerToken =
+      try container.decodeIfPresent(String.self, forKey: .workerToken)
+    let tokenFromSession =
+      try container.decodeIfPresent(String.self, forKey: .sessionToken)
+    let tokenFromSessionCamel =
+      try container.decodeIfPresent(String.self, forKey: .sessionTokenCamel)
+    let tokenFromGeneric =
+      try container.decodeIfPresent(String.self, forKey: .token)
+    workerSessionToken =
+      tokenFromWorkerSession
+      ?? tokenFromWorkerSessionCamel
+      ?? tokenFromWorkerToken
+      ?? tokenFromSession
+      ?? tokenFromSessionCamel
+      ?? tokenFromGeneric
+
+    let expiresFromWorkerSession =
+      try container.decodeIfPresent(String.self, forKey: .workerSessionExpiresAt)
+    let expiresFromSession =
+      try container.decodeIfPresent(String.self, forKey: .sessionExpiresAt)
+    let expiresFromWorkerSessionCamel =
+      try container.decodeIfPresent(String.self, forKey: .workerSessionExpiresAtCamel)
+    let expiresFromSessionCamel =
+      try container.decodeIfPresent(String.self, forKey: .sessionExpiresAtCamel)
+    workerSessionExpiresAt =
+      expiresFromWorkerSession
+      ?? expiresFromSession
+      ?? expiresFromWorkerSessionCamel
+      ?? expiresFromSessionCamel
+  }
+
+  private static func deriveAssignedPackages(
+    shift: BackendShift?,
+    queue: [WorkerQueueItem]
+  ) -> [BackendAssignedPackage] {
+    var resolved: [BackendAssignedPackage] = []
+    var seen = Set<String>()
+
+    if let package = shift?.package {
+      let candidate = BackendAssignedPackage(
+        id: package.id,
+        title: package.title,
+        description: package.description,
+        outcome: package.outcome,
+        version: package.version,
+        shiftName: shift?.shiftName,
+        active: shift?.active,
+        packageRunID: queue.first(where: { $0.packageID == package.id })?.packageRunID,
+        packageRunStatus: nil,
+        packageRunStartedAt: nil,
+        packageRunCompletedAt: nil
+      )
+      resolved.append(candidate)
+      seen.insert(candidate.id)
+    }
+
+    for item in queue where item.packageID != nil {
+      guard let packageID = item.packageID, !seen.contains(packageID) else { continue }
+      resolved.append(
+        BackendAssignedPackage(
+          id: packageID,
+          title: item.packageTitle ?? "Assigned Package",
+          description: nil,
+          outcome: nil,
+          version: item.packageVersion,
+          shiftName: item.shiftName ?? shift?.shiftName,
+          active: item.active,
+          packageRunID: item.packageRunID,
+          packageRunStatus: nil,
+          packageRunStartedAt: item.startsAt,
+          packageRunCompletedAt: item.endsAt
+        )
+      )
+      seen.insert(packageID)
+    }
+
+    return resolved
+  }
+}
+
+struct BackendExecutionSession: Identifiable, Decodable, Equatable {
+  let id: String
+  let workerID: String?
+  let deviceID: String?
+  let packageID: String?
+  let packageRunID: String?
+  let currentSopID: String?
+  let sopVersion: Int?
+  let packageVersion: Int?
+  let currentStepIndex: Int
+  let status: String
+  let helpRequested: Bool
+  let webrtcRoomCode: String?
+  let lastFrameBucket: String?
+  let lastFramePath: String?
+  let startedAt: String?
+  let endedAt: String?
+  let updatedAt: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case workerID = "worker_id"
+    case workerIDCamel = "workerId"
+    case deviceID = "device_id"
+    case deviceIDCamel = "deviceId"
+    case packageID = "package_id"
+    case packageIDCamel = "packageId"
+    case packageRunID = "package_run_id"
+    case packageRunIDCamel = "packageRunId"
+    case currentSopID = "current_sop_id"
+    case currentSopIDCamel = "currentSopId"
+    case sopVersion = "sop_version"
+    case sopVersionCamel = "sopVersion"
+    case packageVersion = "package_version"
+    case packageVersionCamel = "packageVersion"
+    case currentStepIndex = "current_step_index"
+    case currentStepIndexCamel = "currentStepIndex"
+    case status
+    case helpRequested = "help_requested"
+    case helpRequestedCamel = "helpRequested"
+    case webrtcRoomCode = "webrtc_room_code"
+    case webrtcRoomCodeCamel = "webrtcRoomCode"
+    case lastFrameBucket = "last_frame_bucket"
+    case lastFrameBucketCamel = "lastFrameBucket"
+    case lastFramePath = "last_frame_path"
+    case lastFramePathCamel = "lastFramePath"
+    case startedAt = "started_at"
+    case startedAtCamel = "startedAt"
+    case endedAt = "ended_at"
+    case endedAtCamel = "endedAt"
+    case updatedAt = "updated_at"
+    case updatedAtCamel = "updatedAt"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    workerID = try container.decodeFirstString(forKeys: [.workerID, .workerIDCamel])
+    deviceID = try container.decodeFirstString(forKeys: [.deviceID, .deviceIDCamel])
+    packageID = try container.decodeFirstString(forKeys: [.packageID, .packageIDCamel])
+    packageRunID = try container.decodeFirstString(forKeys: [.packageRunID, .packageRunIDCamel])
+    currentSopID = try container.decodeFirstString(forKeys: [.currentSopID, .currentSopIDCamel])
+    sopVersion = try container.decodeLossyInt(forKeys: [.sopVersion, .sopVersionCamel])
+    packageVersion = try container.decodeLossyInt(forKeys: [.packageVersion, .packageVersionCamel])
+    currentStepIndex = try container.decodeLossyInt(forKeys: [.currentStepIndex, .currentStepIndexCamel]) ?? 0
+    status = try container.decodeIfPresent(String.self, forKey: .status) ?? "active"
+    helpRequested = try container.decodeLossyBool(forKeys: [.helpRequested, .helpRequestedCamel]) ?? false
+    webrtcRoomCode = try container.decodeFirstString(forKeys: [.webrtcRoomCode, .webrtcRoomCodeCamel])
+    lastFrameBucket = try container.decodeFirstString(forKeys: [.lastFrameBucket, .lastFrameBucketCamel])
+    lastFramePath = try container.decodeFirstString(forKeys: [.lastFramePath, .lastFramePathCamel])
+    startedAt = try container.decodeFirstString(forKeys: [.startedAt, .startedAtCamel])
+    endedAt = try container.decodeFirstString(forKeys: [.endedAt, .endedAtCamel])
+    updatedAt = try container.decodeFirstString(forKeys: [.updatedAt, .updatedAtCamel])
+  }
+}
+
+struct BackendExecutionEvent: Identifiable, Decodable, Equatable {
+  let id: Int
+  let sessionID: String?
+  let eventType: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case sessionID = "session_id"
+    case eventType = "event_type"
+  }
+}
+
+struct BackendIntervention: Identifiable, Decodable, Equatable {
+  let id: String
+  let sessionID: String?
+  let status: String?
+  let notes: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case sessionID = "session_id"
+    case status
+    case notes
+  }
+}
+
+struct BackendMediaAsset: Identifiable, Decodable, Equatable {
+  let id: String
+  let sessionID: String?
+  let bucket: String?
+  let path: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case sessionID = "session_id"
+    case bucket
+    case path
+  }
+}
+
+struct BackendMediaUploadTarget: Decodable, Equatable {
+  let assetID: String?
+  let uploadURL: String
+  let method: String
+  let headers: [String: String]
+
+  private enum CodingKeys: String, CodingKey {
+    case assetID = "asset_id"
+    case assetIDCamel = "assetId"
+    case uploadURL = "upload_url"
+    case uploadURLCamel = "uploadUrl"
+    case method
+    case headers
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    assetID = try container.decodeFirstString(forKeys: [.assetID, .assetIDCamel])
+    uploadURL = try container.decodeFirstString(forKeys: [.uploadURL, .uploadURLCamel]) ?? ""
+    method = try container.decodeIfPresent(String.self, forKey: .method) ?? "PUT"
+    headers = try container.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+  }
+}
+
+protocol WorkerAdminAPI: AnyObject {
+  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws
+  func requestWorkerMediaUploadTarget(
+    sessionID: String,
+    assetType: String,
+    filename: String,
+    contentType: String,
+    byteSize: Int
+  ) async throws -> WorkerMediaUploadTarget
+  func finalizeWorkerMediaUpload(_ finalize: WorkerMediaFinalizeRequest) async throws
+  func uploadBinary(
+    to target: WorkerMediaUploadTarget,
+    data: Data,
+    contentType: String
+  ) async throws
+}
+
+struct WorkerLiveHeartbeatRequest: Equatable {
+  let sessionID: String
+  let webrtcRoomCode: String?
+  let currentStepIndex: Int
+  let helpRequested: Bool
+  let status: String
+  let lastFrameBucket: String?
+  let lastFramePath: String?
+
+  var payload: [String: Any] {
+    var payload: [String: Any] = [
+      "sessionId": sessionID,
+      "currentStepIndex": currentStepIndex,
+      "helpRequested": helpRequested,
+      "status": status
+    ]
+    if let webrtcRoomCode {
+      payload["webrtcRoomCode"] = webrtcRoomCode
+    }
+    if let lastFrameBucket {
+      payload["lastFrameBucket"] = lastFrameBucket
+    }
+    if let lastFramePath {
+      payload["lastFramePath"] = lastFramePath
+    }
+    return payload
+  }
+}
+
+struct WorkerMediaUploadTarget: Decodable, Equatable {
+  let assetID: String
+  let bucket: String
+  let path: String
+  let uploadURL: String
+  let method: String
+  let headers: [String: String]
+
+  init(
+    assetID: String,
+    bucket: String,
+    path: String,
+    uploadURL: String,
+    method: String = "PUT",
+    headers: [String: String] = [:]
+  ) {
+    self.assetID = assetID
+    self.bucket = bucket
+    self.path = path
+    self.uploadURL = uploadURL
+    self.method = method
+    self.headers = headers
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case assetID = "asset_id"
+    case assetIDCamel = "assetId"
+    case bucket
+    case path
+    case uploadURL = "upload_url"
+    case uploadURLCamel = "uploadUrl"
+    case method
+    case headers
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    guard let assetID = try container.decodeFirstString(forKeys: [.assetID, .assetIDCamel]),
+          let bucket = try container.decodeFirstString(forKeys: [.bucket]),
+          let path = try container.decodeFirstString(forKeys: [.path]),
+          let uploadURL = try container.decodeFirstString(forKeys: [.uploadURL, .uploadURLCamel])
+    else {
+      throw DecodingError.dataCorrupted(
+        .init(codingPath: decoder.codingPath, debugDescription: "Missing worker media upload target fields")
+      )
+    }
+    self.assetID = assetID
+    self.bucket = bucket
+    self.path = path
+    self.uploadURL = uploadURL
+    self.method = try container.decodeIfPresent(String.self, forKey: .method) ?? "PUT"
+    self.headers = try container.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+  }
+}
+
+struct WorkerMediaFinalizeRequest: Equatable {
+  let assetID: String
+  let sessionID: String
+  let bucket: String
+  let path: String
+  let status: String
+  let byteSize: Int
+  let error: String?
+
+  var payload: [String: Any] {
+    var payload: [String: Any] = [
+      "assetId": assetID,
+      "sessionId": sessionID,
+      "bucket": bucket,
+      "path": path,
+      "status": status,
+      "byteSize": byteSize
+    ]
+    if let error {
+      payload["error"] = error
+    }
+    return payload
+  }
+}
+
+struct BackendMemoryLink: Identifiable, Decodable, Equatable {
+  let id: String
+}
+
+struct BackendPackageExecutionRun: Identifiable, Decodable, Equatable {
+  let id: String
+  let packageID: String?
+  let status: String?
+  let completedAt: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case packageID = "package_id"
+    case status
+    case completedAt = "completed_at"
+  }
+}
+
+private struct HealthResponse: Decodable {
+  let status: String
+  let service: String
+}
+
+struct ExecutionSessionPatch {
+  var status: String?
+  var currentSopID: String?
+  var currentStepIndex: Int?
+  var helpRequested: Bool?
+  var webrtcRoomCode: String?
+  var lastFrameBucket: String?
+  var lastFramePath: String?
+  var endedAt: String?
+
+  var payload: [String: Any] {
+    var payload: [String: Any] = [:]
+    if let status { payload["status"] = status }
+    if let currentSopID { payload["current_sop_id"] = currentSopID }
+    if let currentStepIndex { payload["current_step_index"] = currentStepIndex }
+    if let helpRequested { payload["help_requested"] = helpRequested }
+    if let webrtcRoomCode = webrtcRoomCode?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !webrtcRoomCode.isEmpty {
+      payload["webrtc_room_code"] = webrtcRoomCode
+    }
+    if let lastFrameBucket = lastFrameBucket?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !lastFrameBucket.isEmpty {
+      payload["last_frame_bucket"] = lastFrameBucket
+    }
+    if let lastFramePath = lastFramePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !lastFramePath.isEmpty {
+      payload["last_frame_path"] = lastFramePath
+    }
+    if let endedAt { payload["ended_at"] = endedAt }
+    return payload
+  }
+}
+
+enum OpsAPIError: LocalizedError {
+  case notConfigured
+  case invalidURL(String)
+  case invalidResponse
+  case missingWorkerSession
+  case missingWorkerBearerToken
+  case server(statusCode: Int, message: String)
+
+  var errorDescription: String? {
+    switch self {
+    case .notConfigured:
+      return "Ops API base URL is not configured."
+    case .invalidURL(let path):
+      return "Invalid URL for path \(path)."
+    case .invalidResponse:
+      return "The ops-api returned an invalid response."
+    case .missingWorkerSession:
+      return "Worker session is missing. Re-bootstrap before writing execution state."
+    case .missingWorkerBearerToken:
+      return "Worker bearer token is missing. Re-bootstrap or configure a worker bearer token in Settings."
+    case .server(let statusCode, let message):
+      return "ops-api returned HTTP \(statusCode): \(message)"
+    }
+  }
+}
+
+enum AdminIngestError: LocalizedError {
+  case notConfigured
+  case invalidURL(String)
+  case invalidResponse
+  case missingWorkerBearerToken
+  case server(statusCode: Int, url: String, message: String)
+
+  var errorDescription: String? {
+    switch self {
+    case .notConfigured:
+      return "Admin ingest base URL is not configured."
+    case .invalidURL(let path):
+      return "Invalid admin ingest URL for path \(path)."
+    case .invalidResponse:
+      return "The admin ingest service returned an invalid response."
+    case .missingWorkerBearerToken:
+      return "Worker bearer token is missing. Re-bootstrap or configure a worker bearer token in Settings."
+    case .server(let statusCode, let url, let message):
+      return "Admin ingest returned HTTP \(statusCode) from \(url): \(message)"
+    }
+  }
+}
+
+final class OpsAPIClient: WorkerAdminAPI {
+  private let session: URLSession
+  private let decoder: JSONDecoder
+  private var workerSessionToken: String?
+
+  init(session: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 15
+    return URLSession(configuration: config)
+  }()) {
+    self.session = session
+    self.decoder = JSONDecoder()
+  }
+
+  var isConfigured: Bool {
+    GeminiConfig.isOpsConfigured
+  }
+
+  var currentWorkerBearerToken: String? {
+    let liveToken = workerSessionToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let liveToken, !liveToken.isEmpty {
+      return liveToken
+    }
+
+    let configuredToken = GeminiConfig.openClawBearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    return configuredToken.isEmpty ? nil : configuredToken
+  }
+
+  func health() async throws -> String {
+    let response: HealthResponse = try await performRequest(path: "/health", method: "GET")
+    return "\(response.status):\(response.service)"
+  }
+
+  func bootstrap(loginCode: String, platform: String, label: String) async throws -> BootstrapPayload {
+    let response: BootstrapPayload = try await performRequest(
+      path: "/v1/bootstrap",
+      method: "POST",
+      requiresWorkerAuth: false,
+      payload: [
+        "login_code": loginCode,
+        "platform": platform,
+        "label": label,
+        "device_label": label
+      ]
+    )
+    workerSessionToken = response.workerSessionToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return response
+  }
+
+  func createExecutionSession(
+    workerID: String,
+    deviceID: String?,
+    shiftID: String?,
+    packageID: String?,
+    packageRunID: String?,
+    currentSopID: String?,
+    sopVersion: Int?,
+    packageVersion: Int?,
+    status: String = "active"
+  ) async throws -> BackendExecutionSession {
+    var payload: [String: Any] = [
+      "worker_id": workerID,
+      "status": status
+    ]
+    if let deviceID { payload["device_id"] = deviceID }
+    if let shiftID { payload["shift_id"] = shiftID }
+    if let packageID { payload["package_id"] = packageID }
+    if let packageRunID { payload["package_run_id"] = packageRunID }
+    if let currentSopID { payload["current_sop_id"] = currentSopID }
+    if let sopVersion { payload["sop_version"] = sopVersion }
+    if let packageVersion { payload["package_version"] = packageVersion }
+    return try await performRequest(
+      path: "/v1/execution-sessions",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: payload
+    )
+  }
+
+  func updateExecutionSession(
+    id: String,
+    patch: ExecutionSessionPatch
+  ) async throws -> BackendExecutionSession {
+    try await performRequest(
+      path: "/v1/execution-sessions/\(id)",
+      method: "PATCH",
+      requiresWorkerAuth: true,
+      payload: patch.payload
+    )
+  }
+
+  func postExecutionEvent(
+    sessionID: String,
+    eventType: String,
+    payload: [String: Any]
+  ) async throws -> BackendExecutionEvent {
+    try await performRequest(
+      path: "/v1/execution-sessions/\(sessionID)/events",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: [
+        "event_type": eventType,
+        "payload": payload
+      ]
+    )
+  }
+
+  func createIntervention(
+    sessionID: String,
+    type: String,
+    notes: String?
+  ) async throws -> BackendIntervention {
+    var payload: [String: Any] = [
+      "session_id": sessionID,
+      "type": type
+    ]
+    if let notes, !notes.isEmpty {
+      payload["notes"] = notes
+    }
+    return try await performRequest(
+      path: "/v1/interventions",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: payload
+    )
+  }
+
+  func registerMediaAsset(
+    sessionID: String,
+    bucket: String,
+    path: String,
+    assetType: String,
+    metadata: [String: Any]
+  ) async throws -> BackendMediaAsset {
+    try await performRequest(
+      path: "/v1/media-assets",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: [
+        "session_id": sessionID,
+        "bucket": bucket,
+        "path": path,
+        "asset_type": assetType,
+        "metadata": metadata
+      ]
+    )
+  }
+
+  func createMemoryLink(
+    sourceID: String,
+    sourceType: String,
+    targetID: String,
+    targetType: String,
+    linkType: String,
+    metadata: [String: Any]
+  ) async throws -> BackendMemoryLink {
+    try await performRequest(
+      path: "/v1/memory-links",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: [
+        "source_id": sourceID,
+        "source_type": sourceType,
+        "target_id": targetID,
+        "target_type": targetType,
+        "link_type": linkType,
+        "metadata": metadata
+      ]
+    )
+  }
+
+  func requestMediaUploadTarget(
+    assetID: String,
+    contentType: String,
+    byteCount: Int
+  ) async throws -> BackendMediaUploadTarget {
+    try await performRequest(
+      path: "/v1/media-assets/\(assetID)/upload-target",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: [
+        "content_type": contentType,
+        "byte_count": byteCount
+      ]
+    )
+  }
+
+  func finalizeMediaAssetUpload(
+    assetID: String,
+    uploadState: String = "uploaded",
+    byteCount: Int,
+    contentType: String
+  ) async throws -> BackendMediaAsset {
+    try await performRequest(
+      path: "/v1/media-assets/\(assetID)/finalize",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: [
+        "upload_state": uploadState,
+        "byte_count": byteCount,
+        "content_type": contentType
+      ]
+    )
+  }
+
+  func uploadBinary(
+    to target: BackendMediaUploadTarget,
+    data: Data,
+    contentType: String
+  ) async throws {
+    guard let url = URL(string: target.uploadURL), !target.uploadURL.isEmpty else {
+      throw OpsAPIError.invalidURL(target.uploadURL)
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = target.method.isEmpty ? "PUT" : target.method
+    request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+    for (name, value) in target.headers {
+      request.setValue(value, forHTTPHeaderField: name)
+    }
+
+    let (_, response) = try await session.upload(for: request, from: data)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw OpsAPIError.invalidResponse
+    }
+    guard (200...299).contains(httpResponse.statusCode) else {
+      throw OpsAPIError.server(statusCode: httpResponse.statusCode, message: "Media upload failed")
+    }
+  }
+
+  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws {
+    _ = try await performWorkerRequest(
+      path: "/api/worker/live/heartbeat",
+      method: "POST",
+      payload: heartbeat.payload
+    )
+  }
+
+  func requestWorkerMediaUploadTarget(
+    sessionID: String,
+    assetType: String,
+    filename: String,
+    contentType: String,
+    byteSize: Int
+  ) async throws -> WorkerMediaUploadTarget {
+    let data = try await performWorkerRequest(
+      path: "/api/worker/media/upload-target",
+      method: "POST",
+      payload: [
+        "sessionId": sessionID,
+        "assetType": assetType,
+        "filename": filename,
+        "contentType": contentType,
+        "byteSize": byteSize
+      ]
+    )
+
+    do {
+      return try decoder.decode(WorkerMediaUploadTarget.self, from: data)
+    } catch {
+      let body = String(data: data, encoding: .utf8) ?? "<non-utf8 response>"
+      NSLog("[admin-ingest] Failed decoding /api/worker/media/upload-target -> %@", body)
+      throw error
+    }
+  }
+
+  func finalizeWorkerMediaUpload(_ finalize: WorkerMediaFinalizeRequest) async throws {
+    _ = try await performWorkerRequest(
+      path: "/api/worker/media/finalize",
+      method: "POST",
+      payload: finalize.payload
+    )
+  }
+
+  func uploadBinary(
+    to target: WorkerMediaUploadTarget,
+    data: Data,
+    contentType: String
+  ) async throws {
+    guard let url = URL(string: target.uploadURL), !target.uploadURL.isEmpty else {
+      throw OpsAPIError.invalidURL(target.uploadURL)
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = target.method.isEmpty ? "PUT" : target.method
+    request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+    for (name, value) in target.headers {
+      request.setValue(value, forHTTPHeaderField: name)
+    }
+
+    let (_, response) = try await session.upload(for: request, from: data)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw OpsAPIError.invalidResponse
+    }
+    guard (200...299).contains(httpResponse.statusCode) else {
+      throw OpsAPIError.server(statusCode: httpResponse.statusCode, message: "Media upload failed")
+    }
+  }
+
+  func closePackageRun(
+    packageRunID: String,
+    workerID: String
+  ) async throws -> BackendPackageExecutionRun {
+    try await performRequest(
+      path: "/v1/package-runs/\(packageRunID)/close",
+      method: "POST",
+      requiresWorkerAuth: true,
+      payload: [
+        "worker_id": workerID
+      ]
+    )
+  }
+
+  private func performRequest<Response: Decodable>(
+    path: String,
+    method: String,
+    requiresWorkerAuth: Bool = false,
+    payload: [String: Any]? = nil
+  ) async throws -> Response {
+    guard isConfigured else {
+      throw OpsAPIError.notConfigured
+    }
+
+    guard let url = makeURL(path: path, baseURLString: GeminiConfig.opsBaseURL) else {
+      throw OpsAPIError.invalidURL(path)
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    if requiresWorkerAuth {
+      guard let token = workerSessionToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !token.isEmpty
+      else {
+        throw OpsAPIError.missingWorkerSession
+      }
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    if let payload {
+      request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+    }
+
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw OpsAPIError.invalidResponse
+    }
+
+    guard (200...299).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw OpsAPIError.server(statusCode: httpResponse.statusCode, message: message)
+    }
+
+    do {
+      return try decoder.decode(Response.self, from: data)
+    } catch {
+      let body = String(data: data, encoding: .utf8) ?? "<non-utf8 response>"
+      NSLog("[ops-api] Failed decoding %@ -> %@", path, body)
+      throw error
+    }
+  }
+
+  private func makeURL(path: String, baseURLString: String) -> URL? {
+    let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    let normalizedBase: String
+    if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
+      normalizedBase = trimmed
+    } else {
+      normalizedBase = "https://\(trimmed)"
+    }
+
+    guard var components = URLComponents(string: normalizedBase) else {
+      return nil
+    }
+    let cleanedPath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    components.path = "/" + [cleanedPath, path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))]
+      .filter { !$0.isEmpty }
+      .joined(separator: "/")
+    return components.url
+  }
+
+  private func performWorkerRequest(
+    path: String,
+    method: String,
+    payload: [String: Any]? = nil
+  ) async throws -> Data {
+    guard GeminiConfig.isAdminConfigured else {
+      throw AdminIngestError.notConfigured
+    }
+
+    guard let url = makeURL(path: path, baseURLString: GeminiConfig.adminBaseURL) else {
+      throw AdminIngestError.invalidURL(path)
+    }
+
+    guard let token = currentWorkerBearerToken else {
+      throw AdminIngestError.missingWorkerBearerToken
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+    if let payload {
+      request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+    }
+
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw AdminIngestError.invalidResponse
+    }
+
+    guard (200...299).contains(httpResponse.statusCode) else {
+      let message = summarizeResponseBody(data)
+      NSLog(
+        "[admin-ingest] %@ %@ -> %d %@",
+        method,
+        url.absoluteString,
+        httpResponse.statusCode,
+        message
+      )
+      throw AdminIngestError.server(
+        statusCode: httpResponse.statusCode,
+        url: url.absoluteString,
+        message: message
+      )
+    }
+
+    return data
+  }
+
+  private func summarizeResponseBody(_ data: Data) -> String {
+    let raw = String(data: data, encoding: .utf8) ?? "Unknown error"
+    let compact = raw.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard compact.count > 240 else { return compact }
+    let endIndex = compact.index(compact.startIndex, offsetBy: 240)
+    return "\(compact[..<endIndex])..."
+  }
+}
+
+// Backward-compatible shim for older Gemini/OpenClaw flows that still compile against the
+// legacy SOP relay surface. The worker execution flow now uses OpsAPIClient directly.
+final class SopRelayClient {
+  func postSopLog(
+    tailscaleIP: String,
+    sessionID: String,
+    stepName: String,
+    timestampISO8601: String,
+    imageBase64: String
+  ) {
+    NSLog("[legacy-sop-relay] SOP log ignored during ops-api migration")
+  }
+
+  func postHeartbeat(
+    tailscaleIP: String,
+    sessionID: String,
+    status: String
+  ) {
+    NSLog("[legacy-sop-relay] Heartbeat ignored during ops-api migration")
+  }
+
+  func postHeartbeatForReceipt(
+    tailscaleIP: String,
+    sessionID: String,
+    status: String
+  ) async -> String? {
+    "Legacy SOP relay disabled while ops-api migration is active."
+  }
+
+  func postHeartbeatForReceiptWithStatus(
+    tailscaleIP: String,
+    sessionID: String,
+    status: String
+  ) async -> (statusCode: Int?, message: String?) {
+    (200, "Legacy SOP relay disabled while ops-api migration is active.")
+  }
+
+  func postFinalPayloadForReceiptWithStatus(
+    tailscaleIP: String,
+    payload: [String: Any]
+  ) async -> (statusCode: Int?, message: String?) {
+    (200, "Legacy SOP relay disabled while ops-api migration is active.")
+  }
+
+  func postSopVideoForReceiptWithStatus(
+    tailscaleIP: String,
+    sessionID: String,
+    videoFileURL: URL
+  ) async -> (statusCode: Int?, message: String?) {
+    (200, "Video upload deferred until media upload flow is implemented.")
+  }
+
+  func postSopDossierForReceiptWithStatus(
+    tailscaleIP: String,
+    sessionID: String,
+    sopName: String,
+    metadataJSONString: String,
+    videoFileURL: URL,
+    proofImagesByTargetID: [String: Data]
+  ) async -> (statusCode: Int?, message: String?) {
+    (200, "Dossier upload deferred until media upload flow is implemented.")
+  }
+}
