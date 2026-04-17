@@ -85,7 +85,7 @@ enum ToolCallStatus: Equatable {
 enum ToolDeclarations {
 
   static func allDeclarations() -> [[String: Any]] {
-    return [execute]
+    return [execute, logSopStep]
   }
 
   static let execute: [String: Any] = [
@@ -102,5 +102,41 @@ enum ToolDeclarations {
       "required": ["task"]
     ] as [String: Any],
     "behavior": "BLOCKING"
+  ]
+
+  static let logSopStep: [String: Any] = [
+    "name": "log_sop_step",
+    "description": "Log an SOP step to the external SOP processor.",
+    "parameters": [
+      "type": "object",
+      "properties": [
+        "step_number": [
+          "type": "integer",
+          "description": "Current SOP step number (1-based)"
+        ],
+        "step_name": [
+          "type": "string",
+          "description": "SOP step label to record"
+        ],
+        "action": [
+          "type": "string",
+          "description": "Step action state: started, completed, failed, or skipped"
+        ],
+        "total_steps": [
+          "type": "integer",
+          "description": "Total number of SOP steps"
+        ],
+        "frame_data": [
+          "type": "string",
+          "description": "Optional current frame JPEG as raw base64 bytes (no data URI)."
+        ],
+        "notes": [
+          "type": "string",
+          "description": "Optional operator/model notes for this step."
+        ]
+      ],
+      "required": ["step_name"]
+    ] as [String: Any],
+    "behavior": "NON_BLOCKING"
   ]
 }

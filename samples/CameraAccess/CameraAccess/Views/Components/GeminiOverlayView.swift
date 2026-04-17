@@ -8,7 +8,7 @@ struct GeminiStatusBar: View {
       // Gemini connection pill
       StatusPill(color: geminiStatusColor, text: geminiStatusText)
 
-      // OpenClaw connection pill
+      // Video AI Analyst bridge connection pill
       StatusPill(color: openClawStatusColor, text: openClawStatusText)
     }
   }
@@ -42,10 +42,10 @@ struct GeminiStatusBar: View {
 
   private var openClawStatusText: String {
     switch geminiVM.openClawConnectionState {
-    case .connected: return "OpenClaw"
-    case .checking: return "OpenClaw..."
-    case .unreachable: return "OpenClaw Off"
-    case .notConfigured: return "No OpenClaw"
+    case .connected: return "Video AI Analyst"
+    case .checking: return "Video AI Analyst..."
+    case .unreachable: return "Analyst Off"
+    case .notConfigured: return "No Analyst"
     }
   }
 }
@@ -168,5 +168,61 @@ struct SpeakingIndicator: View {
     }
     .onAppear { animating = true }
     .onDisappear { animating = false }
+  }
+}
+
+struct GeminiAssistantOverlay: View {
+  @ObservedObject var geminiVM: GeminiSessionViewModel
+  let onToggle: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack(alignment: .center, spacing: 10) {
+        GeminiStatusBar(geminiVM: geminiVM)
+        Spacer(minLength: 0)
+        Button(action: onToggle) {
+          Text(geminiVM.isGeminiActive ? "STOP AI" : "START AI")
+            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.68))
+            .overlay(
+              RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+      }
+
+      if !geminiVM.userTranscript.isEmpty || !geminiVM.aiTranscript.isEmpty {
+        TranscriptView(userText: geminiVM.userTranscript, aiText: geminiVM.aiTranscript)
+      }
+
+      HStack(spacing: 10) {
+        ToolCallStatusView(status: geminiVM.toolCallStatus)
+        if geminiVM.isModelSpeaking {
+          SpeakingIndicator()
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.55))
+            .cornerRadius(16)
+        }
+        Spacer(minLength: 0)
+      }
+
+      if let errorMessage = geminiVM.errorMessage, !errorMessage.isEmpty {
+        Text(errorMessage)
+          .font(.system(size: 12, weight: .medium))
+          .foregroundColor(.white)
+          .padding(.horizontal, 14)
+          .padding(.vertical, 10)
+          .background(Color.red.opacity(0.28))
+          .cornerRadius(12)
+      }
+    }
+    .padding(.horizontal, 16)
+    .padding(.top, 18)
+    .frame(maxWidth: .infinity, alignment: .leading)
   }
 }

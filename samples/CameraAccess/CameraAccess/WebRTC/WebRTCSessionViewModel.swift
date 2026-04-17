@@ -1,6 +1,57 @@
 import Foundation
+import QuartzCore
 import SwiftUI
 import WebRTC
+
+final class WebRTCRealtimeVideoForwarder: @unchecked Sendable {
+  private let queue = DispatchQueue(
+    label: "visionclaw.webrtc.realtime-forwarder",
+    qos: .userInteractive
+  )
+  private var imageHandler: ((UIImage) -> Void)?
+  private var pixelBufferHandler: ((CVPixelBuffer, Int64) -> Void)?
+  private var pixelBufferForwardCount: Int64 = 0
+  private var pixelBufferStatsWindowStart = CACurrentMediaTime()
+
+  func updateHandlers(
+    imageHandler: ((UIImage) -> Void)?,
+    pixelBufferHandler: ((CVPixelBuffer, Int64) -> Void)?
+  ) {
+    queue.async {
+      self.imageHandler = imageHandler
+      self.pixelBufferHandler = pixelBufferHandler
+    }
+  }
+
+  func enqueueImage(_ image: UIImage) {
+    queue.async {
+      self.imageHandler?(image)
+    }
+  }
+
+  func enqueuePixelBuffer(_ pixelBuffer: CVPixelBuffer, timeStampNs: Int64) {
+    let queuedAt = CACurrentMediaTime()
+    queue.async {
+      self.pixelBufferHandler?(pixelBuffer, timeStampNs)
+      self.pixelBufferForwardCount += 1
+      self.logPixelBufferForwardStatsIfNeeded(waitDurationMs: (CACurrentMediaTime() - queuedAt) * 1000)
+    }
+  }
+
+  private func logPixelBufferForwardStatsIfNeeded(waitDurationMs: Double) {
+    guard pixelBufferForwardCount == 1 || pixelBufferForwardCount % 120 == 0 else { return }
+    let now = CACurrentMediaTime()
+    let elapsed = max(now - pixelBufferStatsWindowStart, 0.001)
+    let fps = Double(pixelBufferForwardCount) / elapsed
+    NSLog(
+      "[WebRTC] Realtime forwarder rate=%.1ffps last-wait=%.2fms",
+      fps,
+      waitDurationMs
+    )
+    pixelBufferStatsWindowStart = now
+    pixelBufferForwardCount = 0
+  }
+}
 
 enum WebRTCConnectionState: Equatable {
   case disconnected
@@ -22,16 +73,23 @@ class WebRTCSessionViewModel: ObservableObject {
   @Published var errorMessage: String?
   @Published var remoteVideoTrack: RTCVideoTrack?
   @Published var hasRemoteVideo: Bool = false
+  @Published var incomingRemoteVideoEnabled: Bool = true
+
+  nonisolated let realtimeVideoForwarder = WebRTCRealtimeVideoForwarder()
 
   private var webRTCClient: WebRTCClient?
   private var signalingClient: SignalingClient?
   private var delegateAdapter: WebRTCDelegateAdapter?
+  private var currentCaptureMode: StreamingMode = .glasses
+  private var wantsIncomingRemoteVideo = true
+  private var isUsingPhoneFallbackProfile = false
+  private var stablePhoneSenderWindows = 0
 
   /// Saved room code for reconnecting after app backgrounding.
   private var savedRoomCode: String?
   private var foregroundObserver: Any?
 
-  func startSession() async {
+  func startSession(captureMode: StreamingMode = .glasses) async {
     guard !isActive else { return }
     guard WebRTCConfig.isConfigured else {
       errorMessage = "WebRTC signaling URL not configured."
@@ -41,17 +99,23 @@ class WebRTCSessionViewModel: ObservableObject {
     isActive = true
     connectionState = .connecting
     savedRoomCode = nil
+    currentCaptureMode = captureMode
+    wantsIncomingRemoteVideo = captureMode != .iPhone
+    incomingRemoteVideoEnabled = wantsIncomingRemoteVideo
+    isUsingPhoneFallbackProfile = false
+    stablePhoneSenderWindows = 0
 
     // Fetch TURN credentials for NAT traversal across networks
     let iceServers = await WebRTCConfig.fetchIceServers()
 
-    setupWebRTCClient(iceServers: iceServers)
+    setupWebRTCClient(iceServers: iceServers, captureMode: captureMode)
     connectSignaling(rejoinCode: nil)
     observeForeground()
   }
 
   func stopSession() {
     removeForegroundObserver()
+    realtimeVideoForwarder.updateHandlers(imageHandler: nil, pixelBufferHandler: nil)
     webRTCClient?.close()
     webRTCClient = nil
     delegateAdapter = nil
@@ -64,6 +128,10 @@ class WebRTCSessionViewModel: ObservableObject {
     isMuted = false
     remoteVideoTrack = nil
     hasRemoteVideo = false
+    incomingRemoteVideoEnabled = true
+    wantsIncomingRemoteVideo = true
+    isUsingPhoneFallbackProfile = false
+    stablePhoneSenderWindows = 0
   }
 
   func toggleMute() {
@@ -77,15 +145,44 @@ class WebRTCSessionViewModel: ObservableObject {
     webRTCClient?.pushVideoFrame(image)
   }
 
+  func pushVideoPixelBuffer(_ pixelBuffer: CVPixelBuffer, timeStampNs: Int64) {
+    guard isActive, connectionState == .connected else { return }
+    webRTCClient?.pushPixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
+  }
+
   // MARK: - WebRTC + Signaling Setup
 
-  private func setupWebRTCClient(iceServers: [RTCIceServer]?) {
+  private func setupWebRTCClient(
+    iceServers: [RTCIceServer]?,
+    captureMode: StreamingMode
+  ) {
     let client = WebRTCClient()
     let adapter = WebRTCDelegateAdapter(viewModel: self)
     delegateAdapter = adapter
     client.delegate = adapter
-    client.setup(iceServers: iceServers)
+    let profile: WebRTCStreamProfile
+    switch captureMode {
+    case .iPhone:
+      profile = isUsingPhoneFallbackProfile
+        ? WebRTCConfig.supportModePhoneFallbackProfile
+        : WebRTCConfig.supportModePhoneProfile
+    case .glasses:
+      profile = WebRTCConfig.supportModeGlassesProfile
+    }
+    client.setup(
+      iceServers: iceServers,
+      profile: profile,
+      receiveRemoteVideo: wantsIncomingRemoteVideo
+    )
     webRTCClient = client
+    realtimeVideoForwarder.updateHandlers(
+      imageHandler: { [weak client] image in
+        client?.pushVideoFrame(image)
+      },
+      pixelBufferHandler: { [weak client] pixelBuffer, timeStampNs in
+        client?.pushPixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
+      }
+    )
   }
 
   private func connectSignaling(rejoinCode: String?) {
@@ -159,6 +256,28 @@ class WebRTCSessionViewModel: ObservableObject {
   private func handleReturnToForeground() {
     guard isActive, let code = savedRoomCode else { return }
     NSLog("[WebRTC] App returned to foreground, reconnecting to room: %@", code)
+    reconnectCurrentRoom(reason: "app_foreground", roomCode: code)
+  }
+
+  func setIncomingRemoteVideoEnabled(_ enabled: Bool) {
+    guard currentCaptureMode == .iPhone else {
+      incomingRemoteVideoEnabled = true
+      return
+    }
+    guard enabled != wantsIncomingRemoteVideo else { return }
+    wantsIncomingRemoteVideo = enabled
+    incomingRemoteVideoEnabled = enabled
+    remoteVideoTrack = nil
+    hasRemoteVideo = false
+    guard let code = savedRoomCode, isActive else { return }
+    NSLog(
+      "[WebRTC] Reconfiguring incoming supervisor video: %@",
+      enabled ? "enabled" : "disabled"
+    )
+    reconnectCurrentRoom(reason: enabled ? "enable_remote_video" : "disable_remote_video", roomCode: code)
+  }
+
+  private func reconnectCurrentRoom(reason: String, roomCode code: String) {
     connectionState = .connecting
 
     // Tear down old peer connection, set up fresh one
@@ -168,9 +287,10 @@ class WebRTCSessionViewModel: ObservableObject {
 
     Task {
       let iceServers = await WebRTCConfig.fetchIceServers()
-      setupWebRTCClient(iceServers: iceServers)
+      setupWebRTCClient(iceServers: iceServers, captureMode: currentCaptureMode)
       connectSignaling(rejoinCode: code)
     }
+    NSLog("[WebRTC] Reconnecting room %@ (%@)", code, reason)
   }
 
   // MARK: - Signaling Message Handling
@@ -261,6 +381,39 @@ class WebRTCSessionViewModel: ObservableObject {
     hasRemoteVideo = false
     NSLog("[WebRTC] Remote video track removed")
   }
+
+  fileprivate func handleSenderStats(_ stats: WebRTCSenderStats) {
+    guard currentCaptureMode == .iPhone else { return }
+
+    let enqueueMs = stats.lastEnqueueDurationMs ?? 0
+    let isUnderPressure = enqueueMs > 20
+      || stats.windowDroppedFrames >= 3
+      || stats.windowFramesPerSecond < 14
+
+    if isUnderPressure {
+      stablePhoneSenderWindows = 0
+      guard !isUsingPhoneFallbackProfile else { return }
+      isUsingPhoneFallbackProfile = true
+      webRTCClient?.updateStreamProfile(WebRTCConfig.supportModePhoneFallbackProfile)
+      NSLog(
+        "[WebRTC] Phone sender downgraded to fallback profile (fps=%.1f dropped=%lld enqueue=%@ms)",
+        stats.windowFramesPerSecond,
+        stats.windowDroppedFrames,
+        stats.lastEnqueueDurationMs.map { String(format: "%.1f", $0) } ?? "direct"
+      )
+      return
+    }
+
+    guard isUsingPhoneFallbackProfile else { return }
+    stablePhoneSenderWindows += 1
+
+    if stablePhoneSenderWindows >= 3 {
+      stablePhoneSenderWindows = 0
+      isUsingPhoneFallbackProfile = false
+      webRTCClient?.updateStreamProfile(WebRTCConfig.supportModePhoneProfile)
+      NSLog("[WebRTC] Phone sender restored to default support profile")
+    }
+  }
 }
 
 // MARK: - Delegate Adapter (bridges nonisolated delegate to @MainActor ViewModel)
@@ -293,6 +446,12 @@ private class WebRTCDelegateAdapter: WebRTCClientDelegate {
   func webRTCClient(_ client: WebRTCClient, didRemoveRemoteVideoTrack track: RTCVideoTrack) {
     Task { @MainActor [weak self] in
       self?.viewModel?.handleRemoteVideoTrackRemoved(track)
+    }
+  }
+
+  func webRTCClient(_ client: WebRTCClient, didUpdateSenderStats stats: WebRTCSenderStats) {
+    Task { @MainActor [weak self] in
+      self?.viewModel?.handleSenderStats(stats)
     }
   }
 }

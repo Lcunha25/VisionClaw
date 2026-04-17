@@ -29,7 +29,7 @@ class ToolCallRouter {
             consecutiveFailures, callId)
       let errorResult: ToolResult = .failure(
         "Tool execution is temporarily unavailable after \(consecutiveFailures) consecutive failures. " +
-        "Please tell the user you cannot complete this action right now and suggest they check their OpenClaw gateway connection."
+        "Please tell the user you cannot complete this action right now and suggest they check their Video AI Analyst gateway connection."
       )
       let response = buildToolResponse(callId: callId, name: callName, result: errorResult)
       sendResponse(response)

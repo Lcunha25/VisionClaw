@@ -21,13 +21,21 @@ struct MainAppView: View {
   let wearables: WearablesInterface
   @ObservedObject private var viewModel: WearablesViewModel
 
+  private var canUseMockDevices: Bool {
+    #if DEBUG
+    return true
+    #else
+    return false
+    #endif
+  }
+
   init(wearables: WearablesInterface, viewModel: WearablesViewModel) {
     self.wearables = wearables
     self.viewModel = viewModel
   }
 
   var body: some View {
-    if viewModel.registrationState == .registered || viewModel.hasMockDevice || viewModel.skipToIPhoneMode {
+    if viewModel.registrationState == .registered || (canUseMockDevices && viewModel.hasMockDevice) || viewModel.skipToIPhoneMode {
       StreamSessionView(wearables: wearables, wearablesVM: viewModel)
     } else {
       // User not registered - show registration/onboarding flow
