@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 import UIKit
 
 enum GeminiConnectionState: Equatable {
@@ -22,6 +23,8 @@ class GeminiLiveService: ObservableObject {
   var onOutputTranscription: ((String) -> Void)?
   var onToolCall: ((GeminiToolCall) -> Void)?
   var onToolCallCancellation: ((GeminiToolCallCancellation) -> Void)?
+  var onSocketOpened: (() -> Void)?
+  var onSocketClosed: ((String?) -> Void)?
 
   // Latency tracking
   private var lastUserSpeechEnd: Date?
@@ -33,6 +36,12 @@ class GeminiLiveService: ObservableObject {
   private let delegate = WebSocketDelegate()
   private var urlSession: URLSession!
   private let sendQueue = DispatchQueue(label: "gemini.send", qos: .userInitiated)
+  private var latestVideoFrameBase64: String?
+  private var setupSystemInstruction: String = GeminiConfig.systemInstruction
+  private var videoFrameSendCount: Int64 = 0
+  private var videoFrameStatsWindowStart = CACurrentMediaTime()
+
+  var lastVideoFrameBase64: String? { latestVideoFrameBase64 }
 
   init() {
     let config = URLSessionConfiguration.default
@@ -40,12 +49,13 @@ class GeminiLiveService: ObservableObject {
     self.urlSession = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
   }
 
-  func connect() async -> Bool {
+  func connect(systemInstruction: String? = nil) async -> Bool {
     guard let url = GeminiConfig.websocketURL() else {
       connectionState = .error("No API key configured")
       return false
     }
 
+    setupSystemInstruction = resolvedSystemInstruction(systemInstruction)
     connectionState = .connecting
 
     let result = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
@@ -54,6 +64,7 @@ class GeminiLiveService: ObservableObject {
       self.delegate.onOpen = { [weak self] protocol_ in
         guard let self else { return }
         Task { @MainActor in
+          self.onSocketOpened?()
           self.connectionState = .settingUp
           self.sendSetupMessage()
           self.startReceiving()
@@ -67,6 +78,7 @@ class GeminiLiveService: ObservableObject {
           self.resolveConnect(success: false)
           self.connectionState = .disconnected
           self.isModelSpeaking = false
+          self.onSocketClosed?("Connection closed (code \(code.rawValue): \(reasonStr))")
           self.onDisconnected?("Connection closed (code \(code.rawValue): \(reasonStr))")
         }
       }
@@ -78,6 +90,7 @@ class GeminiLiveService: ObservableObject {
           self.resolveConnect(success: false)
           self.connectionState = .error(msg)
           self.isModelSpeaking = false
+          self.onSocketClosed?(msg)
           self.onDisconnected?(msg)
         }
       }
@@ -110,6 +123,8 @@ class GeminiLiveService: ObservableObject {
     delegate.onError = nil
     onToolCall = nil
     onToolCallCancellation = nil
+    onSocketOpened = nil
+    onSocketClosed = nil
     connectionState = .disconnected
     isModelSpeaking = false
     resolveConnect(success: false)
@@ -127,14 +142,20 @@ class GeminiLiveService: ObservableObject {
           ]
         ]
       ]
-      self?.sendJSON(json)
+      Task { @MainActor [weak self] in
+        self?.sendJSON(json)
+      }
     }
   }
 
   func sendVideoFrame(image: UIImage) {
     guard connectionState == .ready else { return }
+    let frameStartedAt = CACurrentMediaTime()
     sendQueue.async { [weak self] in
+      guard let self else { return }
+      let encodeStartedAt = CACurrentMediaTime()
       guard let jpegData = image.jpegData(compressionQuality: GeminiConfig.videoJPEGQuality) else { return }
+      let encodeDurationMs = (CACurrentMediaTime() - encodeStartedAt) * 1000
       let base64 = jpegData.base64EncodedString()
       let json: [String: Any] = [
         "realtimeInput": [
@@ -144,14 +165,46 @@ class GeminiLiveService: ObservableObject {
           ]
         ]
       ]
-      self?.sendJSON(json)
+      self.videoFrameSendCount += 1
+      self.logVideoSendStatsIfNeeded(
+        payloadBytes: jpegData.count,
+        encodeDurationMs: encodeDurationMs,
+        totalDurationMs: (CACurrentMediaTime() - frameStartedAt) * 1000
+      )
+      Task { @MainActor [weak self] in
+        self?.latestVideoFrameBase64 = base64
+        self?.sendJSON(json)
+      }
     }
   }
 
   func sendToolResponse(_ response: [String: Any]) {
     sendQueue.async { [weak self] in
-      self?.sendJSON(response)
+      Task { @MainActor [weak self] in
+        self?.sendJSON(response)
+      }
     }
+  }
+
+  private func logVideoSendStatsIfNeeded(
+    payloadBytes: Int,
+    encodeDurationMs: Double,
+    totalDurationMs: Double
+  ) {
+    guard videoFrameSendCount == 1 || videoFrameSendCount % 10 == 0 else { return }
+    let now = CACurrentMediaTime()
+    let elapsed = max(now - videoFrameStatsWindowStart, 0.001)
+    let fps = Double(videoFrameSendCount) / elapsed
+    NSLog(
+      "[Gemini] Vision lane frames=%lld rate=%.2ffps encode=%.1fms total=%.1fms payload=%dB",
+      videoFrameSendCount,
+      fps,
+      encodeDurationMs,
+      totalDurationMs,
+      payloadBytes
+    )
+    videoFrameStatsWindowStart = now
+    videoFrameSendCount = 0
   }
 
   // MARK: - Private
@@ -161,6 +214,20 @@ class GeminiLiveService: ObservableObject {
       connectContinuation = nil
       cont.resume(returning: success)
     }
+  }
+
+  private func resolvedSystemInstruction(_ override: String?) -> String {
+    let candidate = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !candidate.isEmpty {
+      return candidate
+    }
+
+    let configured = GeminiConfig.systemInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !configured.isEmpty {
+      return configured
+    }
+
+    return GeminiConfig.defaultSystemInstruction
   }
 
   private func sendSetupMessage() {
@@ -175,7 +242,7 @@ class GeminiLiveService: ObservableObject {
         ],
         "systemInstruction": [
           "parts": [
-            ["text": GeminiConfig.systemInstruction]
+            ["text": setupSystemInstruction]
           ]
         ],
         "tools": [
@@ -206,7 +273,17 @@ class GeminiLiveService: ObservableObject {
           let string = String(data: data, encoding: .utf8) else {
       return
     }
-    webSocketTask?.send(.string(string)) { _ in }
+    webSocketTask?.send(.string(string)) { [weak self] error in
+      guard let self, let error else { return }
+      Task { @MainActor in
+        NSLog("[Gemini] WebSocket send failed: %@", error.localizedDescription)
+        self.resolveConnect(success: false)
+        self.connectionState = .error("WebSocket send failed: \(error.localizedDescription)")
+        self.isModelSpeaking = false
+        self.onSocketClosed?(error.localizedDescription)
+        self.onDisconnected?(error.localizedDescription)
+      }
+    }
   }
 
   private func startReceiving() {
@@ -248,6 +325,20 @@ class GeminiLiveService: ObservableObject {
       return
     }
 
+    // Server-provided error payload
+    if let errorObj = json["error"] as? [String: Any] {
+      let status = errorObj["status"] as? String ?? "UNKNOWN"
+      let message = errorObj["message"] as? String ?? "Unknown Gemini server error"
+      let full = "Gemini setup error [\(status)]: \(message)"
+      NSLog("[Gemini] %@", full)
+      connectionState = .error(full)
+      isModelSpeaking = false
+      resolveConnect(success: false)
+      onSocketClosed?(full)
+      onDisconnected?(full)
+      return
+    }
+
     // Setup complete
     if json["setupComplete"] != nil {
       connectionState = .ready
@@ -261,6 +352,7 @@ class GeminiLiveService: ObservableObject {
       let seconds = timeLeft?["seconds"] as? Int ?? 0
       connectionState = .disconnected
       isModelSpeaking = false
+      onSocketClosed?("Server closing (time left: \(seconds)s)")
       onDisconnected?("Server closing (time left: \(seconds)s)")
       return
     }

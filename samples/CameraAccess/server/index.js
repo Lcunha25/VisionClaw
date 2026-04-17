@@ -4,38 +4,71 @@ const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8080;
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PRODUCTION = NODE_ENV === "production";
 const rooms = new Map(); // roomCode -> { creator: ws, viewer: ws, destroyTimer: timeout|null }
 
 // Grace period (ms) before destroying a room when creator disconnects.
 // Allows the iOS user to switch apps (e.g. copy room code, send via WhatsApp) and come back.
 const ROOM_GRACE_PERIOD_MS = 60_000;
 
-// TURN: ExpressTURN (1000 GB/month free, reliable)
-// Ports 3478 (standard), 80, 443 (firewall bypass)
-const EXPRESSTURN_SERVER = process.env.EXPRESSTURN_SERVER || "free.expressturn.com";
-const EXPRESSTURN_USER = process.env.EXPRESSTURN_USER || "efPU52K4SLOQ34W2QY";
-const EXPRESSTURN_PASS = process.env.EXPRESSTURN_PASS || "1TJPNFxHKXrZfelz";
+const STUN_SERVER = process.env.STUN_SERVER || "stun:stun.l.google.com:19302";
+const EXPRESSTURN_SERVER = process.env.EXPRESSTURN_SERVER || "";
+const EXPRESSTURN_USER = process.env.EXPRESSTURN_USER || "";
+const EXPRESSTURN_PASS = process.env.EXPRESSTURN_PASS || "";
+const HAS_TURN_CREDENTIALS = Boolean(
+  EXPRESSTURN_SERVER && EXPRESSTURN_USER && EXPRESSTURN_PASS
+);
+
+if (IS_PRODUCTION && !HAS_TURN_CREDENTIALS) {
+  throw new Error("TURN credentials are required when NODE_ENV=production");
+}
+
+if (!HAS_TURN_CREDENTIALS) {
+  console.warn("[TURN] No TURN credentials configured; serving STUN-only ICE config.");
+}
 
 function getTurnCredentials() {
+  const iceServers = [];
+
+  if (STUN_SERVER) {
+    iceServers.push({ urls: [STUN_SERVER] });
+  }
+
+  if (HAS_TURN_CREDENTIALS) {
+    iceServers.push({
+      urls: [
+        `turn:${EXPRESSTURN_SERVER}:3478`,
+        `turn:${EXPRESSTURN_SERVER}:3478?transport=tcp`,
+        `turn:${EXPRESSTURN_SERVER}:80`,
+        `turn:${EXPRESSTURN_SERVER}:80?transport=tcp`,
+        `turns:${EXPRESSTURN_SERVER}:443?transport=tcp`,
+      ],
+      username: EXPRESSTURN_USER,
+      credential: EXPRESSTURN_PASS,
+    });
+  }
+
   return {
-    iceServers: [
-      {
-        urls: [
-          `turn:${EXPRESSTURN_SERVER}:3478`,
-          `turn:${EXPRESSTURN_SERVER}:3478?transport=tcp`,
-          `turn:${EXPRESSTURN_SERVER}:80`,
-          `turn:${EXPRESSTURN_SERVER}:80?transport=tcp`,
-          `turns:${EXPRESSTURN_SERVER}:443?transport=tcp`,
-        ],
-        username: EXPRESSTURN_USER,
-        credential: EXPRESSTURN_PASS,
-      },
-    ],
+    iceServers,
   };
 }
 
 // HTTP server for serving the web viewer
 const httpServer = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        environment: NODE_ENV,
+        roomCount: rooms.size,
+        turnConfigured: HAS_TURN_CREDENTIALS,
+      })
+    );
+    return;
+  }
+
   // TURN credentials API endpoint
   if (req.url === "/api/turn") {
     const creds = getTurnCredentials();
