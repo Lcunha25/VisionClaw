@@ -165,15 +165,16 @@ class GeminiLiveService: ObservableObject {
           ]
         ]
       ]
-      self.videoFrameSendCount += 1
-      self.logVideoSendStatsIfNeeded(
-        payloadBytes: jpegData.count,
-        encodeDurationMs: encodeDurationMs,
-        totalDurationMs: (CACurrentMediaTime() - frameStartedAt) * 1000
-      )
       Task { @MainActor [weak self] in
-        self?.latestVideoFrameBase64 = base64
-        self?.sendJSON(json)
+        guard let self else { return }
+        self.videoFrameSendCount += 1
+        self.logVideoSendStatsIfNeeded(
+          payloadBytes: jpegData.count,
+          encodeDurationMs: encodeDurationMs,
+          totalDurationMs: (CACurrentMediaTime() - frameStartedAt) * 1000
+        )
+        self.latestVideoFrameBase64 = base64
+        self.sendJSON(json)
       }
     }
   }
@@ -196,7 +197,9 @@ class GeminiLiveService: ObservableObject {
           ]
         ]
       ]
-      self?.sendJSON(msg)
+      Task { @MainActor [weak self] in
+        self?.sendJSON(msg)
+      }
     }
   }
 

@@ -44,7 +44,7 @@ class AudioManager {
       try session.setCategory(
         .playAndRecord,
         mode: .voiceChat,
-        options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers]
+        options: [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers]
       )
     } else {
       try session.setCategory(
