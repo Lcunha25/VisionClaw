@@ -403,6 +403,10 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
   let critical: Bool
   let aiPrompt: String
   let expectedObjects: [String]
+  let preconditions: [String]
+  let postconditions: [String]
+  let skipRisk: String
+  let evidenceRequired: Bool
   let allowManualComplete: Bool
 
   private enum CodingKeys: String, CodingKey {
@@ -423,6 +427,12 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
     case aiPromptCamel = "aiPrompt"
     case expectedObjects = "expected_objects"
     case expectedObjectsCamel = "expectedObjects"
+    case preconditions
+    case postconditions
+    case skipRisk = "skip_risk"
+    case skipRiskCamel = "skipRisk"
+    case evidenceRequired = "evidence_required"
+    case evidenceRequiredCamel = "evidenceRequired"
     case allowManualComplete = "allow_manual_complete"
     case allowManualCompleteCamel = "allowManualComplete"
   }
@@ -437,6 +447,10 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
     critical: Bool = false,
     aiPrompt: String? = nil,
     expectedObjects: [String] = [],
+    preconditions: [String] = [],
+    postconditions: [String] = [],
+    skipRisk: String = "medium",
+    evidenceRequired: Bool = true,
     allowManualComplete: Bool = true
   ) {
     self.id = id
@@ -448,6 +462,10 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
     self.critical = critical
     self.aiPrompt = aiPrompt ?? "Look at the image and confirm whether \"\(title)\" has been completed."
     self.expectedObjects = expectedObjects
+    self.preconditions = preconditions
+    self.postconditions = postconditions
+    self.skipRisk = skipRisk
+    self.evidenceRequired = evidenceRequired
     self.allowManualComplete = allowManualComplete
   }
 
@@ -476,6 +494,11 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
       try container.decodeIfPresent([String].self, forKey: .expectedObjects)
       ?? container.decodeIfPresent([String].self, forKey: .expectedObjectsCamel)
       ?? []
+    let preconditions = (try container.decodeIfPresent([String].self, forKey: .preconditions)) ?? []
+    let postconditions = (try container.decodeIfPresent([String].self, forKey: .postconditions)) ?? []
+    let skipRisk =
+      try container.decodeLossyString(forKeys: [.skipRisk, .skipRiskCamel])
+      ?? ((try container.decodeLossyBool(forKeys: [.critical]) ?? false) ? "high" : "medium")
     self.init(
       id: resolvedID,
       order: try container.decodeLossyInt(forKeys: [.order, .index]) ?? 0,
@@ -487,6 +510,12 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
       aiPrompt:
         try container.decodeLossyString(forKeys: [.aiPrompt, .aiPromptCamel]),
       expectedObjects: expectedObjects.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+      preconditions: preconditions.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+      postconditions: postconditions.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+      skipRisk: ["low", "medium", "high"].contains(skipRisk) ? skipRisk : "medium",
+      evidenceRequired:
+        try container.decodeLossyBool(forKeys: [.evidenceRequired, .evidenceRequiredCamel])
+        ?? true,
       allowManualComplete:
         try container.decodeLossyBool(forKeys: [.allowManualComplete, .allowManualCompleteCamel])
         ?? true
@@ -616,6 +645,10 @@ struct WorkerQueueItem: Identifiable, Decodable, Equatable {
           critical: step.critical,
           aiPrompt: step.aiPrompt,
           expectedObjects: step.expectedObjects,
+          preconditions: step.preconditions,
+          postconditions: step.postconditions,
+          skipRisk: step.skipRisk,
+          evidenceRequired: step.evidenceRequired,
           allowManualComplete: step.allowManualComplete
         )
       }
@@ -1447,6 +1480,10 @@ struct GeminiSpotterRequest: Equatable {
   let stepTitle: String
   let aiPrompt: String
   let expectedObjects: [String]
+  let preconditions: [String]
+  let postconditions: [String]
+  let skipRisk: String
+  let evidenceRequired: Bool
   let imageBase64: String
   let imageMimeType: String
   let capturedAt: String
@@ -1460,6 +1497,10 @@ struct GeminiSpotterRequest: Equatable {
       "stepTitle": stepTitle,
       "aiPrompt": aiPrompt,
       "expectedObjects": expectedObjects,
+      "preconditions": preconditions,
+      "postconditions": postconditions,
+      "skipRisk": skipRisk,
+      "evidenceRequired": evidenceRequired,
       "imageBase64": imageBase64,
       "imageMimeType": imageMimeType,
       "capturedAt": capturedAt,
@@ -1474,6 +1515,8 @@ struct GeminiSpotterResponse: Decodable, Equatable {
   let confidence: Double
   let reason: String
   let evidenceTimestamp: String
+  let threshold: Double?
+  let model: String?
   let autoComplete: Bool
 }
 

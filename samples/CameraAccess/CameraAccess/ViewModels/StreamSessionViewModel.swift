@@ -49,6 +49,29 @@ enum SopTerminationStatus: String, Codable {
   case userEnded = "user_ended"
 }
 
+enum GuidancePolicy: String {
+  case silent
+  case confirm
+  case nextInstruction = "next_instruction"
+  case warning
+  case helpPrompt = "help_prompt"
+
+  var instruction: String {
+    switch self {
+    case .silent:
+      return "Stay silent unless the worker asks for help, the step changes, or a safety/compliance issue appears."
+    case .confirm:
+      return "Briefly confirm the observed evidence, then stay quiet."
+    case .nextInstruction:
+      return "Give the next step instruction once, then stay quiet while the worker acts."
+    case .warning:
+      return "Warn the worker only about the specific skipped, out-of-order, or unsafe condition."
+    case .helpPrompt:
+      return "Ask one short clarifying question or offer help because the evidence is unclear."
+    }
+  }
+}
+
 enum DossierPipelineStatusKind {
   case info
   case active
@@ -143,6 +166,10 @@ struct SOPStepTemplate: Identifiable, Hashable {
   let critical: Bool
   let aiPrompt: String
   let expectedObjects: [String]
+  let preconditions: [String]
+  let postconditions: [String]
+  let skipRisk: String
+  let evidenceRequired: Bool
   let allowManualComplete: Bool
 
   init(
@@ -155,6 +182,10 @@ struct SOPStepTemplate: Identifiable, Hashable {
     critical: Bool = false,
     aiPrompt: String,
     expectedObjects: [String] = [],
+    preconditions: [String] = [],
+    postconditions: [String] = [],
+    skipRisk: String = "medium",
+    evidenceRequired: Bool = true,
     allowManualComplete: Bool = true
   ) {
     self.id = id
@@ -166,6 +197,10 @@ struct SOPStepTemplate: Identifiable, Hashable {
     self.critical = critical
     self.aiPrompt = aiPrompt
     self.expectedObjects = expectedObjects
+    self.preconditions = preconditions
+    self.postconditions = postconditions
+    self.skipRisk = skipRisk
+    self.evidenceRequired = evidenceRequired
     self.allowManualComplete = allowManualComplete
   }
 }
@@ -515,9 +550,32 @@ struct ChecklistItemState: Identifiable, Codable, Hashable {
   let critical: Bool
   let aiPrompt: String
   let expectedObjects: [String]
+  let preconditions: [String]
+  let postconditions: [String]
+  let skipRisk: String
+  let evidenceRequired: Bool
   let allowManualComplete: Bool
   var isChecked: Bool
   var completionSource: ChecklistCompletionSource
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case itemID
+    case name
+    case description
+    case duration
+    case validation
+    case critical
+    case aiPrompt
+    case expectedObjects
+    case preconditions
+    case postconditions
+    case skipRisk
+    case evidenceRequired
+    case allowManualComplete
+    case isChecked
+    case completionSource
+  }
 
   init(
     id: UUID = UUID(),
@@ -529,6 +587,10 @@ struct ChecklistItemState: Identifiable, Codable, Hashable {
     critical: Bool = false,
     aiPrompt: String? = nil,
     expectedObjects: [String] = [],
+    preconditions: [String] = [],
+    postconditions: [String] = [],
+    skipRisk: String = "medium",
+    evidenceRequired: Bool = true,
     allowManualComplete: Bool = true,
     isChecked: Bool = false,
     completionSource: ChecklistCompletionSource = .pending
@@ -542,9 +604,36 @@ struct ChecklistItemState: Identifiable, Codable, Hashable {
     self.critical = critical
     self.aiPrompt = aiPrompt ?? "Look at the image and confirm whether \"\(name)\" has been completed."
     self.expectedObjects = expectedObjects
+    self.preconditions = preconditions
+    self.postconditions = postconditions
+    self.skipRisk = skipRisk
+    self.evidenceRequired = evidenceRequired
     self.allowManualComplete = allowManualComplete
     self.isChecked = isChecked
     self.completionSource = completionSource
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let name = try container.decode(String.self, forKey: .name)
+    self.init(
+      id: try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+      itemID: try container.decodeIfPresent(String.self, forKey: .itemID),
+      name: name,
+      description: try container.decodeIfPresent(String.self, forKey: .description) ?? "",
+      duration: try container.decodeIfPresent(String.self, forKey: .duration) ?? "30s",
+      validation: try container.decodeIfPresent(String.self, forKey: .validation) ?? "visual",
+      critical: try container.decodeIfPresent(Bool.self, forKey: .critical) ?? false,
+      aiPrompt: try container.decodeIfPresent(String.self, forKey: .aiPrompt),
+      expectedObjects: try container.decodeIfPresent([String].self, forKey: .expectedObjects) ?? [],
+      preconditions: try container.decodeIfPresent([String].self, forKey: .preconditions) ?? [],
+      postconditions: try container.decodeIfPresent([String].self, forKey: .postconditions) ?? [],
+      skipRisk: try container.decodeIfPresent(String.self, forKey: .skipRisk) ?? "medium",
+      evidenceRequired: try container.decodeIfPresent(Bool.self, forKey: .evidenceRequired) ?? true,
+      allowManualComplete: try container.decodeIfPresent(Bool.self, forKey: .allowManualComplete) ?? true,
+      isChecked: try container.decodeIfPresent(Bool.self, forKey: .isChecked) ?? false,
+      completionSource: try container.decodeIfPresent(ChecklistCompletionSource.self, forKey: .completionSource) ?? .pending
+    )
   }
 
   static func normalizedItemID(from name: String) -> String {
@@ -556,6 +645,63 @@ struct ChecklistItemState: Identifiable, Codable, Hashable {
       .replacingOccurrences(of: "__+", with: "_", options: .regularExpression)
       .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
     return collapsed.isEmpty ? UUID().uuidString.lowercased() : collapsed
+  }
+}
+
+struct SpotterEvidenceDecision: Equatable {
+  let shouldAutoComplete: Bool
+  let sampleCount: Int
+  let positiveCount: Int
+  let averagePositiveConfidence: Double
+  let threshold: Double
+}
+
+struct SpotterEvidenceWindow {
+  private struct Sample {
+    let matched: Bool
+    let confidence: Double
+  }
+
+  var maxSamples = 5
+  var minPositiveSamples = 3
+  private var samplesByStepID: [String: [Sample]] = [:]
+
+  mutating func record(
+    stepID: String,
+    matched: Bool,
+    autoComplete: Bool,
+    confidence: Double,
+    threshold: Double
+  ) -> SpotterEvidenceDecision {
+    let positive = matched && autoComplete && confidence >= threshold
+    var samples = samplesByStepID[stepID] ?? []
+    samples.append(Sample(matched: positive, confidence: confidence))
+    if samples.count > maxSamples {
+      samples = Array(samples.suffix(maxSamples))
+    }
+    samplesByStepID[stepID] = samples
+
+    let positives = samples.filter(\.matched)
+    let average = positives.isEmpty
+      ? 0
+      : positives.reduce(0) { $0 + $1.confidence } / Double(positives.count)
+    let shouldAutoComplete = positives.count >= minPositiveSamples && average >= threshold
+
+    return SpotterEvidenceDecision(
+      shouldAutoComplete: shouldAutoComplete,
+      sampleCount: samples.count,
+      positiveCount: positives.count,
+      averagePositiveConfidence: average,
+      threshold: threshold
+    )
+  }
+
+  mutating func reset(stepID: String) {
+    samplesByStepID[stepID] = nil
+  }
+
+  mutating func resetAll() {
+    samplesByStepID.removeAll()
   }
 }
 
@@ -1515,6 +1661,8 @@ class StreamSessionViewModel: ObservableObject {
   @Published var isClosingPackage: Bool = false
   @Published var activeCaptureSOP: SOPTemplate?
   @Published var geminiInstructionSyncStatus: String = ""
+  @Published private(set) var guidancePolicy: GuidancePolicy = .nextInstruction
+  @Published private(set) var guidancePolicyReason: String = "Start the assigned SOP."
   @Published var iPhonePreviewSession: AVCaptureSession?
 
   @Published var availableSOPs: [SOPTemplate] = []
@@ -1669,6 +1817,7 @@ class StreamSessionViewModel: ObservableObject {
     qos: .userInitiated
   )
   private var proofImagesByTargetID: [String: Data] = [:]
+  private var spotterEvidenceWindow = SpotterEvidenceWindow()
   private var lastSpotterInferenceTime: Date = .distantPast
   private var isSpotterInferenceInFlight = false
   private var isFinalizingAndShipping = false
@@ -2337,6 +2486,10 @@ class StreamSessionViewModel: ObservableObject {
           critical: step.critical,
           aiPrompt: step.aiPrompt,
           expectedObjects: step.expectedObjects,
+          preconditions: step.preconditions,
+          postconditions: step.postconditions,
+          skipRisk: step.skipRisk,
+          evidenceRequired: step.evidenceRequired,
           allowManualComplete: step.allowManualComplete
         )
       }
@@ -3152,6 +3305,11 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  private func updateGuidancePolicy(_ policy: GuidancePolicy, reason: String) {
+    guidancePolicy = policy
+    guidancePolicyReason = reason
+  }
+
   private func formatStreamingError(_ error: StreamSessionError) -> String {
     switch error {
     case .internalError:
@@ -3188,9 +3346,15 @@ class StreamSessionViewModel: ObservableObject {
         critical: step.critical,
         aiPrompt: step.aiPrompt,
         expectedObjects: step.expectedObjects,
+        preconditions: step.preconditions,
+        postconditions: step.postconditions,
+        skipRisk: step.skipRisk,
+        evidenceRequired: step.evidenceRequired,
         allowManualComplete: step.allowManualComplete
       )
     }
+    spotterEvidenceWindow.resetAll()
+    updateGuidancePolicy(.nextInstruction, reason: "A new SOP assignment started.")
 
     Task { @MainActor [weak self] in
       await self?.syncGeminiSessionInstruction(for: sop)
@@ -3419,6 +3583,8 @@ class StreamSessionViewModel: ObservableObject {
     checklistItems[index].completionSource = source
 
     let item = checklistItems[index]
+    spotterEvidenceWindow.reset(stepID: item.itemID)
+    updateGuidancePolicy(.nextInstruction, reason: "Step completed by \(source.rawValue).")
     Task {
       await handleChecklistMutation(
         item: item,
@@ -3443,6 +3609,8 @@ class StreamSessionViewModel: ObservableObject {
     checklistItems[index].isChecked = true
     checklistItems[index].completionSource = .vision
     dossierSpotterHitCount += 1
+    spotterEvidenceWindow.reset(stepID: itemID)
+    updateGuidancePolicy(.nextInstruction, reason: "Step completed after stable visual evidence.")
     updateDossierPipelineStatus("Live spotter hit #\(dossierSpotterHitCount)", kind: .active)
 
     let item = checklistItems[index]
@@ -3562,19 +3730,45 @@ class StreamSessionViewModel: ObservableObject {
         )
       }
       let durationMs = (CACurrentMediaTime() - requestStartedAt) * 1000
-      let autoCompleteMatches = matches.filter(\.autoComplete)
+      let stableMatches = await MainActor.run {
+        matches.compactMap { match -> (GeminiLiveSpotter.SpotterMatch, SpotterEvidenceDecision)? in
+          guard let target = pendingItems.first(where: { $0.id == match.id }) else { return nil }
+          let decision = self.spotterEvidenceWindow.record(
+            stepID: match.id,
+            matched: match.matched,
+            autoComplete: match.autoComplete,
+            confidence: match.confidence,
+            threshold: match.threshold
+          )
+          if match.matched && !decision.shouldAutoComplete {
+            self.updateGuidancePolicy(
+              .confirm,
+              reason: "Visual evidence is accumulating for \(target.name)."
+            )
+          } else if !match.matched && decision.sampleCount >= self.spotterEvidenceWindow.maxSamples && target.skipRisk == "high" {
+            self.updateGuidancePolicy(
+              .helpPrompt,
+              reason: "High-risk step evidence is still unclear for \(target.name)."
+            )
+          }
+          return (match, decision)
+        }
+      }
+      let autoCompleteMatches = stableMatches.filter { $0.1.shouldAutoComplete }
       NSLog(
-        "[Spotter] Active-step review targets=%@ matched=%@ autoComplete=%@ duration=%.1fms",
+        "[Spotter] Active-step review targets=%@ matched=%@ stableAutoComplete=%@ duration=%.1fms",
         pendingItems.map(\.id).joined(separator: ","),
         matches.filter(\.matched).map(\.id).joined(separator: ","),
-        autoCompleteMatches.map(\.id).joined(separator: ","),
+        autoCompleteMatches.map { $0.0.id }.joined(separator: ","),
         durationMs
       )
-      if let firstMatch = matches.first {
+      if let first = stableMatches.first {
+        let firstMatch = first.0
+        let firstDecision = first.1
         await WorkerTelemetry.shared.record(
           "gemini_spotter_result",
           source: "gemini_spotter",
-          stage: firstMatch.autoComplete ? "auto_complete" : firstMatch.matched ? "matched" : "not_matched",
+          stage: firstDecision.shouldAutoComplete ? "auto_complete" : firstMatch.matched ? "stabilizing" : "not_matched",
           sessionID: self.currentSopSessionId,
           durationMs: durationMs,
           metricValue: firstMatch.confidence,
@@ -3583,19 +3777,29 @@ class StreamSessionViewModel: ObservableObject {
             "step_id": firstMatch.id,
             "matched": firstMatch.matched,
             "auto_complete": firstMatch.autoComplete,
+            "stable_auto_complete": firstDecision.shouldAutoComplete,
+            "window_samples": firstDecision.sampleCount,
+            "window_positive_samples": firstDecision.positiveCount,
+            "window_average_confidence": firstDecision.averagePositiveConfidence,
+            "threshold": firstDecision.threshold,
             "reason": firstMatch.reason
           ]
         )
       }
 
       await MainActor.run {
-        autoCompleteMatches.forEach {
-          self.captureProofImageIfNeeded(for: $0.id, from: image)
-          self.setChecklistItemCheckedBySpotterID($0.id, evidence: [
-            "ai_confidence": $0.confidence,
-            "ai_reason": $0.reason,
-            "evidence_timestamp": $0.evidenceTimestamp,
-            "auto_complete": $0.autoComplete
+        autoCompleteMatches.forEach { match, decision in
+          self.captureProofImageIfNeeded(for: match.id, from: image)
+          self.setChecklistItemCheckedBySpotterID(match.id, evidence: [
+            "ai_confidence": match.confidence,
+            "ai_reason": match.reason,
+            "evidence_timestamp": match.evidenceTimestamp,
+            "auto_complete": match.autoComplete,
+            "stable_auto_complete": decision.shouldAutoComplete,
+            "window_samples": decision.sampleCount,
+            "window_positive_samples": decision.positiveCount,
+            "window_average_confidence": decision.averagePositiveConfidence,
+            "threshold": decision.threshold
           ])
         }
         self.isSpotterInferenceInFlight = false
@@ -3878,6 +4082,10 @@ class StreamSessionViewModel: ObservableObject {
         name: currentStep.name,
         aiPrompt: currentStep.aiPrompt,
         expectedObjects: currentStep.expectedObjects,
+        preconditions: currentStep.preconditions,
+        postconditions: currentStep.postconditions,
+        skipRisk: currentStep.skipRisk,
+        evidenceRequired: currentStep.evidenceRequired,
         validation: currentStep.validation,
         critical: currentStep.critical
       )
@@ -3927,6 +4135,14 @@ class StreamSessionViewModel: ObservableObject {
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { !$0.isEmpty }
       .joined(separator: ", ")
+    let preconditions = step.preconditions
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: "; ")
+    let postconditions = step.postconditions
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: "; ")
 
     let directNextAction: String
     if hasRemainingSteps {
@@ -3957,6 +4173,17 @@ class StreamSessionViewModel: ObservableObject {
     if !expectedObjects.isEmpty {
       lines.append("Expected objects to look for: \(expectedObjects)")
     }
+    if !preconditions.isEmpty {
+      lines.append("Preconditions before this step: \(preconditions)")
+    }
+    if !postconditions.isEmpty {
+      lines.append("Postconditions that prove completion: \(postconditions)")
+    }
+    lines.append("Skip risk: \(step.skipRisk)")
+    lines.append("Evidence required: \(step.evidenceRequired ? "yes" : "no")")
+    lines.append("Guidance policy: \(guidancePolicy.rawValue)")
+    lines.append("Guidance policy reason: \(guidancePolicyReason)")
+    lines.append("Guidance policy instruction: \(guidancePolicy.instruction)")
 
     if let nextCritical = nextCriticalStepTitleAfterActive(in: sop, nextIndex: nextIndex) {
       lines.append("Next critical checkpoint after this: \(nextCritical)")

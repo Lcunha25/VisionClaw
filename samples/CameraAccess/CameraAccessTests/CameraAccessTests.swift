@@ -477,6 +477,8 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
             confidence: 0.93,
             reason: "Clear visual evidence.",
             evidenceTimestamp: request.capturedAt,
+            threshold: 0.88,
+            model: "gemini-3.5-flash",
             autoComplete: true
           )
         : spotterResponses.removeFirst()
@@ -980,6 +982,57 @@ final class AssignmentDrivenFlowTests: XCTestCase {
   }
 }
 
+final class SpotterEvidenceWindowTests: XCTestCase {
+  func testRequiresMultiplePositiveSamplesBeforeAutoComplete() {
+    var window = SpotterEvidenceWindow()
+
+    let first = window.record(
+      stepID: "seal-check",
+      matched: true,
+      autoComplete: true,
+      confidence: 0.92,
+      threshold: 0.88
+    )
+    let second = window.record(
+      stepID: "seal-check",
+      matched: true,
+      autoComplete: true,
+      confidence: 0.91,
+      threshold: 0.88
+    )
+    let third = window.record(
+      stepID: "seal-check",
+      matched: true,
+      autoComplete: true,
+      confidence: 0.9,
+      threshold: 0.88
+    )
+
+    XCTAssertFalse(first.shouldAutoComplete)
+    XCTAssertFalse(second.shouldAutoComplete)
+    XCTAssertTrue(third.shouldAutoComplete)
+    XCTAssertEqual(third.positiveCount, 3)
+  }
+
+  func testNegativeSamplesPreventStableAutoComplete() {
+    var window = SpotterEvidenceWindow()
+
+    _ = window.record(stepID: "seal-check", matched: true, autoComplete: true, confidence: 0.92, threshold: 0.88)
+    _ = window.record(stepID: "seal-check", matched: false, autoComplete: false, confidence: 0.2, threshold: 0.88)
+    let decision = window.record(
+      stepID: "seal-check",
+      matched: true,
+      autoComplete: true,
+      confidence: 0.91,
+      threshold: 0.88
+    )
+
+    XCTAssertFalse(decision.shouldAutoComplete)
+    XCTAssertEqual(decision.sampleCount, 3)
+    XCTAssertEqual(decision.positiveCount, 2)
+  }
+}
+
 final class OpsAPIClientRoutingTests: XCTestCase {
   override func tearDown() {
     RequestCaptureURLProtocol.handler = nil
@@ -1026,7 +1079,7 @@ final class OpsAPIClientRoutingTests: XCTestCase {
         )
       case "/api/worker/gemini/spotter":
         body = Data(
-          #"{"matched":true,"confidence":0.93,"reason":"Clear visual evidence.","evidenceTimestamp":"2026-05-30T18:31:00.000Z","autoComplete":true}"#
+          #"{"matched":true,"confidence":0.93,"reason":"Clear visual evidence.","evidenceTimestamp":"2026-05-30T18:31:00.000Z","threshold":0.88,"model":"gemini-3.5-flash","autoComplete":true}"#
             .utf8
         )
       default:
@@ -1082,6 +1135,10 @@ final class OpsAPIClientRoutingTests: XCTestCase {
         stepTitle: "Check seal",
         aiPrompt: "Confirm the seal is visible.",
         expectedObjects: ["seal"],
+        preconditions: ["Package is in view"],
+        postconditions: ["Seal is visible"],
+        skipRisk: "medium",
+        evidenceRequired: true,
         imageBase64: "ZmFrZQ==",
         imageMimeType: "image/jpeg",
         capturedAt: "2026-05-30T18:31:00.000Z",

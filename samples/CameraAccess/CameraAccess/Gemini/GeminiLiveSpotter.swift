@@ -9,6 +9,10 @@ final class GeminiLiveSpotter {
     let name: String
     let aiPrompt: String
     let expectedObjects: [String]
+    let preconditions: [String]
+    let postconditions: [String]
+    let skipRisk: String
+    let evidenceRequired: Bool
     let validation: String
     let critical: Bool
   }
@@ -19,6 +23,7 @@ final class GeminiLiveSpotter {
     let confidence: Double
     let reason: String
     let evidenceTimestamp: String
+    let threshold: Double
     let autoComplete: Bool
   }
 
@@ -46,6 +51,10 @@ final class GeminiLiveSpotter {
           stepTitle: item.name,
           aiPrompt: item.aiPrompt,
           expectedObjects: item.expectedObjects,
+          preconditions: item.preconditions,
+          postconditions: item.postconditions,
+          skipRisk: item.skipRisk,
+          evidenceRequired: item.evidenceRequired,
           imageBase64: imagePayload.base64,
           imageMimeType: imagePayload.mimeType,
           capturedAt: capturedAt,
@@ -61,6 +70,7 @@ final class GeminiLiveSpotter {
           confidence: response.confidence,
           reason: response.reason,
           evidenceTimestamp: response.evidenceTimestamp,
+          threshold: response.threshold ?? (item.critical ? 0.94 : ((item.evidenceRequired || item.skipRisk == "high") ? 0.9 : 0.88)),
           autoComplete: response.autoComplete
         )
       )
