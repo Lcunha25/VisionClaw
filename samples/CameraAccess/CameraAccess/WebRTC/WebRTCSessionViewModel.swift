@@ -48,6 +48,20 @@ final class WebRTCRealtimeVideoForwarder: @unchecked Sendable {
       fps,
       waitDurationMs
     )
+    Task {
+      await WorkerTelemetry.shared.record(
+        "webrtc_realtime_forwarder",
+        source: "webrtc",
+        stage: "forwarder",
+        durationMs: waitDurationMs,
+        metricValue: fps,
+        metricUnit: "fps",
+        payload: [
+          "fps": fps,
+          "wait_ms": waitDurationMs
+        ]
+      )
+    }
     pixelBufferStatsWindowStart = now
     pixelBufferForwardCount = 0
   }
@@ -104,6 +118,14 @@ class WebRTCSessionViewModel: ObservableObject {
     incomingRemoteVideoEnabled = wantsIncomingRemoteVideo
     isUsingPhoneFallbackProfile = false
     stablePhoneSenderWindows = 0
+    Task {
+      await WorkerTelemetry.shared.record(
+        "webrtc_session_start",
+        source: "webrtc",
+        stage: "connecting",
+        payload: ["capture_mode": captureMode == .iPhone ? "iphone" : "glasses"]
+      )
+    }
 
     // Fetch TURN credentials for NAT traversal across networks
     let iceServers = await WebRTCConfig.fetchIceServers()
@@ -132,6 +154,13 @@ class WebRTCSessionViewModel: ObservableObject {
     wantsIncomingRemoteVideo = true
     isUsingPhoneFallbackProfile = false
     stablePhoneSenderWindows = 0
+    Task {
+      await WorkerTelemetry.shared.record(
+        "webrtc_session_stop",
+        source: "webrtc",
+        stage: "disconnected"
+      )
+    }
   }
 
   func toggleMute() {
@@ -193,6 +222,13 @@ class WebRTCSessionViewModel: ObservableObject {
 
     signaling.onConnected = { [weak self] in
       Task { @MainActor in
+        Task {
+          await WorkerTelemetry.shared.record(
+            "webrtc_signaling_connected",
+            source: "webrtc",
+            stage: "signaling"
+          )
+        }
         if let code = rejoinCode {
           NSLog("[WebRTC] Reconnected, rejoining room: %@", code)
           self?.signalingClient?.rejoinRoom(code: code)
@@ -211,6 +247,14 @@ class WebRTCSessionViewModel: ObservableObject {
     signaling.onDisconnected = { [weak self] reason in
       Task { @MainActor in
         guard let self, self.isActive else { return }
+        Task {
+          await WorkerTelemetry.shared.record(
+            "webrtc_signaling_disconnected",
+            source: "webrtc",
+            stage: self.savedRoomCode != nil ? "backgrounded" : "failed",
+            payload: ["reason": reason ?? NSNull()]
+          )
+        }
         // Don't fully stop -- mark as backgrounded so we can reconnect
         if self.savedRoomCode != nil {
           self.connectionState = .backgrounded
@@ -302,15 +346,38 @@ class WebRTCSessionViewModel: ObservableObject {
       savedRoomCode = code
       connectionState = .waitingForPeer
       NSLog("[WebRTC] Room created: %@", code)
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_room_created",
+          source: "webrtc",
+          stage: "room",
+          payload: ["room_code_present": true]
+        )
+      }
 
     case .roomRejoined(let code):
       roomCode = code
       savedRoomCode = code
       connectionState = .waitingForPeer
       NSLog("[WebRTC] Room rejoined: %@", code)
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_room_rejoined",
+          source: "webrtc",
+          stage: "room",
+          payload: ["room_code_present": true]
+        )
+      }
 
     case .peerJoined:
       NSLog("[WebRTC] Peer joined, creating offer")
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_peer_joined",
+          source: "webrtc",
+          stage: "peer"
+        )
+      }
       webRTCClient?.createOffer { [weak self] sdp in
         self?.signalingClient?.send(sdp: sdp)
       }
@@ -332,8 +399,23 @@ class WebRTCSessionViewModel: ObservableObject {
     case .peerLeft:
       NSLog("[WebRTC] Peer left")
       connectionState = .waitingForPeer
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_peer_left",
+          source: "webrtc",
+          stage: "peer"
+        )
+      }
 
     case .error(let msg):
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_signaling_error",
+          source: "webrtc",
+          stage: "failed",
+          payload: ["error": msg]
+        )
+      }
       // If rejoin fails (room expired), fall back to creating a new room
       if savedRoomCode != nil && msg == "Room not found" {
         NSLog("[WebRTC] Rejoin failed (room expired), creating new room")
@@ -355,10 +437,31 @@ class WebRTCSessionViewModel: ObservableObject {
     case .connected, .completed:
       connectionState = .connected
       NSLog("[WebRTC] Peer connected")
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_ice_connected",
+          source: "webrtc",
+          stage: "connected"
+        )
+      }
     case .disconnected:
       connectionState = .waitingForPeer
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_ice_disconnected",
+          source: "webrtc",
+          stage: "disconnected"
+        )
+      }
     case .failed:
       connectionState = .error("Connection failed")
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_ice_failed",
+          source: "webrtc",
+          stage: "failed"
+        )
+      }
     case .closed:
       connectionState = .disconnected
     default:
@@ -386,6 +489,21 @@ class WebRTCSessionViewModel: ObservableObject {
     guard currentCaptureMode == .iPhone else { return }
 
     let enqueueMs = stats.lastEnqueueDurationMs ?? 0
+    Task {
+      await WorkerTelemetry.shared.record(
+        "webrtc_sender_stats",
+        source: "webrtc",
+        stage: isUsingPhoneFallbackProfile ? "fallback" : "sender",
+        metricValue: stats.windowFramesPerSecond,
+        metricUnit: "fps",
+        payload: [
+          "sender_fps": stats.windowFramesPerSecond,
+          "dropped_frames": stats.windowDroppedFrames,
+          "enqueue_ms": enqueueMs,
+          "fallback_profile": isUsingPhoneFallbackProfile
+        ]
+      )
+    }
     let isUnderPressure = enqueueMs > 20
       || stats.windowDroppedFrames >= 3
       || stats.windowFramesPerSecond < 14
@@ -395,6 +513,18 @@ class WebRTCSessionViewModel: ObservableObject {
       guard !isUsingPhoneFallbackProfile else { return }
       isUsingPhoneFallbackProfile = true
       webRTCClient?.updateStreamProfile(WebRTCConfig.supportModePhoneFallbackProfile)
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_profile_downgrade",
+          source: "webrtc",
+          stage: "fallback",
+          payload: [
+            "sender_fps": stats.windowFramesPerSecond,
+            "dropped_frames": stats.windowDroppedFrames,
+            "enqueue_ms": enqueueMs
+          ]
+        )
+      }
       NSLog(
         "[WebRTC] Phone sender downgraded to fallback profile (fps=%.1f dropped=%lld enqueue=%@ms)",
         stats.windowFramesPerSecond,
@@ -411,6 +541,14 @@ class WebRTCSessionViewModel: ObservableObject {
       stablePhoneSenderWindows = 0
       isUsingPhoneFallbackProfile = false
       webRTCClient?.updateStreamProfile(WebRTCConfig.supportModePhoneProfile)
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_profile_restore",
+          source: "webrtc",
+          stage: "sender",
+          payload: ["stable_windows": stablePhoneSenderWindows]
+        )
+      }
       NSLog("[WebRTC] Phone sender restored to default support profile")
     }
   }

@@ -4,6 +4,12 @@ import Security
 final class SettingsManager {
   static let shared = SettingsManager()
 
+  private enum RuntimeURL {
+    static let adminBaseURL = "https://admin.embarcaderolabs.cloud"
+    static let opsBaseURL = "https://admin.embarcaderolabs.cloud"
+    static let signalBaseURL = "https://signal.embarcaderolabs.cloud"
+  }
+
   private let defaults = UserDefaults.standard
   private let keychain = KeychainStore(
     service: Bundle.main.bundleIdentifier ?? "com.embarcaderolabs.visionclaw"
@@ -71,9 +77,9 @@ final class SettingsManager {
     get {
       if let stored = defaults.string(forKey: Key.opsBaseURL.rawValue),
          Self.isUsableRuntimeURL(stored) {
-        return stored
+        return migratedRuntimeURL(stored, for: .opsBaseURL)
       }
-      return Secrets.opsBaseURL
+      return migratedRuntimeURL(Secrets.opsBaseURL, for: .opsBaseURL)
     }
     set { defaults.set(newValue, forKey: Key.opsBaseURL.rawValue) }
   }
@@ -82,9 +88,9 @@ final class SettingsManager {
     get {
       if let stored = defaults.string(forKey: Key.adminBaseURL.rawValue),
          Self.isUsableRuntimeURL(stored) {
-        return stored
+        return migratedRuntimeURL(stored, for: .adminBaseURL)
       }
-      return Secrets.adminBaseURL
+      return migratedRuntimeURL(Secrets.adminBaseURL, for: .adminBaseURL)
     }
     set { defaults.set(newValue, forKey: Key.adminBaseURL.rawValue) }
   }
@@ -93,13 +99,13 @@ final class SettingsManager {
     get {
       if let stored = defaults.string(forKey: Key.signalBaseURL.rawValue),
          Self.isUsableRuntimeURL(stored) {
-        return stored
+        return migratedRuntimeURL(stored, for: .signalBaseURL)
       }
       if let legacy = defaults.string(forKey: Key.webrtcSignalingURL.rawValue),
          Self.isUsableRuntimeURL(legacy) {
-        return Self.normalizeSignalBaseURL(legacy)
+        return migratedRuntimeURL(Self.normalizeSignalBaseURL(legacy), for: .signalBaseURL)
       }
-      return Secrets.signalBaseURL
+      return migratedRuntimeURL(Secrets.signalBaseURL, for: .signalBaseURL)
     }
     set { defaults.set(newValue, forKey: Key.signalBaseURL.rawValue) }
   }
@@ -218,6 +224,38 @@ final class SettingsManager {
     } else {
       keychain.set(trimmed, for: key.rawValue)
     }
+  }
+
+  private func migratedRuntimeURL(_ raw: String, for key: Key) -> String {
+    let migrated = Self.migrateRuntimeURL(raw, for: key)
+    if migrated != raw {
+      defaults.set(migrated, forKey: key.rawValue)
+      if key == .signalBaseURL {
+        defaults.set(migrated, forKey: Key.webrtcSignalingURL.rawValue)
+      }
+    }
+    return migrated
+  }
+
+  private static func migrateRuntimeURL(_ raw: String, for key: Key) -> String {
+    let normalized = normalizeSignalBaseURL(raw)
+    let lowercased = normalized.lowercased()
+
+    if lowercased.contains("embarcadero-admin-705096377819.us-central1.run.app") {
+      if key == .signalBaseURL {
+        return RuntimeURL.signalBaseURL
+      }
+      if key == .opsBaseURL {
+        return RuntimeURL.opsBaseURL
+      }
+      return RuntimeURL.adminBaseURL
+    }
+
+    if lowercased.contains("embarcadero-signal-705096377819.us-central1.run.app") {
+      return RuntimeURL.signalBaseURL
+    }
+
+    return normalized
   }
 
   private static func normalizeSignalBaseURL(_ raw: String) -> String {

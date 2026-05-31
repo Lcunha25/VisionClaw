@@ -1,9 +1,28 @@
 import Foundation
 
+struct GeminiLiveCredential: Equatable {
+  let token: String
+  let queryParameterName: String
+  let websocketBaseURL: String
+  let model: String
+
+  static func apiKey(_ apiKey: String = GeminiConfig.apiKey) -> GeminiLiveCredential? {
+    let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed != "YOUR_GEMINI_API_KEY", !trimmed.isEmpty else { return nil }
+    return GeminiLiveCredential(
+      token: trimmed,
+      queryParameterName: "key",
+      websocketBaseURL: GeminiConfig.websocketBaseURL,
+      model: GeminiConfig.model
+    )
+  }
+}
+
 enum GeminiConfig {
   static let websocketBaseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+  static let ephemeralTokenWebsocketBaseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
   // Use a model that exists for this API key and supports native audio interactions.
-  static let model = "models/gemini-2.5-flash-native-audio-latest"
+  static let model = "models/gemini-live-2.5-flash-native-audio"
 
   static let inputAudioSampleRate: Double = 16000
   static let outputAudioSampleRate: Double = 24000
@@ -44,9 +63,14 @@ enum GeminiConfig {
   static var openClawHookToken: String { SettingsManager.shared.openClawHookToken }
   static var openClawGatewayToken: String { SettingsManager.shared.openClawGatewayToken }
 
-  static func websocketURL() -> URL? {
-    guard apiKey != "YOUR_GEMINI_API_KEY" && !apiKey.isEmpty else { return nil }
-    return URL(string: "\(websocketBaseURL)?key=\(apiKey)")
+  static func websocketURL(credential: GeminiLiveCredential) -> URL? {
+    guard var components = URLComponents(string: credential.websocketBaseURL) else { return nil }
+    var queryItems = components.queryItems ?? []
+    queryItems.append(
+      URLQueryItem(name: credential.queryParameterName, value: credential.token)
+    )
+    components.queryItems = queryItems
+    return components.url
   }
 
   static var isConfigured: Bool {

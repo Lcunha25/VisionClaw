@@ -38,6 +38,7 @@ class GeminiLiveService: ObservableObject {
   private let sendQueue = DispatchQueue(label: "gemini.send", qos: .userInitiated)
   private var latestVideoFrameBase64: String?
   private var setupSystemInstruction: String = GeminiConfig.systemInstruction
+  private var setupModel: String = GeminiConfig.model
   private var videoFrameSendCount: Int64 = 0
   private var videoFrameStatsWindowStart = CACurrentMediaTime()
 
@@ -49,13 +50,17 @@ class GeminiLiveService: ObservableObject {
     self.urlSession = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
   }
 
-  func connect(systemInstruction: String? = nil) async -> Bool {
-    guard let url = GeminiConfig.websocketURL() else {
-      connectionState = .error("No API key configured")
+  func connect(
+    systemInstruction: String? = nil,
+    credential: GeminiLiveCredential
+  ) async -> Bool {
+    guard let url = GeminiConfig.websocketURL(credential: credential) else {
+      connectionState = .error("Gemini Live credential is invalid")
       return false
     }
 
     setupSystemInstruction = resolvedSystemInstruction(systemInstruction)
+    setupModel = credential.model
     connectionState = .connecting
 
     let result = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
@@ -64,6 +69,14 @@ class GeminiLiveService: ObservableObject {
       self.delegate.onOpen = { [weak self] protocol_ in
         guard let self else { return }
         Task { @MainActor in
+          Task {
+            await WorkerTelemetry.shared.record(
+              "gemini_socket_open",
+              source: "gemini_live",
+              stage: "connected",
+              payload: ["protocol": protocol_ ?? NSNull()]
+            )
+          }
           self.onSocketOpened?()
           self.connectionState = .settingUp
           self.sendSetupMessage()
@@ -75,6 +88,17 @@ class GeminiLiveService: ObservableObject {
         guard let self else { return }
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason"
         Task { @MainActor in
+          Task {
+            await WorkerTelemetry.shared.record(
+              "gemini_socket_closed",
+              source: "gemini_live",
+              stage: "closed",
+              payload: [
+                "code": code.rawValue,
+                "reason": reasonStr
+              ]
+            )
+          }
           self.resolveConnect(success: false)
           self.connectionState = .disconnected
           self.isModelSpeaking = false
@@ -87,6 +111,14 @@ class GeminiLiveService: ObservableObject {
         guard let self else { return }
         let msg = error?.localizedDescription ?? "Unknown error"
         Task { @MainActor in
+          Task {
+            await WorkerTelemetry.shared.record(
+              "gemini_socket_error",
+              source: "gemini_live",
+              stage: "failed",
+              payload: ["error": msg]
+            )
+          }
           self.resolveConnect(success: false)
           self.connectionState = .error(msg)
           self.isModelSpeaking = false
@@ -220,6 +252,22 @@ class GeminiLiveService: ObservableObject {
       totalDurationMs,
       payloadBytes
     )
+    Task {
+      await WorkerTelemetry.shared.record(
+        "gemini_video_frame_sent",
+        source: "gemini_live",
+        stage: "video",
+        durationMs: totalDurationMs,
+        metricValue: Double(payloadBytes),
+        metricUnit: "bytes",
+        payload: [
+          "frames": Int(videoFrameSendCount),
+          "fps": fps,
+          "encode_ms": encodeDurationMs,
+          "payload_bytes": payloadBytes
+        ]
+      )
+    }
     videoFrameStatsWindowStart = now
     videoFrameSendCount = 0
   }
@@ -250,7 +298,7 @@ class GeminiLiveService: ObservableObject {
   private func sendSetupMessage() {
     let setup: [String: Any] = [
       "setup": [
-        "model": GeminiConfig.model,
+        "model": setupModel,
         "generationConfig": [
           "responseModalities": ["AUDIO"],
           "thinkingConfig": [
@@ -364,6 +412,14 @@ class GeminiLiveService: ObservableObject {
     // Setup complete
     if json["setupComplete"] != nil {
       connectionState = .ready
+      Task {
+        await WorkerTelemetry.shared.record(
+          "gemini_setup_complete",
+          source: "gemini_live",
+          stage: "ready",
+          payload: ["model": setupModel]
+        )
+      }
       resolveConnect(success: true)
       return
     }
@@ -415,6 +471,16 @@ class GeminiLiveService: ObservableObject {
               if let speechEnd = lastUserSpeechEnd, !responseLatencyLogged {
                 let latency = Date().timeIntervalSince(speechEnd)
                 NSLog("[Latency] %.0fms (user speech end -> first audio)", latency * 1000)
+                Task {
+                  await WorkerTelemetry.shared.record(
+                    "gemini_first_audio_latency",
+                    source: "gemini_live",
+                    stage: "first_audio",
+                    durationMs: latency * 1000,
+                    metricValue: latency * 1000,
+                    metricUnit: "ms"
+                  )
+                }
                 responseLatencyLogged = true
               }
             }

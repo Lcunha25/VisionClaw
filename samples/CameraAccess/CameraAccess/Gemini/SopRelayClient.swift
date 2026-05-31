@@ -54,6 +54,30 @@ private extension KeyedDecodingContainer {
     }
     return nil
   }
+
+  func decodeLossyString(forKeys keys: [K]) throws -> String? {
+    for key in keys {
+      if let stringValue = try? decodeIfPresent(String.self, forKey: key) {
+        let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+          return trimmed
+        }
+      }
+      if let intValue = try? decodeIfPresent(Int.self, forKey: key) {
+        return String(intValue)
+      }
+      if let doubleValue = try? decodeIfPresent(Double.self, forKey: key) {
+        if doubleValue.rounded(.towardZero) == doubleValue {
+          return String(Int(doubleValue))
+        }
+        return String(doubleValue)
+      }
+      if let boolValue = try? decodeIfPresent(Bool.self, forKey: key) {
+        return boolValue ? "true" : "false"
+      }
+    }
+    return nil
+  }
 }
 
 private func canonicalLucasSopTitle(for sopID: String) -> String? {
@@ -389,7 +413,9 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
     case label
     case step
     case item
+    case index
     case description
+    case instruction
     case duration
     case validation
     case critical
@@ -437,14 +463,14 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
     }
 
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    let name = try container.decodeIfPresent(String.self, forKey: .name)
-    let fallbackTitle = try container.decodeIfPresent(String.self, forKey: .title)
-    let label = try container.decodeIfPresent(String.self, forKey: .label)
-    let step = try container.decodeIfPresent(String.self, forKey: .step)
-    let item = try container.decodeIfPresent(String.self, forKey: .item)
+    let name = try container.decodeLossyString(forKeys: [.name])
+    let fallbackTitle = try container.decodeLossyString(forKeys: [.title])
+    let label = try container.decodeLossyString(forKeys: [.label])
+    let step = try container.decodeLossyString(forKeys: [.step])
+    let item = try container.decodeLossyString(forKeys: [.item])
     let resolvedTitle = name ?? fallbackTitle ?? label ?? step ?? item ?? "Untitled Step"
     let resolvedID =
-      try container.decodeIfPresent(String.self, forKey: .id)
+      try container.decodeLossyString(forKeys: [.id])
       ?? resolvedTitle.lowercased().replacingOccurrences(of: "[^a-z0-9]+", with: "_", options: .regularExpression)
     let expectedObjects =
       try container.decodeIfPresent([String].self, forKey: .expectedObjects)
@@ -452,19 +478,17 @@ struct WorkerQueueStep: Identifiable, Decodable, Equatable, Hashable {
       ?? []
     self.init(
       id: resolvedID,
-      order: try container.decodeIfPresent(Int.self, forKey: .order) ?? 0,
+      order: try container.decodeLossyInt(forKeys: [.order, .index]) ?? 0,
       title: resolvedTitle,
-      description: try container.decodeIfPresent(String.self, forKey: .description) ?? "",
-      duration: try container.decodeIfPresent(String.self, forKey: .duration) ?? "30s",
-      validation: try container.decodeIfPresent(String.self, forKey: .validation) ?? "visual",
-      critical: try container.decodeIfPresent(Bool.self, forKey: .critical) ?? false,
+      description: try container.decodeLossyString(forKeys: [.description, .instruction]) ?? "",
+      duration: try container.decodeLossyString(forKeys: [.duration]) ?? "30s",
+      validation: try container.decodeLossyString(forKeys: [.validation]) ?? "visual",
+      critical: try container.decodeLossyBool(forKeys: [.critical]) ?? false,
       aiPrompt:
-        try container.decodeIfPresent(String.self, forKey: .aiPrompt)
-        ?? container.decodeIfPresent(String.self, forKey: .aiPromptCamel),
+        try container.decodeLossyString(forKeys: [.aiPrompt, .aiPromptCamel]),
       expectedObjects: expectedObjects.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
       allowManualComplete:
-        try container.decodeIfPresent(Bool.self, forKey: .allowManualComplete)
-        ?? container.decodeIfPresent(Bool.self, forKey: .allowManualCompleteCamel)
+        try container.decodeLossyBool(forKeys: [.allowManualComplete, .allowManualCompleteCamel])
         ?? true
     )
   }
@@ -572,7 +596,7 @@ struct WorkerQueueItem: Identifiable, Decodable, Equatable {
     startsAt = try container.decodeFirstString(forKeys: [.startsAt, .startsAtCamel, .scheduledFor])
     endsAt = try container.decodeFirstString(forKeys: [.endsAt, .endsAtCamel, .completedAtCamel])
 
-    if let direct = try container.decodeIfPresent([String].self, forKey: .steps) {
+    if let direct = try? container.decodeIfPresent([String].self, forKey: .steps) {
       steps = direct.enumerated().map { index, title in
         WorkerQueueStep(
           id: "\(decodedSopID)-\(index + 1)",
@@ -815,14 +839,23 @@ struct BackendExecutionSession: Identifiable, Decodable, Equatable {
 }
 
 struct BackendExecutionEvent: Identifiable, Decodable, Equatable {
-  let id: Int
+  let id: String
   let sessionID: String?
   let eventType: String?
 
   private enum CodingKeys: String, CodingKey {
     case id
     case sessionID = "session_id"
+    case sessionIDCamel = "sessionId"
     case eventType = "event_type"
+    case eventTypeCamel = "eventType"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decodeLossyString(forKeys: [.id]) ?? UUID().uuidString
+    sessionID = try container.decodeFirstString(forKeys: [.sessionID, .sessionIDCamel])
+    eventType = try container.decodeFirstString(forKeys: [.eventType, .eventTypeCamel])
   }
 }
 
@@ -878,6 +911,385 @@ struct BackendMediaUploadTarget: Decodable, Equatable {
   }
 }
 
+struct WorkerTelemetryEvent: @unchecked Sendable {
+  let name: String
+  let source: String
+  let stage: String
+  let occurredAt: String
+  let durationMs: Double?
+  let sequence: Int?
+  let metricValue: Double?
+  let metricUnit: String?
+  let payload: [String: Any]
+
+  init(
+    name: String,
+    source: String,
+    stage: String = "point",
+    occurredAt: Date = Date(),
+    durationMs: Double? = nil,
+    sequence: Int? = nil,
+    metricValue: Double? = nil,
+    metricUnit: String? = nil,
+    payload: [String: Any] = [:]
+  ) {
+    self.name = name
+    self.source = source
+    self.stage = stage
+    self.occurredAt = Self.formatter.string(from: occurredAt)
+    self.durationMs = durationMs
+    self.sequence = sequence
+    self.metricValue = metricValue
+    self.metricUnit = metricUnit
+    self.payload = WorkerTelemetryPayloadSanitizer.sanitizedPayload(payload)
+  }
+
+  var wirePayload: [String: Any] {
+    var payload: [String: Any] = [
+      "name": name,
+      "source": source,
+      "stage": stage,
+      "occurredAt": occurredAt
+    ]
+    if let durationMs { payload["durationMs"] = durationMs }
+    if let sequence { payload["sequence"] = sequence }
+    if let metricValue { payload["metricValue"] = metricValue }
+    if let metricUnit { payload["metricUnit"] = metricUnit }
+    if !self.payload.isEmpty { payload["payload"] = self.payload }
+    return payload
+  }
+
+  private static var formatter: ISO8601DateFormatter {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+  }
+}
+
+struct WorkerTelemetryBatch: @unchecked Sendable {
+  let sessionID: String
+  let deviceID: String?
+  let workerID: String?
+  let platform: String
+  let appBuild: String?
+  let events: [WorkerTelemetryEvent]
+
+  var payload: [String: Any] {
+    var payload: [String: Any] = [
+      "sessionId": sessionID,
+      "platform": platform,
+      "events": events.map(\.wirePayload)
+    ]
+    if let deviceID { payload["deviceId"] = deviceID }
+    if let workerID { payload["workerId"] = workerID }
+    if let appBuild { payload["appBuild"] = appBuild }
+    return payload
+  }
+}
+
+enum WorkerTelemetryPayloadSanitizer {
+  private static let maxStringLength = 512
+  private static let maxArrayLength = 25
+  private static let maxObjectKeys = 60
+  private static let maxPayloadBytes = 8 * 1024
+  private static let maxDepth = 4
+
+  static func sanitizedPayload(_ payload: [String: Any]) -> [String: Any] {
+    let sanitized = sanitizeDictionary(payload, depth: 0)
+    guard jsonByteCount(sanitized) > maxPayloadBytes else { return sanitized }
+
+    var trimmed: [String: Any] = ["_truncated": true]
+    for (key, value) in sanitized {
+      trimmed[key] = value
+      if jsonByteCount(trimmed) > maxPayloadBytes {
+        trimmed.removeValue(forKey: key)
+        break
+      }
+    }
+    return trimmed
+  }
+
+  private static func sanitizeDictionary(_ payload: [String: Any], depth: Int) -> [String: Any] {
+    guard depth <= maxDepth else { return ["_truncated": true] }
+    var sanitized: [String: Any] = [:]
+    let entries = Array(payload.prefix(maxObjectKeys))
+    for (key, value) in entries {
+      sanitized[key] = sanitizeValue(value, key: key, depth: depth + 1)
+    }
+    if payload.count > entries.count {
+      sanitized["_truncated"] = true
+    }
+    return sanitized
+  }
+
+  private static func sanitizeValue(_ value: Any, key: String, depth: Int) -> Any {
+    if value is NSNull {
+      return NSNull()
+    }
+    if let number = value as? NSNumber {
+      return number
+    }
+    if let string = value as? String {
+      return sanitizeString(string, key: key)
+    }
+    if let array = value as? [Any] {
+      var sanitized = array.prefix(maxArrayLength).enumerated().map { index, item in
+        sanitizeValue(item, key: "\(key).\(index)", depth: depth + 1)
+      }
+      if array.count > sanitized.count {
+        sanitized.append("[truncated]")
+      }
+      return sanitized
+    }
+    if let dictionary = value as? [String: Any] {
+      return sanitizeDictionary(dictionary, depth: depth + 1)
+    }
+    return String(describing: value).prefixString(maxStringLength)
+  }
+
+  private static func sanitizeString(_ value: String, key: String) -> String {
+    let lowercasedKey = key.lowercased()
+    if lowercasedKey.contains("authorization")
+      || lowercasedKey.contains("bearer")
+      || lowercasedKey.contains("token")
+      || lowercasedKey.contains("secret")
+      || lowercasedKey.contains("apikey")
+      || lowercasedKey.contains("api_key")
+      || lowercasedKey.contains("password") {
+      return "[redacted]"
+    }
+    if lowercasedKey.contains("signedurl")
+      || lowercasedKey.contains("signed_url")
+      || lowercasedKey.contains("uploadurl")
+      || lowercasedKey.contains("upload_url") {
+      return "[redacted-url]"
+    }
+    if isRawPayloadKey(lowercasedKey) || looksLikeRawPayload(value) {
+      return "[redacted-raw-payload]"
+    }
+    return value.prefixString(maxStringLength)
+  }
+
+  private static func isRawPayloadKey(_ key: String) -> Bool {
+    key.contains("base64")
+      || key.contains("image_data")
+      || key.contains("imagedata")
+      || key.contains("audio_data")
+      || key.contains("audiodata")
+      || key.contains("video_data")
+      || key.contains("videodata")
+      || key.contains("jpeg_data")
+      || key.contains("jpegdata")
+      || key.contains("raw_transcript")
+      || key == "transcript"
+  }
+
+  private static func looksLikeRawPayload(_ value: String) -> Bool {
+    if value.hasPrefix("data:image/") || value.hasPrefix("data:audio/") {
+      return true
+    }
+    guard value.count >= 512, value.count % 4 == 0 else { return false }
+    return value.range(of: #"^[A-Za-z0-9+/]+={0,2}$"#, options: .regularExpression) != nil
+  }
+
+  private static func jsonByteCount(_ payload: [String: Any]) -> Int {
+    guard JSONSerialization.isValidJSONObject(payload),
+          let data = try? JSONSerialization.data(withJSONObject: payload)
+    else {
+      return Int.max
+    }
+    return data.count
+  }
+}
+
+actor WorkerTelemetry {
+  static let shared = WorkerTelemetry()
+
+  typealias Sleeper = @Sendable (UInt64) async -> Void
+
+  private weak var api: WorkerAdminAPI?
+  private var sessionID: String?
+  private var deviceID: String?
+  private var workerID: String?
+  private var platform: String
+  private var appBuild: String?
+  private var sequence: Int = 0
+  private var queue: [WorkerTelemetryEvent] = []
+  private var flushTask: Task<Void, Never>?
+  private var isFlushing = false
+
+  private let flushIntervalNanoseconds: UInt64
+  private let maxBatchSize: Int
+  private let maxQueueSize: Int
+  private let sleeper: Sleeper
+
+  init(
+    api: WorkerAdminAPI? = nil,
+    sessionID: String? = nil,
+    deviceID: String? = nil,
+    workerID: String? = nil,
+    platform: String = "ios",
+    appBuild: String? = WorkerTelemetry.defaultAppBuild,
+    flushIntervalNanoseconds: UInt64 = 5_000_000_000,
+    maxBatchSize: Int = 20,
+    maxQueueSize: Int = 500,
+    sleeper: @escaping Sleeper = { nanoseconds in
+      guard nanoseconds > 0 else { return }
+      try? await Task.sleep(nanoseconds: nanoseconds)
+    }
+  ) {
+    self.api = api
+    self.sessionID = sessionID
+    self.deviceID = deviceID
+    self.workerID = workerID
+    self.platform = platform
+    self.appBuild = appBuild
+    self.flushIntervalNanoseconds = flushIntervalNanoseconds
+    self.maxBatchSize = max(1, maxBatchSize)
+    self.maxQueueSize = max(1, maxQueueSize)
+    self.sleeper = sleeper
+  }
+
+  func configure(
+    api: WorkerAdminAPI,
+    sessionID: String,
+    deviceID: String? = GeminiConfig.deviceID,
+    workerID: String? = nil,
+    platform: String = "ios",
+    appBuild: String? = WorkerTelemetry.defaultAppBuild
+  ) {
+    let cleanedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+    if self.sessionID != cleanedSessionID {
+      queue.removeAll()
+      sequence = 0
+    }
+    self.api = api
+    self.sessionID = cleanedSessionID
+    self.deviceID = trimmed(deviceID)
+    self.workerID = trimmed(workerID)
+    self.platform = platform
+    self.appBuild = trimmed(appBuild)
+  }
+
+  func record(
+    _ name: String,
+    source: String,
+    stage: String = "point",
+    sessionID explicitSessionID: String? = nil,
+    durationMs: Double? = nil,
+    metricValue: Double? = nil,
+    metricUnit: String? = nil,
+    payload: [String: Any] = [:]
+  ) {
+    guard let resolvedSessionID = trimmed(explicitSessionID) ?? sessionID,
+          !resolvedSessionID.isEmpty
+    else {
+      return
+    }
+
+    if sessionID == nil {
+      sessionID = resolvedSessionID
+    }
+
+    sequence += 1
+    queue.append(
+      WorkerTelemetryEvent(
+        name: name,
+        source: source,
+        stage: stage,
+        durationMs: durationMs,
+        sequence: sequence,
+        metricValue: metricValue,
+        metricUnit: metricUnit,
+        payload: payload
+      )
+    )
+    if queue.count > maxQueueSize {
+      queue.removeFirst(queue.count - maxQueueSize)
+    }
+
+    if queue.count >= maxBatchSize {
+      Task { await self.flush() }
+    } else {
+      scheduleFlush()
+    }
+  }
+
+  func flush() async {
+    guard !isFlushing else { return }
+    guard let api, let sessionID, !queue.isEmpty else { return }
+
+    let count = min(maxBatchSize, queue.count)
+    let events = Array(queue.prefix(count))
+    queue.removeFirst(count)
+    isFlushing = true
+
+    do {
+      try await api.sendWorkerTelemetryBatch(
+        WorkerTelemetryBatch(
+          sessionID: sessionID,
+          deviceID: deviceID,
+          workerID: workerID,
+          platform: platform,
+          appBuild: appBuild,
+          events: events
+        )
+      )
+    } catch {
+      queue = Array((events + queue).suffix(maxQueueSize))
+      NSLog("[telemetry] flush failed: %@", error.localizedDescription)
+    }
+
+    isFlushing = false
+    if !queue.isEmpty {
+      scheduleFlush()
+    }
+  }
+
+  func flushAndStop() async {
+    flushTask?.cancel()
+    flushTask = nil
+    await flush()
+  }
+
+  private func scheduleFlush() {
+    guard flushIntervalNanoseconds > 0, flushTask == nil else { return }
+    flushTask = Task { [flushIntervalNanoseconds, sleeper] in
+      await sleeper(flushIntervalNanoseconds)
+      await self.flushAfterDelay()
+    }
+  }
+
+  private func flushAfterDelay() async {
+    flushTask = nil
+    await flush()
+  }
+
+  private func trimmed(_ value: String?) -> String? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !value.isEmpty
+    else {
+      return nil
+    }
+    return value
+  }
+
+  private static var defaultAppBuild: String? {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String
+    let build = info?["CFBundleVersion"] as? String
+    return [version, build].compactMap { $0 }.joined(separator: " ")
+  }
+}
+
+private extension String {
+  func prefixString(_ maxLength: Int) -> String {
+    guard count > maxLength else { return self }
+    let index = self.index(startIndex, offsetBy: maxLength)
+    return "\(self[..<index])..."
+  }
+}
+
 protocol WorkerAdminAPI: AnyObject {
   func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws
   func requestWorkerMediaUploadTarget(
@@ -894,6 +1306,12 @@ protocol WorkerAdminAPI: AnyObject {
     data: Data,
     contentType: String
   ) async throws
+  func sendWorkerTelemetryBatch(_ batch: WorkerTelemetryBatch) async throws
+  func requestGeminiLiveToken(
+    model: String,
+    sessionID: String?
+  ) async throws -> GeminiLiveTokenResponse
+  func requestGeminiSpotter(_ request: GeminiSpotterRequest) async throws -> GeminiSpotterResponse
 }
 
 struct WorkerLiveHeartbeatRequest: Equatable {
@@ -1003,6 +1421,60 @@ struct WorkerMediaFinalizeRequest: Equatable {
     }
     return payload
   }
+}
+
+struct GeminiLiveTokenResponse: Decodable, Equatable {
+  let token: String
+  let expiresAt: String
+  let newSessionExpiresAt: String
+  let model: String
+  let websocketBaseURL: String
+  let queryParameterName: String
+
+  var credential: GeminiLiveCredential {
+    GeminiLiveCredential(
+      token: token,
+      queryParameterName: queryParameterName.isEmpty ? "access_token" : queryParameterName,
+      websocketBaseURL: websocketBaseURL.isEmpty ? GeminiConfig.ephemeralTokenWebsocketBaseURL : websocketBaseURL,
+      model: model.isEmpty ? GeminiConfig.model : model
+    )
+  }
+}
+
+struct GeminiSpotterRequest: Equatable {
+  let sessionID: String
+  let stepID: String
+  let stepTitle: String
+  let aiPrompt: String
+  let expectedObjects: [String]
+  let imageBase64: String
+  let imageMimeType: String
+  let capturedAt: String
+  let critical: Bool
+  let allowAIComplete: Bool
+
+  var payload: [String: Any] {
+    [
+      "sessionId": sessionID,
+      "stepId": stepID,
+      "stepTitle": stepTitle,
+      "aiPrompt": aiPrompt,
+      "expectedObjects": expectedObjects,
+      "imageBase64": imageBase64,
+      "imageMimeType": imageMimeType,
+      "capturedAt": capturedAt,
+      "critical": critical,
+      "allowAIComplete": allowAIComplete
+    ]
+  }
+}
+
+struct GeminiSpotterResponse: Decodable, Equatable {
+  let matched: Bool
+  let confidence: Double
+  let reason: String
+  let evidenceTimestamp: String
+  let autoComplete: Bool
 }
 
 struct BackendMemoryLink: Identifiable, Decodable, Equatable {
@@ -1398,6 +1870,57 @@ final class OpsAPIClient: WorkerAdminAPI {
       method: "POST",
       payload: finalize.payload
     )
+  }
+
+  func sendWorkerTelemetryBatch(_ batch: WorkerTelemetryBatch) async throws {
+    _ = try await performWorkerRequest(
+      path: "/api/worker/telemetry",
+      method: "POST",
+      payload: batch.payload
+    )
+  }
+
+  func requestGeminiLiveToken(
+    model: String,
+    sessionID: String? = nil
+  ) async throws -> GeminiLiveTokenResponse {
+    var payload: [String: Any] = [
+      "model": model,
+      "responseModalities": ["AUDIO"]
+    ]
+    if let sessionID, !sessionID.isEmpty {
+      payload["sessionId"] = sessionID
+    }
+
+    let data = try await performWorkerRequest(
+      path: "/api/worker/gemini/live-token",
+      method: "POST",
+      payload: payload
+    )
+
+    do {
+      return try decoder.decode(GeminiLiveTokenResponse.self, from: data)
+    } catch {
+      let body = String(data: data, encoding: .utf8) ?? "<non-utf8 response>"
+      NSLog("[admin-ingest] Failed decoding /api/worker/gemini/live-token -> %@", body)
+      throw error
+    }
+  }
+
+  func requestGeminiSpotter(_ request: GeminiSpotterRequest) async throws -> GeminiSpotterResponse {
+    let data = try await performWorkerRequest(
+      path: "/api/worker/gemini/spotter",
+      method: "POST",
+      payload: request.payload
+    )
+
+    do {
+      return try decoder.decode(GeminiSpotterResponse.self, from: data)
+    } catch {
+      let body = String(data: data, encoding: .utf8) ?? "<non-utf8 response>"
+      NSLog("[admin-ingest] Failed decoding /api/worker/gemini/spotter -> %@", body)
+      throw error
+    }
   }
 
   func uploadBinary(

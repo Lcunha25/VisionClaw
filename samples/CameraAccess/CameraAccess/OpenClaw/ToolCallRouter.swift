@@ -22,6 +22,17 @@ class ToolCallRouter {
 
     NSLog("[ToolCall] Received: %@ (id: %@) args: %@",
           callName, callId, String(describing: call.args))
+    Task {
+      await WorkerTelemetry.shared.record(
+        "tool_call_received",
+        source: "gemini_live",
+        stage: "tool",
+        payload: [
+          "tool_name": callName,
+          "arg_keys": Array(call.args.keys).sorted()
+        ]
+      )
+    }
 
     // Circuit breaker: stop sending tool calls after repeated failures
     if consecutiveFailures >= maxConsecutiveFailures {
@@ -31,6 +42,17 @@ class ToolCallRouter {
         "Tool execution is temporarily unavailable after \(consecutiveFailures) consecutive failures. " +
         "Please tell the user you cannot complete this action right now and suggest they check their Video AI Analyst gateway connection."
       )
+      Task {
+        await WorkerTelemetry.shared.record(
+          "tool_call_rejected",
+          source: "gemini_live",
+          stage: "failed",
+          payload: [
+            "tool_name": callName,
+            "consecutive_failures": consecutiveFailures
+          ]
+        )
+      }
       let response = buildToolResponse(callId: callId, name: callName, result: errorResult)
       sendResponse(response)
       return
@@ -38,10 +60,19 @@ class ToolCallRouter {
 
     let task = Task { @MainActor in
       let taskDesc = call.args["task"] as? String ?? String(describing: call.args)
+      let startedAt = Date()
       let result = await bridge.delegateTask(task: taskDesc, toolName: callName)
 
       guard !Task.isCancelled else {
         NSLog("[ToolCall] Task %@ was cancelled, skipping response", callId)
+        Task {
+          await WorkerTelemetry.shared.record(
+            "tool_call_cancelled",
+            source: "gemini_live",
+            stage: "cancelled",
+            payload: ["tool_name": callName]
+          )
+        }
         return
       }
 
@@ -54,6 +85,25 @@ class ToolCallRouter {
 
       NSLog("[ToolCall] Result for %@ (id: %@): %@",
             callName, callId, String(describing: result))
+      let resultStage: String
+      switch result {
+      case .success:
+        resultStage = "success"
+      case .failure:
+        resultStage = "failed"
+      }
+      Task {
+        await WorkerTelemetry.shared.record(
+          "tool_call_result",
+          source: "gemini_live",
+          stage: resultStage,
+          durationMs: Date().timeIntervalSince(startedAt) * 1000,
+          payload: [
+            "tool_name": callName,
+            "consecutive_failures": self.consecutiveFailures
+          ]
+        )
+      }
 
       let response = self.buildToolResponse(callId: callId, name: callName, result: result)
       sendResponse(response)
@@ -71,6 +121,13 @@ class ToolCallRouter {
         NSLog("[ToolCall] Cancelling in-flight call: %@", id)
         task.cancel()
         inFlightTasks.removeValue(forKey: id)
+        Task {
+          await WorkerTelemetry.shared.record(
+            "tool_call_cancellation_requested",
+            source: "gemini_live",
+            stage: "cancelled"
+          )
+        }
       }
     }
     bridge.lastToolCallStatus = .cancelled(ids.first ?? "unknown")

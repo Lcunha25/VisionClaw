@@ -571,7 +571,11 @@ private enum WorkerLiveLogger {
     byteSize: Int? = nil,
     retryCount: Int? = nil,
     uploadState: String? = nil,
-    error: String? = nil
+    error: String? = nil,
+    durationMs: Double? = nil,
+    metricValue: Double? = nil,
+    metricUnit: String? = nil,
+    telemetry: WorkerTelemetry? = nil
   ) {
     let payload: [String: Any] = [
       "event": event,
@@ -584,7 +588,8 @@ private enum WorkerLiveLogger {
       "byteSize": byteSize ?? NSNull(),
       "retryCount": retryCount ?? NSNull(),
       "uploadState": uploadState ?? NSNull(),
-      "error": error ?? NSNull()
+      "error": error ?? NSNull(),
+      "durationMs": durationMs ?? NSNull()
     ]
 
     guard JSONSerialization.isValidJSONObject(payload),
@@ -596,6 +601,49 @@ private enum WorkerLiveLogger {
     }
 
     NSLog("[worker-live] %@", encoded)
+
+    guard let telemetry, let sessionID else { return }
+    Task {
+      await telemetry.record(
+        event,
+        source: telemetrySource(for: event),
+        stage: telemetryStage(for: event, uploadState: uploadState),
+        sessionID: sessionID,
+        durationMs: durationMs,
+        metricValue: metricValue,
+        metricUnit: metricUnit,
+        payload: payload
+      )
+    }
+  }
+
+  private static func telemetrySource(for event: String) -> String {
+    if event.contains("upload") || event.contains("finalize") || event == "retry_scheduled" {
+      return "media_upload"
+    }
+    if event.contains("heartbeat") {
+      return "ios_app"
+    }
+    return "ios_app"
+  }
+
+  private static func telemetryStage(for event: String, uploadState: String?) -> String {
+    if event.contains("failure") || uploadState == "failed" {
+      return "failed"
+    }
+    if event.contains("success") || uploadState == "uploaded" {
+      return "uploaded"
+    }
+    if event.contains("target") {
+      return "target"
+    }
+    if event.contains("heartbeat") {
+      return "heartbeat"
+    }
+    if event == "retry_scheduled" {
+      return "retry"
+    }
+    return "point"
   }
 }
 
@@ -618,6 +666,7 @@ actor WorkerAdminLiveSessionCoordinator {
   typealias FileLoader = @Sendable (URL) async -> Data?
 
   private let api: WorkerAdminAPI
+  private let telemetry: WorkerTelemetry?
   private let heartbeatIntervalNanoseconds: UInt64
   private let sleeper: Sleeper
   private let fileLoader: FileLoader
@@ -636,6 +685,7 @@ actor WorkerAdminLiveSessionCoordinator {
     api: WorkerAdminAPI,
     sessionID: String? = nil,
     heartbeatIntervalNanoseconds: UInt64 = 7_000_000_000,
+    telemetry: WorkerTelemetry? = nil,
     sleeper: @escaping Sleeper = { nanoseconds in
       guard nanoseconds > 0 else { return }
       try? await Task.sleep(nanoseconds: nanoseconds)
@@ -647,6 +697,7 @@ actor WorkerAdminLiveSessionCoordinator {
     }
   ) {
     self.api = api
+    self.telemetry = telemetry
     self.sessionID = sessionID
     self.heartbeatIntervalNanoseconds = heartbeatIntervalNanoseconds
     self.sleeper = sleeper
@@ -662,6 +713,22 @@ actor WorkerAdminLiveSessionCoordinator {
     self.sessionID = sessionID
     self.currentStepIndex = currentStepIndex
     self.helpRequested = helpRequested
+    await telemetry?.configure(
+      api: api,
+      sessionID: sessionID,
+      deviceID: GeminiConfig.deviceID
+    )
+    await telemetry?.record(
+      "session_start",
+      source: "ios_app",
+      stage: "started",
+      sessionID: sessionID,
+      payload: [
+        "current_step_index": currentStepIndex,
+        "help_requested": helpRequested,
+        "room_code_present": Self.trimmed(roomCode) != nil
+      ]
+    )
     if let roomCode = Self.trimmed(roomCode) {
       self.roomCode = roomCode
     }
@@ -703,6 +770,20 @@ actor WorkerAdminLiveSessionCoordinator {
 
   func enqueueFrameUpload(data: Data) async {
     queuedFrameData = data
+    if let sessionID {
+      await telemetry?.record(
+        "frame_enqueued",
+        source: "media_upload",
+        stage: "queued",
+        sessionID: sessionID,
+        metricValue: Double(data.count),
+        metricUnit: "bytes",
+        payload: [
+          "bytes": data.count,
+          "latest_frame_only": true
+        ]
+      )
+    }
     guard frameUploadTask == nil else { return }
     frameUploadTask = Task {
       await self.drainQueuedFrames()
@@ -755,6 +836,18 @@ actor WorkerAdminLiveSessionCoordinator {
     let result = await uploadVideoRecording(from: videoFileURL, source: videoSource)
     await sendHeartbeat()
     await onBeforeMarkEnded()
+    await telemetry?.record(
+      "session_end_requested",
+      source: "ios_app",
+      stage: result.succeeded ? "uploaded" : "failed",
+      sessionID: sessionID,
+      payload: [
+        "video_upload_state": result.uploadState,
+        "video_bytes": result.byteSize,
+        "error": result.errorMessage ?? NSNull()
+      ]
+    )
+    await telemetry?.flushAndStop()
 
     heartbeatTask?.cancel()
     heartbeatTask = nil
@@ -767,6 +860,15 @@ actor WorkerAdminLiveSessionCoordinator {
     frameUploadTask = nil
     heartbeatTask?.cancel()
     heartbeatTask = nil
+    if let sessionID {
+      await telemetry?.record(
+        "session_stop",
+        source: "ios_app",
+        stage: "stopped",
+        sessionID: sessionID
+      )
+      await telemetry?.flushAndStop()
+    }
   }
 
   private func sendHeartbeat() async {
@@ -788,10 +890,12 @@ actor WorkerAdminLiveSessionCoordinator {
       roomCode: roomCode,
       bucket: lastFrameBucket,
       path: lastFramePath,
-      uploadState: "active"
+      uploadState: "active",
+      telemetry: telemetry
     )
 
     do {
+      let heartbeatStartedAt = CACurrentMediaTime()
       try await retry(
         sessionID: sessionID,
         roomCode: roomCode,
@@ -809,7 +913,9 @@ actor WorkerAdminLiveSessionCoordinator {
         roomCode: roomCode,
         bucket: lastFrameBucket,
         path: lastFramePath,
-        uploadState: "active"
+        uploadState: "active",
+        durationMs: (CACurrentMediaTime() - heartbeatStartedAt) * 1000,
+        telemetry: telemetry
       )
     } catch {
       WorkerLiveLogger.log(
@@ -819,7 +925,8 @@ actor WorkerAdminLiveSessionCoordinator {
         bucket: lastFrameBucket,
         path: lastFramePath,
         uploadState: "active",
-        error: error.localizedDescription
+        error: error.localizedDescription,
+        telemetry: telemetry
       )
     }
   }
@@ -878,8 +985,10 @@ actor WorkerAdminLiveSessionCoordinator {
     }
 
     let logPrefix = assetType == "frame" ? "frame" : "video"
+    let assetUploadStartedAt = CACurrentMediaTime()
 
     do {
+      let targetStartedAt = CACurrentMediaTime()
       let target = try await retry(
         sessionID: sessionID,
         roomCode: roomCode,
@@ -906,7 +1015,9 @@ actor WorkerAdminLiveSessionCoordinator {
         bucket: target.bucket,
         path: target.path,
         byteSize: byteSize,
-        uploadState: "pending"
+        uploadState: "pending",
+        durationMs: (CACurrentMediaTime() - targetStartedAt) * 1000,
+        telemetry: telemetry
       )
 
       guard let data, !data.isEmpty else {
@@ -920,7 +1031,9 @@ actor WorkerAdminLiveSessionCoordinator {
           path: target.path,
           byteSize: byteSize,
           uploadState: "failed",
-          error: missingDataError
+          error: missingDataError,
+          durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+          telemetry: telemetry
         )
         return await finalizeFailure(
           logPrefix: logPrefix,
@@ -933,6 +1046,7 @@ actor WorkerAdminLiveSessionCoordinator {
       }
 
       do {
+        let binaryUploadStartedAt = CACurrentMediaTime()
         try await retry(
           sessionID: sessionID,
           roomCode: roomCode,
@@ -955,10 +1069,15 @@ actor WorkerAdminLiveSessionCoordinator {
           bucket: target.bucket,
           path: target.path,
           byteSize: byteSize,
-          uploadState: "pending"
+          uploadState: "pending",
+          durationMs: (CACurrentMediaTime() - binaryUploadStartedAt) * 1000,
+          metricValue: Double(byteSize),
+          metricUnit: "bytes",
+          telemetry: telemetry
         )
 
         do {
+          let finalizeStartedAt = CACurrentMediaTime()
           try await retry(
             sessionID: sessionID,
             roomCode: roomCode,
@@ -991,7 +1110,11 @@ actor WorkerAdminLiveSessionCoordinator {
             bucket: target.bucket,
             path: target.path,
             byteSize: byteSize,
-            uploadState: "uploaded"
+            uploadState: "uploaded",
+            durationMs: (CACurrentMediaTime() - finalizeStartedAt) * 1000,
+            metricValue: Double(byteSize),
+            metricUnit: "bytes",
+            telemetry: telemetry
           )
 
           return WorkerMediaUploadResult(
@@ -1015,7 +1138,9 @@ actor WorkerAdminLiveSessionCoordinator {
             path: target.path,
             byteSize: byteSize,
             uploadState: "uploaded",
-            error: finalizeError
+            error: finalizeError,
+            durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+            telemetry: telemetry
           )
           return await finalizeFailure(
             logPrefix: logPrefix,
@@ -1038,7 +1163,9 @@ actor WorkerAdminLiveSessionCoordinator {
           path: target.path,
           byteSize: byteSize,
           uploadState: "failed",
-          error: uploadError
+          error: uploadError,
+          durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+          telemetry: telemetry
         )
         return await finalizeFailure(
           logPrefix: logPrefix,
@@ -1057,7 +1184,9 @@ actor WorkerAdminLiveSessionCoordinator {
         assetType: assetType,
         byteSize: byteSize,
         uploadState: "failed",
-        error: error.localizedDescription
+        error: error.localizedDescription,
+        durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+        telemetry: telemetry
       )
 
       return WorkerMediaUploadResult(
@@ -1114,7 +1243,8 @@ actor WorkerAdminLiveSessionCoordinator {
         path: target.path,
         byteSize: byteSize,
         uploadState: "failed",
-        error: errorMessage
+        error: errorMessage,
+        telemetry: telemetry
       )
     } catch {
       WorkerLiveLogger.log(
@@ -1127,7 +1257,8 @@ actor WorkerAdminLiveSessionCoordinator {
         path: target.path,
         byteSize: byteSize,
         uploadState: "failed",
-        error: error.localizedDescription
+        error: error.localizedDescription,
+        telemetry: telemetry
       )
     }
 
@@ -1176,7 +1307,8 @@ actor WorkerAdminLiveSessionCoordinator {
           byteSize: byteSize,
           retryCount: retryCount,
           uploadState: uploadState,
-          error: error.localizedDescription
+          error: error.localizedDescription,
+          telemetry: telemetry
         )
 
         await sleeper(backoffSchedule[attempt])
@@ -1924,6 +2056,10 @@ class StreamSessionViewModel: ObservableObject {
 
   func toggleGeminiAssistant() async {
     geminiAssistant.streamingMode = streamingMode
+    geminiAssistant.configureWorkerAdminAPI(
+      opsAPIClient,
+      sessionID: activeExecutionSession?.id
+    )
     if geminiAssistant.isGeminiActive {
       geminiAssistant.stopSession()
       return
@@ -2435,7 +2571,11 @@ class StreamSessionViewModel: ObservableObject {
 
     let sessionId = await createOrFallbackSessionID(for: sop)
     await workerAdminSync?.stop()
-    workerAdminSync = WorkerAdminLiveSessionCoordinator(api: opsAPIClient)
+    workerAdminSync = WorkerAdminLiveSessionCoordinator(
+      api: opsAPIClient,
+      telemetry: WorkerTelemetry.shared
+    )
+    geminiLiveSpotter.configure(api: opsAPIClient)
     currentSopSessionId = sessionId
     activeCaptureSOP = sop
     isSopAuditRunning = true
@@ -3050,7 +3190,8 @@ class StreamSessionViewModel: ObservableObject {
     let recoverySync = WorkerAdminLiveSessionCoordinator(
       api: opsAPIClient,
       sessionID: pendingRecording.sessionID,
-      heartbeatIntervalNanoseconds: 0
+      heartbeatIntervalNanoseconds: 0,
+      telemetry: WorkerTelemetry.shared
     )
 
     let result = await recoverySync.uploadVideoRecording(
@@ -3232,6 +3373,10 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func setChecklistItemCheckedBySpotterID(_ itemID: String) {
+    setChecklistItemCheckedBySpotterID(itemID, evidence: nil)
+  }
+
+  private func setChecklistItemCheckedBySpotterID(_ itemID: String, evidence: [String: Any]?) {
     guard let index = checklistItems.firstIndex(where: { $0.itemID == itemID }) else { return }
     guard !checklistItems[index].isChecked else { return }
 
@@ -3245,7 +3390,8 @@ class StreamSessionViewModel: ObservableObject {
       await handleChecklistMutation(
         item: item,
         stepIndex: index,
-        eventType: "step_complete"
+        eventType: "step_complete",
+        evidence: evidence
       )
     }
 
@@ -3334,25 +3480,63 @@ class StreamSessionViewModel: ObservableObject {
 
     Task { [weak self] in
       guard let self else { return }
-      let matchedIDs: [String]
+      let matches: [GeminiLiveSpotter.SpotterMatch]
       let requestStartedAt = CACurrentMediaTime()
       do {
-        matchedIDs = try await self.geminiLiveSpotter.detectVisibleItemIDs(image: image, items: pendingItems)
+        matches = try await self.geminiLiveSpotter.detectVisibleItemMatches(
+          image: image,
+          items: pendingItems,
+          sessionID: self.currentSopSessionId
+        )
       } catch {
-        matchedIDs = []
+        matches = []
+        await WorkerTelemetry.shared.record(
+          "gemini_spotter_failed",
+          source: "gemini_spotter",
+          stage: "failed",
+          sessionID: self.currentSopSessionId,
+          payload: [
+            "error": error.localizedDescription,
+            "target_count": pendingItems.count
+          ]
+        )
       }
       let durationMs = (CACurrentMediaTime() - requestStartedAt) * 1000
+      let autoCompleteMatches = matches.filter(\.autoComplete)
       NSLog(
-        "[Spotter] Active-step review targets=%@ matched=%@ duration=%.1fms",
+        "[Spotter] Active-step review targets=%@ matched=%@ autoComplete=%@ duration=%.1fms",
         pendingItems.map(\.id).joined(separator: ","),
-        matchedIDs.joined(separator: ","),
+        matches.filter(\.matched).map(\.id).joined(separator: ","),
+        autoCompleteMatches.map(\.id).joined(separator: ","),
         durationMs
       )
+      if let firstMatch = matches.first {
+        await WorkerTelemetry.shared.record(
+          "gemini_spotter_result",
+          source: "gemini_spotter",
+          stage: firstMatch.autoComplete ? "auto_complete" : firstMatch.matched ? "matched" : "not_matched",
+          sessionID: self.currentSopSessionId,
+          durationMs: durationMs,
+          metricValue: firstMatch.confidence,
+          metricUnit: "confidence",
+          payload: [
+            "step_id": firstMatch.id,
+            "matched": firstMatch.matched,
+            "auto_complete": firstMatch.autoComplete,
+            "reason": firstMatch.reason
+          ]
+        )
+      }
 
       await MainActor.run {
-        matchedIDs.forEach {
-          self.captureProofImageIfNeeded(for: $0, from: image)
-          self.setChecklistItemCheckedBySpotterID($0)
+        autoCompleteMatches.forEach {
+          self.captureProofImageIfNeeded(for: $0.id, from: image)
+          self.setChecklistItemCheckedBySpotterID($0.id, evidence: [
+            "ai_confidence": $0.confidence,
+            "ai_reason": $0.reason,
+            "evidence_timestamp": $0.evidenceTimestamp,
+            "auto_complete": $0.autoComplete
+          ])
         }
         self.isSpotterInferenceInFlight = false
       }
@@ -3569,18 +3753,23 @@ class StreamSessionViewModel: ObservableObject {
   private func handleChecklistMutation(
     item: ChecklistItemState,
     stepIndex: Int,
-    eventType: String
+    eventType: String,
+    evidence: [String: Any]? = nil
   ) async {
     let nextIndex = nextIncompleteStepIndex()
     await workerAdminSync?.updateCurrentStepIndex(nextIndex, sendImmediateHeartbeat: true)
+    var eventPayload: [String: Any] = [
+      "step_index": stepIndex,
+      "step_name": item.name,
+      "source": item.completionSource.rawValue,
+      "checked": item.isChecked
+    ]
+    if let evidence {
+      eventPayload["evidence"] = evidence
+    }
     await postExecutionEvent(
       type: eventType,
-      payload: [
-        "step_index": stepIndex,
-        "step_name": item.name,
-        "source": item.completionSource.rawValue,
-        "checked": item.isChecked
-      ]
+      payload: eventPayload
     )
     await patchActiveExecutionSession(
       ExecutionSessionPatch(
@@ -3605,7 +3794,9 @@ class StreamSessionViewModel: ObservableObject {
         id: currentStep.itemID,
         name: currentStep.name,
         aiPrompt: currentStep.aiPrompt,
-        expectedObjects: currentStep.expectedObjects
+        expectedObjects: currentStep.expectedObjects,
+        validation: currentStep.validation,
+        critical: currentStep.critical
       )
     ]
   }

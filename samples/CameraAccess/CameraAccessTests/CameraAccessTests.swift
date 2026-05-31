@@ -160,6 +160,95 @@ class ViewModelIntegrationTests: XCTestCase {
 }
 #endif
 
+final class BackendBootstrapDecodingTests: XCTestCase {
+  func testBootstrapPayloadAcceptsCloudSQLNumericStringsAndNumericStepDurations() throws {
+    let json = """
+    {
+      "worker": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "login_code": "EMBC-0001",
+        "display_name": "Lucas Pereira",
+        "role": "Kitchen Staff",
+        "active": true
+      },
+      "device": {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "worker_id": "11111111-1111-1111-1111-111111111111",
+        "platform": "ios",
+        "device_label": "iPhone"
+      },
+      "queue": [
+        {
+          "shift_assignment_id": "33333333-3333-4333-8333-333333333333",
+          "worker_id": "11111111-1111-1111-1111-111111111111",
+          "package_id": "44444444-4444-4444-8444-444444444444",
+          "package_title": "Meal Prep",
+          "package_version": "2",
+          "package_run_id": "55555555-5555-4555-8555-555555555555",
+          "sop_id": "66666666-6666-4666-8666-666666666666",
+          "sop_title": "Burger Assembly",
+          "sop_version": "1",
+          "sort_order": "1",
+          "required": "true",
+          "active": true,
+          "source_type": "package",
+          "steps": [
+            {
+              "id": "step-1",
+              "title": "Prepare the bun",
+              "duration": 15,
+              "validation": "visual",
+              "allowManualComplete": false
+            },
+            {
+              "index": 1,
+              "title": "Record temperature log",
+              "instruction": "Read the temperature logger display.",
+              "requires_photo": false
+            }
+          ]
+        }
+      ],
+      "assigned_packages": [],
+      "worker_session_token": "worker-token",
+      "worker_session_expires_at": "2026-05-31T14:43:20.929Z"
+    }
+    """
+
+    let payload = try JSONDecoder().decode(BootstrapPayload.self, from: Data(json.utf8))
+
+    XCTAssertEqual(payload.worker.loginCode, "EMBC-0001")
+    XCTAssertEqual(payload.queue.first?.sortOrder, 1)
+    XCTAssertEqual(payload.queue.first?.packageVersion, 2)
+    XCTAssertEqual(payload.queue.first?.steps.first?.duration, "15")
+    XCTAssertEqual(payload.queue.first?.steps.last?.description, "Read the temperature logger display.")
+    XCTAssertEqual(payload.workerSessionToken, "worker-token")
+  }
+
+  func testExecutionEventDecodesCloudSQLUuidResponse() throws {
+    let json = """
+    {
+      "id": "bb81da90-9e5e-491e-ba02-0c91730b35b9",
+      "session_id": "0089c81d-e79f-407f-a235-a1b84a535c9c",
+      "event_type": "step_complete",
+      "payload": {
+        "source": "vision",
+        "checked": true,
+        "step_index": 0
+      },
+      "created_at": "2026-05-31T02:57:53.933Z",
+      "workspace_id": "00000000-0000-4000-8000-000000000001"
+    }
+    """
+
+    let event = try JSONDecoder().decode(BackendExecutionEvent.self, from: Data(json.utf8))
+
+    XCTAssertEqual(event.id, "bb81da90-9e5e-491e-ba02-0c91730b35b9")
+    XCTAssertEqual(event.sessionID, "0089c81d-e79f-407f-a235-a1b84a535c9c")
+    XCTAssertEqual(event.eventType, "step_complete")
+  }
+}
+
 private final class RequestCaptureURLProtocol: URLProtocol {
   static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
@@ -204,6 +293,9 @@ private struct WorkerAdminAPISnapshot {
   let uploadTargetRequests: [WorkerUploadTargetRequestCapture]
   let uploadCalls: [(assetID: String, byteSize: Int, contentType: String)]
   let finalizeRequests: [WorkerMediaFinalizeRequest]
+  let telemetryBatches: [WorkerTelemetryBatch]
+  let liveTokenRequests: [(model: String, sessionID: String?)]
+  let spotterRequests: [GeminiSpotterRequest]
 }
 
 private func requestBodyData(from request: URLRequest) -> Data? {
@@ -241,13 +333,21 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
   var uploadTargetErrors: [Error] = []
   var uploadErrors: [Error] = []
   var finalizeErrors: [Error] = []
+  var telemetryErrors: [Error] = []
+  var liveTokenErrors: [Error] = []
+  var spotterErrors: [Error] = []
   var uploadTargetResponses: [WorkerMediaUploadTarget] = []
+  var liveTokenResponses: [GeminiLiveTokenResponse] = []
+  var spotterResponses: [GeminiSpotterResponse] = []
   var onFinalizeAttempt: ((WorkerMediaFinalizeRequest) -> Void)?
 
   private var recordedHeartbeats: [WorkerLiveHeartbeatRequest] = []
   private var recordedUploadTargetRequests: [WorkerUploadTargetRequestCapture] = []
   private var recordedUploadCalls: [(assetID: String, byteSize: Int, contentType: String)] = []
   private var recordedFinalizeRequests: [WorkerMediaFinalizeRequest] = []
+  private var recordedTelemetryBatches: [WorkerTelemetryBatch] = []
+  private var recordedLiveTokenRequests: [(model: String, sessionID: String?)] = []
+  private var recordedSpotterRequests: [GeminiSpotterRequest] = []
 
   func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws {
     let queuedError = lock.withLock { () -> Error? in
@@ -330,6 +430,65 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
     }
   }
 
+  func sendWorkerTelemetryBatch(_ batch: WorkerTelemetryBatch) async throws {
+    let queuedError = lock.withLock { () -> Error? in
+      recordedTelemetryBatches.append(batch)
+      return telemetryErrors.isEmpty ? nil : telemetryErrors.removeFirst()
+    }
+
+    if let queuedError {
+      throw queuedError
+    }
+  }
+
+  func requestGeminiLiveToken(
+    model: String,
+    sessionID: String?
+  ) async throws -> GeminiLiveTokenResponse {
+    let (queuedError, response) = lock.withLock { () -> (Error?, GeminiLiveTokenResponse) in
+      recordedLiveTokenRequests.append((model: model, sessionID: sessionID))
+      let queuedError = liveTokenErrors.isEmpty ? nil : liveTokenErrors.removeFirst()
+      let response = liveTokenResponses.isEmpty
+        ? GeminiLiveTokenResponse(
+            token: "ephemeral-token",
+            expiresAt: "2026-05-30T19:00:00.000Z",
+            newSessionExpiresAt: "2026-05-30T18:31:00.000Z",
+            model: model,
+            websocketBaseURL: GeminiConfig.ephemeralTokenWebsocketBaseURL,
+            queryParameterName: "access_token"
+          )
+        : liveTokenResponses.removeFirst()
+      return (queuedError, response)
+    }
+
+    if let queuedError {
+      throw queuedError
+    }
+    return response
+  }
+
+  func requestGeminiSpotter(_ request: GeminiSpotterRequest) async throws -> GeminiSpotterResponse {
+    let (queuedError, response) = lock.withLock { () -> (Error?, GeminiSpotterResponse) in
+      recordedSpotterRequests.append(request)
+      let queuedError = spotterErrors.isEmpty ? nil : spotterErrors.removeFirst()
+      let response = spotterResponses.isEmpty
+        ? GeminiSpotterResponse(
+            matched: true,
+            confidence: 0.93,
+            reason: "Clear visual evidence.",
+            evidenceTimestamp: request.capturedAt,
+            autoComplete: true
+          )
+        : spotterResponses.removeFirst()
+      return (queuedError, response)
+    }
+
+    if let queuedError {
+      throw queuedError
+    }
+    return response
+  }
+
   func snapshot() -> WorkerAdminAPISnapshot {
     lock.lock()
     defer { lock.unlock() }
@@ -337,7 +496,10 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
       heartbeats: recordedHeartbeats,
       uploadTargetRequests: recordedUploadTargetRequests,
       uploadCalls: recordedUploadCalls,
-      finalizeRequests: recordedFinalizeRequests
+      finalizeRequests: recordedFinalizeRequests,
+      telemetryBatches: recordedTelemetryBatches,
+      liveTokenRequests: recordedLiveTokenRequests,
+      spotterRequests: recordedSpotterRequests
     )
   }
 }
@@ -599,6 +761,81 @@ final class WorkerAdminLiveSessionCoordinatorTests: XCTestCase {
     XCTAssertTrue(result.succeeded)
     XCTAssertEqual(snapshot.uploadTargetRequests.last?.source, "phone-recording")
   }
+
+  func testTelemetryBatchFlushesSanitizedPayload() async throws {
+    let api = WorkerAdminAPIMock()
+    let telemetry = WorkerTelemetry(
+      api: api,
+      sessionID: "11111111-1111-1111-1111-111111111111",
+      deviceID: "iphone-test",
+      appBuild: "test-build",
+      flushIntervalNanoseconds: 0,
+      maxBatchSize: 20
+    )
+
+    await telemetry.record(
+      "video_upload_success",
+      source: "media_upload",
+      stage: "uploaded",
+      durationMs: 42,
+      metricValue: 1024,
+      metricUnit: "bytes",
+      payload: [
+        "token": "secret-token",
+        "uploadUrl": "https://signed.example/upload?token=secret",
+        "image_data": "data:image/jpeg;base64,abcd",
+        "asset_type": "video"
+      ]
+    )
+    await telemetry.flush()
+
+    let snapshot = api.snapshot()
+    let batch = try XCTUnwrap(snapshot.telemetryBatches.first)
+    XCTAssertEqual(batch.sessionID, "11111111-1111-1111-1111-111111111111")
+    XCTAssertEqual(batch.deviceID, "iphone-test")
+    XCTAssertEqual(batch.appBuild, "test-build")
+    XCTAssertEqual(batch.events.first?.name, "video_upload_success")
+    XCTAssertEqual(batch.events.first?.payload["token"] as? String, "[redacted]")
+    XCTAssertEqual(batch.events.first?.payload["uploadUrl"] as? String, "[redacted-url]")
+    XCTAssertEqual(batch.events.first?.payload["image_data"] as? String, "[redacted-raw-payload]")
+    XCTAssertEqual(batch.events.first?.payload["asset_type"] as? String, "video")
+  }
+
+  func testTelemetryFailureDoesNotBlockCoordinatorUpload() async throws {
+    let api = WorkerAdminAPIMock()
+    api.telemetryErrors = [URLError(.timedOut)]
+    api.uploadTargetResponses = [
+      WorkerMediaUploadTarget(
+        assetID: "video-asset-telemetry",
+        bucket: "execution-videos",
+        path: "sessions/session-telemetry/recording.mp4",
+        uploadURL: "https://upload.example/video-telemetry"
+      )
+    ]
+    let telemetry = WorkerTelemetry(
+      api: api,
+      sessionID: "22222222-2222-2222-2222-222222222222",
+      flushIntervalNanoseconds: 0,
+      maxBatchSize: 100
+    )
+    let fileURL = try makeTempFile(data: Data([0x41, 0x42, 0x43]), suffix: "telemetry")
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+    let coordinator = WorkerAdminLiveSessionCoordinator(
+      api: api,
+      sessionID: "22222222-2222-2222-2222-222222222222",
+      heartbeatIntervalNanoseconds: 0,
+      telemetry: telemetry,
+      sleeper: { _ in }
+    )
+
+    let result = await coordinator.uploadVideoRecording(from: fileURL)
+    await telemetry.flush()
+
+    let snapshot = api.snapshot()
+    XCTAssertTrue(result.succeeded)
+    XCTAssertEqual(snapshot.finalizeRequests.last?.status, "uploaded")
+    XCTAssertEqual(snapshot.telemetryBatches.count, 1)
+  }
 }
 
 @MainActor
@@ -732,6 +969,16 @@ final class OpsAPIClientRoutingTests: XCTestCase {
           #"{"assetId":"video-asset-1","bucket":"execution-videos","path":"sessions/session-1/recording.mp4","uploadUrl":"https://upload.example/video-1"}"#
             .utf8
         )
+      case "/api/worker/gemini/live-token":
+        body = Data(
+          #"{"token":"ephemeral-token","expiresAt":"2026-05-30T19:00:00.000Z","newSessionExpiresAt":"2026-05-30T18:31:00.000Z","model":"gemini-live-2.5-flash-native-audio","websocketBaseURL":"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained","queryParameterName":"access_token"}"#
+            .utf8
+        )
+      case "/api/worker/gemini/spotter":
+        body = Data(
+          #"{"matched":true,"confidence":0.93,"reason":"Clear visual evidence.","evidenceTimestamp":"2026-05-30T18:31:00.000Z","autoComplete":true}"#
+            .utf8
+        )
       default:
         body = Data("{}".utf8)
       }
@@ -773,15 +1020,46 @@ final class OpsAPIClientRoutingTests: XCTestCase {
       source: "phone-recording"
     )
 
+    _ = try await client.requestGeminiLiveToken(
+      model: "models/gemini-live-2.5-flash-native-audio",
+      sessionID: "11111111-1111-1111-1111-111111111111"
+    )
+
+    _ = try await client.requestGeminiSpotter(
+      GeminiSpotterRequest(
+        sessionID: "11111111-1111-1111-1111-111111111111",
+        stepID: "step-1",
+        stepTitle: "Check seal",
+        aiPrompt: "Confirm the seal is visible.",
+        expectedObjects: ["seal"],
+        imageBase64: "ZmFrZQ==",
+        imageMimeType: "image/jpeg",
+        capturedAt: "2026-05-30T18:31:00.000Z",
+        critical: false,
+        allowAIComplete: true
+      )
+    )
+
     let requests = lock.withLock { capturedRequests }
-    XCTAssertEqual(requests.map { $0.url?.host }, ["ops.example.test", "admin.example.test", "admin.example.test"])
-    XCTAssertEqual(requests.map { $0.url?.path }, ["/health", "/api/worker/live/heartbeat", "/api/worker/media/upload-target"])
+    XCTAssertEqual(requests.map { $0.url?.host }, ["ops.example.test", "admin.example.test", "admin.example.test", "admin.example.test", "admin.example.test"])
+    XCTAssertEqual(requests.map { $0.url?.path }, ["/health", "/api/worker/live/heartbeat", "/api/worker/media/upload-target", "/api/worker/gemini/live-token", "/api/worker/gemini/spotter"])
     XCTAssertNil(requests.first?.value(forHTTPHeaderField: "Authorization"))
     XCTAssertEqual(requests.dropFirst().first?.value(forHTTPHeaderField: "Authorization"), "Bearer worker-bearer-token")
     let uploadPayload = try XCTUnwrap(
-      JSONSerialization.jsonObject(with: try XCTUnwrap(requests.last.flatMap(requestBodyData(from:)))) as? [String: Any]
+      JSONSerialization.jsonObject(with: try XCTUnwrap(requestBodyData(from: requests[2]))) as? [String: Any]
     )
     XCTAssertEqual(uploadPayload["source"] as? String, "phone-recording")
+    let tokenPayload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try XCTUnwrap(requestBodyData(from: requests[3]))) as? [String: Any]
+    )
+    XCTAssertEqual(tokenPayload["model"] as? String, "models/gemini-live-2.5-flash-native-audio")
+    XCTAssertEqual(tokenPayload["sessionId"] as? String, "11111111-1111-1111-1111-111111111111")
+    let spotterPayload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try XCTUnwrap(requests.last.flatMap(requestBodyData(from:)))) as? [String: Any]
+    )
+    XCTAssertEqual(spotterPayload["stepId"] as? String, "step-1")
+    XCTAssertEqual(spotterPayload["allowAIComplete"] as? Bool, true)
+    XCTAssertEqual(spotterPayload["imageBase64"] as? String, "ZmFrZQ==")
   }
 
   func testWorkerRouteErrorsMentionAdminIngest() async throws {
@@ -826,5 +1104,68 @@ final class OpsAPIClientRoutingTests: XCTestCase {
       XCTAssertFalse(error.localizedDescription.localizedCaseInsensitiveContains("ops-api"))
       XCTAssertTrue(error.localizedDescription.contains("/api/worker/media/upload-target"))
     }
+  }
+
+  func testTelemetryRouteUsesAdminBaseURL() async throws {
+    let settings = SettingsManager.shared
+    let originalAdminBaseURL = settings.adminBaseURL
+    let originalBearerToken = settings.openClawBearerToken
+
+    settings.adminBaseURL = "http://admin.example.test:3001"
+    settings.openClawBearerToken = "worker-bearer-token"
+    defer {
+      settings.adminBaseURL = originalAdminBaseURL
+      settings.openClawBearerToken = originalBearerToken
+    }
+
+    let lock = NSLock()
+    var capturedRequests: [URLRequest] = []
+    RequestCaptureURLProtocol.handler = { request in
+      lock.withLock {
+        capturedRequests.append(request)
+      }
+
+      let response = HTTPURLResponse(
+        url: try XCTUnwrap(request.url),
+        statusCode: 202,
+        httpVersion: nil,
+        headerFields: ["Content-Type": "application/json"]
+      )
+      return (try XCTUnwrap(response), Data(#"{"accepted":1,"inserted":1}"#.utf8))
+    }
+
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [RequestCaptureURLProtocol.self]
+    let client = OpsAPIClient(session: URLSession(configuration: configuration))
+
+    try await client.sendWorkerTelemetryBatch(
+      WorkerTelemetryBatch(
+        sessionID: "11111111-1111-1111-1111-111111111111",
+        deviceID: "iphone-test",
+        workerID: nil,
+        platform: "ios",
+        appBuild: "test-build",
+        events: [
+          WorkerTelemetryEvent(
+            name: "heartbeat_result",
+            source: "ios_app",
+            stage: "heartbeat",
+            payload: ["status": "active"]
+          )
+        ]
+      )
+    )
+
+    let request = try XCTUnwrap(lock.withLock { capturedRequests.first })
+    XCTAssertEqual(request.url?.host, "admin.example.test")
+    XCTAssertEqual(request.url?.path, "/api/worker/telemetry")
+    XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer worker-bearer-token")
+    let payload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try XCTUnwrap(requestBodyData(from: request))) as? [String: Any]
+    )
+    XCTAssertEqual(payload["sessionId"] as? String, "11111111-1111-1111-1111-111111111111")
+    XCTAssertEqual(payload["deviceId"] as? String, "iphone-test")
+    XCTAssertEqual(payload["platform"] as? String, "ios")
+    XCTAssertEqual((payload["events"] as? [[String: Any]])?.first?["name"] as? String, "heartbeat_result")
   }
 }

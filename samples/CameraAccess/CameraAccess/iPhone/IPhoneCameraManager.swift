@@ -36,6 +36,15 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
       self?.configureSession()
       self?.captureSession.startRunning()
       self?.isRunning = true
+      let sessionRunning = self?.captureSession.isRunning == true
+      Task {
+        await WorkerTelemetry.shared.record(
+          "iphone_camera_start",
+          source: "ios_app",
+          stage: "camera",
+          payload: ["session_running": sessionRunning]
+        )
+      }
       NSLog("[iPhoneCamera] captureSession.startRunning() complete (isRunning=%@, sessionRunning=%@)",
             self?.isRunning == true ? "true" : "false",
             self?.captureSession.isRunning == true ? "true" : "false")
@@ -74,6 +83,18 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
       self.currentRecordingURL = fileURL
 
       self.movieOutput.startRecording(to: fileURL, recordingDelegate: self)
+      Task {
+        await WorkerTelemetry.shared.record(
+          "iphone_recording_start",
+          source: "ios_app",
+          stage: "recording",
+          sessionID: sessionID,
+          payload: [
+            "file_extension": fileURL.pathExtension,
+            "disk_free_checked": true
+          ]
+        )
+      }
       NSLog("[iPhoneCamera] Started recording SOP video: %@", fileURL.path)
     }
   }
@@ -113,6 +134,13 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
       NSLog("[iPhoneCamera] stop() requested")
       self?.captureSession.stopRunning()
       self?.isRunning = false
+      Task {
+        await WorkerTelemetry.shared.record(
+          "iphone_camera_stop",
+          source: "ios_app",
+          stage: "camera"
+        )
+      }
       NSLog("[iPhoneCamera] captureSession.stopRunning() complete")
     }
   }
@@ -247,8 +275,34 @@ extension IPhoneCameraManager: AVCaptureFileOutputRecordingDelegate {
     if let attributes = try? FileManager.default.attributesOfItem(atPath: outputFileURL.path),
        let fileSize = attributes[.size] as? NSNumber {
       NSLog("[iPhoneCamera] Recorded file size: %@ bytes", fileSize)
+      let stage = error == nil ? "recorded" : "failed"
+      let errorMessage = error?.localizedDescription
+      let byteCount = fileSize.intValue
+      let metricValue = fileSize.doubleValue
+      Task {
+        await WorkerTelemetry.shared.record(
+          "iphone_recording_finish",
+          source: "ios_app",
+          stage: stage,
+          metricValue: metricValue,
+          metricUnit: "bytes",
+          payload: [
+            "bytes": byteCount,
+            "error": errorMessage ?? NSNull()
+          ]
+        )
+      }
     } else {
       NSLog("[iPhoneCamera] Could not read recorded file size at %@", outputFileURL.path)
+      let errorMessage = error?.localizedDescription
+      Task {
+        await WorkerTelemetry.shared.record(
+          "iphone_recording_finish",
+          source: "ios_app",
+          stage: "unknown_size",
+          payload: ["error": errorMessage ?? NSNull()]
+        )
+      }
     }
 
     let completion = recordingCompletion
@@ -292,6 +346,20 @@ extension IPhoneCameraManager {
       analysisFPS,
       movieOutput.isRecording ? "true" : "false"
     )
+    Task {
+      await WorkerTelemetry.shared.record(
+        "iphone_camera_fps",
+        source: "ios_app",
+        stage: "camera",
+        metricValue: previewFPS,
+        metricUnit: "fps",
+        payload: [
+          "preview_fps": previewFPS,
+          "analysis_fps": analysisFPS,
+          "recording": movieOutput.isRecording
+        ]
+      )
+    }
 
     statsWindowStart = now
     sampleFrameCount = 0

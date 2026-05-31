@@ -27,8 +27,16 @@ class GeminiSessionViewModel: ObservableObject {
   private var isFinalizingSession: Bool = false
   private var pendingSystemInstruction: String?
   private var currentSessionInstruction: String?
+  private weak var workerAdminAPI: WorkerAdminAPI?
+  private var adminExecutionSessionID: String?
+  private var currentLiveCredential: GeminiLiveCredential?
 
   var streamingMode: StreamingMode = .glasses
+
+  func configureWorkerAdminAPI(_ api: WorkerAdminAPI?, sessionID: String? = nil) {
+    workerAdminAPI = api
+    adminExecutionSessionID = sessionID
+  }
 
   func startSession(systemInstruction: String? = nil) async {
     pendingSystemInstruction = normalizedSystemInstruction(systemInstruction)
@@ -40,10 +48,11 @@ class GeminiSessionViewModel: ObservableObject {
     userTranscript = ""
     aiTranscript = ""
 
-    guard GeminiConfig.isConfigured else {
-      errorMessage = "Gemini API key not configured. Open Settings and add your key from https://aistudio.google.com/apikey"
+    guard let credential = await resolveLiveCredential() else {
+      errorMessage = "Gemini Live token unavailable. Confirm the admin URL, worker bearer token, and server Gemini key."
       return
     }
+    currentLiveCredential = credential
 
     isGeminiActive = true
     configureRealtimeCallbacks()
@@ -61,7 +70,10 @@ class GeminiSessionViewModel: ObservableObject {
     }
 
     let resolvedInstruction = resolvedSystemInstruction()
-    let setupOk = await geminiService.connect(systemInstruction: resolvedInstruction)
+    let setupOk = await geminiService.connect(
+      systemInstruction: resolvedInstruction,
+      credential: credential
+    )
 
     if !setupOk {
       let message: String
@@ -409,7 +421,16 @@ class GeminiSessionViewModel: ObservableObject {
       return
     }
 
-    let setupOk = await geminiService.connect(systemInstruction: systemInstruction)
+    guard let credential = await resolveLiveCredential() else {
+      resetToIdle(receiptMessage: "Gemini Live token unavailable. Confirm the admin URL, worker bearer token, and server Gemini key.")
+      return
+    }
+    currentLiveCredential = credential
+
+    let setupOk = await geminiService.connect(
+      systemInstruction: systemInstruction,
+      credential: credential
+    )
     if !setupOk {
       let message: String
       if case .error(let err) = geminiService.connectionState {
@@ -430,6 +451,49 @@ class GeminiSessionViewModel: ObservableObject {
 
     connectEventStreamIfNeeded()
     currentSessionInstruction = systemInstruction
+  }
+
+  private func resolveLiveCredential() async -> GeminiLiveCredential? {
+    if let workerAdminAPI, GeminiConfig.isAdminConfigured {
+      do {
+        let token = try await workerAdminAPI.requestGeminiLiveToken(
+          model: GeminiConfig.model,
+          sessionID: adminExecutionSessionID
+        )
+        await WorkerTelemetry.shared.record(
+          "gemini_live_token_received",
+          source: "gemini_live",
+          stage: "ready",
+          payload: [
+            "model": token.model,
+            "expires_at": token.expiresAt
+          ]
+        )
+        return token.credential
+      } catch {
+        await WorkerTelemetry.shared.record(
+          "gemini_live_token_failed",
+          source: "gemini_live",
+          stage: "fallback",
+          payload: [
+            "error": error.localizedDescription,
+            "api_key_fallback_available": GeminiConfig.isConfigured
+          ]
+        )
+      }
+    }
+
+    if let fallback = GeminiLiveCredential.apiKey() {
+      await WorkerTelemetry.shared.record(
+        "gemini_live_token_fallback",
+        source: "gemini_live",
+        stage: "api_key",
+        payload: ["model": fallback.model]
+      )
+      return fallback
+    }
+
+    return nil
   }
 
   private func normalizedReceiptMessage(_ receiptMessage: String?) -> String? {

@@ -54,7 +54,7 @@ struct SettingsView: View {
             Text("Ops Base URL")
               .font(.caption)
               .foregroundColor(.secondary)
-            TextField("https://ops.embarcaderolabs.cloud", text: $opsBaseURL)
+            TextField("https://admin.embarcaderolabs.cloud", text: $opsBaseURL)
               .autocapitalization(.none)
               .disableAutocorrection(true)
               .keyboardType(.URL)
