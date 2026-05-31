@@ -28,8 +28,8 @@ struct StreamSessionView: View {
 
   var body: some View {
     NavigationStack {
-      HomeView(viewModel: viewModel)
-        .background(DesignSystem.colors.deepNavy.ignoresSafeArea())
+      HomeView(viewModel: viewModel, wearablesViewModel: wearablesViewModel)
+        .background(DesignSystem.colors.adminBackground.ignoresSafeArea())
     }
     .overlay(alignment: .bottom) {
       if viewModel.showShipSuccessToast {

@@ -1623,6 +1623,34 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  var currentAssignmentSubtitle: String {
+    guard let sop = currentAssignedSOP else { return "No assignment loaded" }
+    let package = sop.packageTitle ?? activePackageTitle
+    let stepCount = sop.steps.count
+    return "\(package) · \(stepCount) STEP\(stepCount == 1 ? "" : "S")"
+  }
+
+  var assignmentQueueSummary: String {
+    let count = pendingTaskSOPs.count
+    if count == 0 {
+      return "Queue clear"
+    }
+    if count == 1 {
+      return "1 assignment ready"
+    }
+    return "\(count) assignments ready"
+  }
+
+  var cameraReadinessLabel: String {
+    hasActiveDevice ? "Meta camera ready" : "iPhone camera ready"
+  }
+
+  var cameraReadinessDetail: String {
+    hasActiveDevice
+      ? "Glasses will be used for the next execution."
+      : "Using iPhone until glasses are available."
+  }
+
   // Photo capture properties
   @Published var capturedPhoto: UIImage?
   @Published var showPhotoPreview: Bool = false
@@ -1647,6 +1675,7 @@ class StreamSessionViewModel: ObservableObject {
   private var successToastTask: Task<Void, Never>?
   private var hasLoadedWorkerContext = false
   private var hasEnteredWorkerHome = false
+  private var autoPresentedAssignmentKeys: Set<String> = []
   private var isUsingLocalSessionFallback = false
   private var roomCodeCancellable: AnyCancellable?
   private var connectionStateCancellable: AnyCancellable?
@@ -1747,6 +1776,7 @@ class StreamSessionViewModel: ObservableObject {
     deviceMonitorTask = Task { @MainActor in
       for await device in deviceSelector.activeDeviceStream() {
         self.hasActiveDevice = device != nil
+        self.reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: true)
       }
     }
 
@@ -2110,6 +2140,23 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  func startCurrentAssignmentFromHome() {
+    reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: false)
+    guard let sop = currentAssignedSOP else {
+      if operationsSyncError == nil {
+        setCriticalOperationsSyncIssue(
+          phase: "assignment",
+          message: "No active SOP assignment is available for this worker."
+        )
+      }
+      return
+    }
+
+    selectedSOP = sop
+    activeCaptureSOP = sop
+    shouldDismissCapture = false
+  }
+
   func presentCapture(for sop: SOPTemplate) {
     selectedSOP = sop
     activeCaptureSOP = sop
@@ -2120,16 +2167,19 @@ class StreamSessionViewModel: ObservableObject {
     if !hasLoadedWorkerContext {
       await loadWorkerContextIfNeeded()
     }
+    reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: false)
 
     guard !hasEnteredWorkerHome else { return }
     hasEnteredWorkerHome = true
     await resetDemoShiftForHomeIfNeeded(reloadAssignments: false)
+    autoPresentCurrentAssignmentIfNeeded()
   }
 
   func handleWorkerAppBecameActive() async {
     guard hasEnteredWorkerHome else { return }
     guard !isSopAuditRunning, activeCaptureSOP == nil else { return }
     await resetDemoShiftForHomeIfNeeded(reloadAssignments: true)
+    autoPresentCurrentAssignmentIfNeeded()
   }
 
   func restoreActiveCaptureIfNeeded() {
@@ -2159,6 +2209,15 @@ class StreamSessionViewModel: ObservableObject {
   func loadWorkerContextIfNeeded() async {
     guard !hasLoadedWorkerContext else { return }
     await refreshWorkerContext()
+  }
+
+  private func autoPresentCurrentAssignmentIfNeeded() {
+    guard activeCaptureSOP == nil, !isSopAuditRunning else { return }
+    guard let sop = currentAssignedSOP else { return }
+    let key = pendingTaskKey(for: sop)
+    guard !autoPresentedAssignmentKeys.contains(key) else { return }
+    autoPresentedAssignmentKeys.insert(key)
+    startCurrentAssignmentFromHome()
   }
 
   func refreshWorkerContext() async {
@@ -2206,6 +2265,7 @@ class StreamSessionViewModel: ObservableObject {
       if selectedSOP == nil || !pendingTaskSOPs.contains(selectedSOP!) {
         selectedSOP = pendingTaskSOPs.first
       }
+      reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: false)
       hasLoadedWorkerContext = true
 
       if availableSOPs.isEmpty {
@@ -3544,6 +3604,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func startPreferredCamera() async {
+    reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: false)
     switch preferredCaptureMode {
     case .iPhone:
       await handleStartIPhone()
@@ -3553,6 +3614,28 @@ class StreamSessionViewModel: ObservableObject {
         return
       }
       await handleStartStreaming()
+    }
+  }
+
+  private func reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: Bool) {
+    let nextMode: StreamingMode = hasActiveDevice ? .glasses : .iPhone
+    guard preferredCaptureMode != nextMode else { return }
+
+    preferredCaptureMode = nextMode
+
+    if hasActiveDevice {
+      if isSopAuditRunning && streamingMode == .iPhone {
+        sopAuditStatusMessage = "Meta camera connected. The next assignment will use glasses."
+      } else {
+        sopAuditStatusMessage = "Meta camera ready."
+      }
+    } else if streamingMode == .glasses {
+      sopAuditStatusMessage = "Meta camera disconnected."
+    }
+
+    guard allowTransportSwitch, isStreaming, !isSopAuditRunning else { return }
+    Task { @MainActor [weak self] in
+      await self?.switchToPreferredCaptureModeIfNeeded()
     }
   }
 

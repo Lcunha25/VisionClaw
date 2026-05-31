@@ -29,6 +29,17 @@ extension Color {
 
 enum DesignSystem {
   enum colors {
+    static let adminBackground = Color(hex: "#F9FAF7")
+    static let adminSurface = Color(hex: "#FFFFFF")
+    static let adminInk = Color(hex: "#2C2C2C")
+    static let adminMuted = Color(hex: "#646464")
+    static let adminSubtle = Color(hex: "#B4B8B4")
+    static let adminStroke = Color(hex: "#DEE2DE")
+    static let brandOrange = Color(hex: "#DD6B2E")
+    static let brandOrangeDeep = Color(hex: "#B85222")
+    static let successGreen = Color(hex: "#1F9D6F")
+    static let adminWarning = Color(hex: "#D8A838")
+
     static let deepNavy = Color(hex: "#080D18")
     static let surface = Color(hex: "#111827")
     static let surfaceRaised = Color(hex: "#1F2937")

@@ -930,6 +930,56 @@ final class GeminiInstructionSyncTests: XCTestCase {
   }
 }
 
+@MainActor
+final class AssignmentDrivenFlowTests: XCTestCase {
+  override func setUp() async throws {
+    try await super.setUp()
+    try? Wearables.configure()
+  }
+
+  func testHomeStartsFirstAssignedSopWithoutPicker() async throws {
+    let viewModel = StreamSessionViewModel(wearables: Wearables.shared)
+    let secondAssignment = SOPTemplate(
+      name: "Second assigned SOP",
+      items: ["Inspect secondary station"],
+      packageTitle: "Line A",
+      sortOrder: 2
+    )
+    let firstAssignment = SOPTemplate(
+      name: "First assigned SOP",
+      items: ["Inspect primary station"],
+      packageTitle: "Line A",
+      sortOrder: 1
+    )
+
+    viewModel.availableSOPs = [secondAssignment, firstAssignment]
+    viewModel.startCurrentAssignmentFromHome()
+
+    XCTAssertEqual(viewModel.currentAssignedSOP?.name, "First assigned SOP")
+    XCTAssertEqual(viewModel.selectedSOP?.name, "First assigned SOP")
+    XCTAssertEqual(viewModel.activeCaptureSOP?.name, "First assigned SOP")
+    XCTAssertEqual(viewModel.preferredCaptureMode, .iPhone)
+  }
+
+  func testHomePrefersGlassesForNextAssignmentWhenAvailable() async throws {
+    let viewModel = StreamSessionViewModel(wearables: Wearables.shared)
+    viewModel.hasActiveDevice = true
+    viewModel.availableSOPs = [
+      SOPTemplate(
+        name: "Assigned SOP",
+        items: ["Inspect station"],
+        packageTitle: "Line A",
+        sortOrder: 1
+      )
+    ]
+
+    viewModel.startCurrentAssignmentFromHome()
+
+    XCTAssertEqual(viewModel.activeCaptureSOP?.name, "Assigned SOP")
+    XCTAssertEqual(viewModel.preferredCaptureMode, .glasses)
+  }
+}
+
 final class OpsAPIClientRoutingTests: XCTestCase {
   override func tearDown() {
     RequestCaptureURLProtocol.handler = nil
