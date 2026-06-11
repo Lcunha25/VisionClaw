@@ -144,6 +144,7 @@ class GeminiSessionViewModel: ObservableObject {
     audioManager.onAudioCaptured = { [weak self] data in
       guard let self else { return }
       Task { @MainActor in
+        guard self.isGeminiActive, !self.isStoppingSession else { return }
         let speakerOnPhone = self.streamingMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
         if speakerOnPhone && self.geminiService.isModelSpeaking { return }
         self.onInputAudioChunk?(data)
@@ -152,12 +153,20 @@ class GeminiSessionViewModel: ObservableObject {
     }
 
     geminiService.onAudioReceived = { [weak self] data in
-      self?.onOutputAudioChunk?(data)
-      self?.audioManager.playAudio(data: data)
+      guard let self else { return }
+      Task { @MainActor in
+        guard self.isGeminiActive, !self.isStoppingSession else { return }
+        self.onOutputAudioChunk?(data)
+        self.audioManager.playAudio(data: data)
+      }
     }
 
     geminiService.onInterrupted = { [weak self] in
-      self?.audioManager.stopPlayback()
+      guard let self else { return }
+      Task { @MainActor in
+        guard self.isGeminiActive, !self.isStoppingSession else { return }
+        self.audioManager.stopPlayback()
+      }
     }
 
     geminiService.onTurnComplete = { [weak self] in
@@ -217,10 +226,12 @@ class GeminiSessionViewModel: ObservableObject {
     let wasActive = isGeminiActive
     isGeminiActive = false
     isAudioReady = false
+    isModelSpeaking = false
     isStoppingSession = true
+    clearGeminiCallbacks()
+    audioManager.stopPlayback()
     await audioManager.stopCapture()
     await Task.yield()
-    clearGeminiCallbacks()
     await geminiService.disconnectAndWaitForClose(timeout: 1.0)
     stateObservation?.cancel()
     stateObservation = nil
@@ -359,20 +370,20 @@ class GeminiSessionViewModel: ObservableObject {
 
   private func resetToIdle(message: String?) async {
     isStoppingSession = true
+    isGeminiActive = false
+    isAudioReady = false
+    isModelSpeaking = false
     stateObservation?.cancel()
     stateObservation = nil
+    clearGeminiCallbacks()
+    audioManager.stopPlayback()
     // This is the Gemini-to-WebRTC hardware barrier: the engine graph and
     // accumulator finish before the socket is allowed to close.
     await audioManager.stopCapture()
     await Task.yield()
-    audioManager.stopPlayback()
-    clearGeminiCallbacks()
     await geminiService.disconnectAndWaitForClose(timeout: 1.0)
 
-    isGeminiActive = false
-    isAudioReady = false
     connectionState = .disconnected
-    isModelSpeaking = false
     userTranscript = ""
     aiTranscript = ""
     currentSessionInstruction = nil

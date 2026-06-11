@@ -1567,6 +1567,7 @@ actor WorkerAdminLiveSessionCoordinator {
   typealias Sleeper = @Sendable (UInt64) async -> Void
   typealias FileLoader = @Sendable (URL) async -> Data?
   typealias HeartbeatResponseHandler = @Sendable (WorkerLiveHeartbeatResponse) async -> Void
+  typealias HeartbeatFailureHandler = @Sendable (_ sessionID: String, _ message: String) async -> Void
 
   private let api: WorkerAdminAPI
   private let telemetry: WorkerTelemetry?
@@ -1574,6 +1575,7 @@ actor WorkerAdminLiveSessionCoordinator {
   private let sleeper: Sleeper
   private let fileLoader: FileLoader
   private let onHeartbeatResponse: HeartbeatResponseHandler?
+  private let onHeartbeatFailure: HeartbeatFailureHandler?
 
   private var sessionID: String?
   private var roomCode: String?
@@ -1591,6 +1593,7 @@ actor WorkerAdminLiveSessionCoordinator {
     heartbeatIntervalNanoseconds: UInt64 = 7_000_000_000,
     telemetry: WorkerTelemetry? = nil,
     onHeartbeatResponse: HeartbeatResponseHandler? = nil,
+    onHeartbeatFailure: HeartbeatFailureHandler? = nil,
     sleeper: @escaping Sleeper = { nanoseconds in
       guard nanoseconds > 0 else { return }
       try? await Task.sleep(nanoseconds: nanoseconds)
@@ -1608,6 +1611,7 @@ actor WorkerAdminLiveSessionCoordinator {
     self.sleeper = sleeper
     self.fileLoader = fileLoader
     self.onHeartbeatResponse = onHeartbeatResponse
+    self.onHeartbeatFailure = onHeartbeatFailure
   }
 
   func start(
@@ -1847,6 +1851,7 @@ actor WorkerAdminLiveSessionCoordinator {
         telemetry: telemetry
       )
     } catch {
+      let message = error.localizedDescription
       WorkerLiveLogger.log(
         "heartbeat_result",
         sessionID: sessionID,
@@ -1854,9 +1859,10 @@ actor WorkerAdminLiveSessionCoordinator {
         bucket: lastFrameBucket,
         path: lastFramePath,
         uploadState: "active",
-        error: error.localizedDescription,
+        error: message,
         telemetry: telemetry
       )
+      await onHeartbeatFailure?(sessionID, message)
     }
   }
 
@@ -2761,6 +2767,7 @@ class StreamSessionViewModel: ObservableObject {
   private var didAttemptPendingRecordingRecovery = false
   private var shouldResumeAiSupportAfterBackOffice = false
   private var isLiveRoomHandoffInProgress = false
+  private var lastWorkerLiveHeartbeatFailureWarningAt: Date = .distantPast
 
   private var isDemoWorkerMode: Bool {
     let configuredCode = GeminiConfig.workerLoginCode.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3967,6 +3974,11 @@ class StreamSessionViewModel: ObservableObject {
         Task { @MainActor [weak self] in
           await self?.handleWorkerLiveHeartbeatResponse(response)
         }
+      },
+      onHeartbeatFailure: { [weak self] sessionID, message in
+        Task { @MainActor [weak self] in
+          await self?.handleWorkerLiveHeartbeatFailure(sessionID: sessionID, message: message)
+        }
       }
     )
     geminiLiveSpotter.configure(api: opsAPIClient)
@@ -3983,6 +3995,7 @@ class StreamSessionViewModel: ObservableObject {
     lastGlassesAnalysisFrameQueuedAt = 0
     hasLoggedRoomCreatedForSession = false
     hasLoggedRoomJoinedForSession = false
+    lastWorkerLiveHeartbeatFailureWarningAt = .distantPast
     if streamingMode == .iPhone {
       sopVideoRecorder = nil
       conversationAudioRecorder = ConversationAudioRecorder(sessionID: sessionId)
@@ -5750,9 +5763,38 @@ class StreamSessionViewModel: ObservableObject {
     await workerAdminSync?.enqueueFrameUpload(data: jpegData)
   }
 
+  private func handleWorkerLiveHeartbeatFailure(sessionID: String, message: String) async {
+    guard sessionID == currentSopSessionId else { return }
+
+    let now = Date()
+    guard now.timeIntervalSince(lastWorkerLiveHeartbeatFailureWarningAt) >= 5 else { return }
+    lastWorkerLiveHeartbeatFailureWarningAt = now
+
+    setOperationsSyncWarning(
+      phase: "live_heartbeat",
+      message: "Live heartbeat failed; keeping active audio and handoff routes unchanged. \(message)"
+    )
+    await WorkerTelemetry.shared.record(
+      "worker_live_heartbeat_failed_no_audio_teardown",
+      source: "ios_app",
+      stage: "non_authoritative_error",
+      sessionID: sessionID,
+      payload: [
+        "error": message,
+        "gemini_active": geminiAssistant.isGeminiActive,
+        "gemini_audio_ready": geminiAssistant.isAudioReady,
+        "webrtc_active": webrtcViewModel.isActive,
+        "has_active_help_escalation": hasActiveHelpEscalation,
+        "support_mode_trusted": false
+      ]
+    )
+  }
+
   private func handleWorkerLiveHeartbeatResponse(_ response: WorkerLiveHeartbeatResponse) async {
     guard response.sessionID == currentSopSessionId else { return }
 
+    // Only successful heartbeat responses are authoritative enough to mutate
+    // handoff state. HTTP failures are handled above and never release audio.
     let humanConnected =
       response.shouldOpenLiveRoom ||
       (response.supportMode == "back_office" && response.humanSupportStatus == "connected")

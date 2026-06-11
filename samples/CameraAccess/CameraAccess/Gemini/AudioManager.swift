@@ -328,11 +328,14 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
 final class AudioManager: @unchecked Sendable {
   var onAudioCaptured: ((Data) -> Void)?
 
+  // Keep the engine container permanent for the process lifetime. Teardown only
+  // stops and detaches child nodes; it never nils or replaces this engine.
   private let audioEngine = AVAudioEngine()
   private let audioLifecycleQueue = DispatchQueue(
     label: "gemini.audio.lifecycle",
     qos: .userInitiated
   )
+  private let audioLifecycleQueueKey = DispatchSpecificKey<Void>()
   private let playerNode = AVAudioPlayerNode()
   private var isCapturing = false
   private var isInputTapInstalled = false
@@ -340,12 +343,14 @@ final class AudioManager: @unchecked Sendable {
   private var wasCapturingBeforeInterruption = false
   private var useIPhoneMode = false
   private var audioRouteLease: WorkerAudioRouteLease?
+  private var audioGraphGeneration: UInt64 = 0
 
   private let outputFormat: AVAudioFormat
 
   // Accumulate resampled PCM into ~100ms chunks before sending
   private let sendQueue = DispatchQueue(label: "audio.accumulator")
   private var accumulatedData = Data()
+  private var accumulatorGeneration: UInt64 = 0
   private let minSendBytes = 3200  // 100ms at 16kHz mono Int16 = 1600 frames * 2 bytes
 
   // Notification observers for background resilience
@@ -361,6 +366,7 @@ final class AudioManager: @unchecked Sendable {
       channels: GeminiConfig.audioChannels,
       interleaved: true
     )!
+    audioLifecycleQueue.setSpecific(key: audioLifecycleQueueKey, value: ())
   }
 
   func setupAudioSession(useIPhoneMode: Bool = false) throws {
@@ -386,6 +392,12 @@ final class AudioManager: @unchecked Sendable {
   }
 
   func startCapture() throws {
+    try syncOnAudioLifecycleQueue {
+      try startCaptureOnAudioLifecycleQueue()
+    }
+  }
+
+  private func startCaptureOnAudioLifecycleQueue() throws {
     guard !isCapturing else { return }
 
     if isInputTapInstalled {
@@ -422,7 +434,12 @@ final class AudioManager: @unchecked Sendable {
 
     NSLog("[Audio] Needs resample: %@", needsResample ? "YES" : "NO")
 
-    sendQueue.async { self.accumulatedData = Data() }
+    audioGraphGeneration &+= 1
+    let captureGeneration = audioGraphGeneration
+    sendQueue.sync {
+      accumulatedData = Data()
+      accumulatorGeneration = captureGeneration
+    }
 
     var converter: AVAudioConverter?
     if needsResample {
@@ -440,8 +457,9 @@ final class AudioManager: @unchecked Sendable {
       guard let self else { return }
 
       tapCount += 1
+      let currentTapCount = tapCount
       let rmsValue = self.computeRMS(buffer)
-      if tapCount % 15 == 0 {
+      if currentTapCount % 15 == 0 {
         print("[Audio Monitor] App Mic Level: \(rmsValue)")
       }
       let pcmData: Data
@@ -454,7 +472,7 @@ final class AudioManager: @unchecked Sendable {
           interleaved: false
         )!
         guard let resampled = self.convertBuffer(buffer, using: converter, targetFormat: resampleFormat) else {
-          if tapCount <= 3 { NSLog("[Audio] Resample failed for tap #%d", tapCount) }
+          if currentTapCount <= 3 { NSLog("[Audio] Resample failed for tap #%d", currentTapCount) }
           return
         }
         pcmData = self.float32BufferToInt16Data(resampled)
@@ -464,11 +482,12 @@ final class AudioManager: @unchecked Sendable {
 
       // Accumulate into ~100ms chunks before sending to Gemini
       self.sendQueue.async {
+        guard self.accumulatorGeneration == captureGeneration else { return }
         self.accumulatedData.append(pcmData)
         if self.accumulatedData.count >= self.minSendBytes {
           let chunk = self.accumulatedData
           self.accumulatedData = Data()
-          if tapCount <= 3 {
+          if currentTapCount <= 3 {
             NSLog("[Audio] Sending chunk: %d bytes (~%dms)",
                   chunk.count, chunk.count / 32)  // 16kHz * 2 bytes = 32 bytes/ms
           }
@@ -483,13 +502,20 @@ final class AudioManager: @unchecked Sendable {
       playerNode.play()
       isCapturing = true
     } catch {
-      tearDownEngineGraph(flushPendingAudio: false)
+      tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: false)
       throw error
     }
   }
 
   func playAudio(data: Data) {
-    guard isCapturing, !data.isEmpty else { return }
+    guard !data.isEmpty else { return }
+    audioLifecycleQueue.async { [weak self] in
+      self?.playAudioOnAudioLifecycleQueue(data: data)
+    }
+  }
+
+  private func playAudioOnAudioLifecycleQueue(data: Data) {
+    guard isCapturing, isPlayerNodeAttached, audioEngine.isRunning, !data.isEmpty else { return }
 
     let playerFormat = AVAudioFormat(
       commonFormat: .pcmFormatFloat32,
@@ -519,9 +545,15 @@ final class AudioManager: @unchecked Sendable {
   }
 
   func stopPlayback() {
+    audioLifecycleQueue.async { [weak self] in
+      self?.stopPlaybackOnAudioLifecycleQueue()
+    }
+  }
+
+  private func stopPlaybackOnAudioLifecycleQueue() {
     guard isPlayerNodeAttached else { return }
     playerNode.stop()
-    if isCapturing {
+    if isCapturing, audioEngine.isRunning {
       playerNode.play()
     }
   }
@@ -536,13 +568,7 @@ final class AudioManager: @unchecked Sendable {
           return
         }
 
-        guard self.isCapturing || self.isInputTapInstalled || self.isPlayerNodeAttached else {
-          self.removeObservers()
-          continuation.resume()
-          return
-        }
-
-        self.tearDownEngineGraph(flushPendingAudio: true) {
+        self.tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: true) {
           self.removeObservers()
           continuation.resume()
         }
@@ -613,10 +639,7 @@ final class AudioManager: @unchecked Sendable {
     ) { [weak self] _ in
       guard let self else { return }
       NSLog("[Audio] App will enter foreground")
-      if self.isCapturing && !self.audioEngine.isRunning {
-        NSLog("[Audio] Audio engine stopped while backgrounded, attempting reset")
-        self.attemptAudioReset()
-      }
+      self.checkAndResetStoppedEngine()
     }
   }
 
@@ -624,9 +647,12 @@ final class AudioManager: @unchecked Sendable {
     switch type {
     case .began:
       NSLog("[Audio] Audio interruption began (e.g. phone call)")
-      wasCapturingBeforeInterruption = isCapturing
-      if isCapturing {
-        audioEngine.pause()
+      audioLifecycleQueue.async { [weak self] in
+        guard let self else { return }
+        self.wasCapturingBeforeInterruption = self.isCapturing
+        if self.isCapturing {
+          self.audioEngine.pause()
+        }
       }
     case .ended:
       NSLog("[Audio] Audio interruption ended (shouldResume=%@)", shouldResume ? "true" : "false")
@@ -644,9 +670,7 @@ final class AudioManager: @unchecked Sendable {
       NSLog("[Audio] New audio device available")
     case .oldDeviceUnavailable:
       NSLog("[Audio] Audio device removed")
-      if isCapturing {
-        attemptAudioReset()
-      }
+      attemptAudioReset()
     case .categoryChange, .override, .wakeFromSleep, .routeConfigurationChange:
       NSLog("[Audio] Audio route change: %d", reason.rawValue)
     default:
@@ -673,54 +697,72 @@ final class AudioManager: @unchecked Sendable {
 
   private func resumeAudioAfterInterruption() {
     NSLog("[Audio] Resuming audio after interruption")
-    let audioSession = AVAudioSession.sharedInstance()
-    do {
-      try audioSession.setActive(true)
-      try audioEngine.start()
-      NSLog("[Audio] Audio resumed successfully")
-    } catch {
-      NSLog("[Audio] Failed to resume audio: %@", error.localizedDescription)
-      attemptAudioReset()
+    audioLifecycleQueue.async { [weak self] in
+      guard let self else { return }
+      let audioSession = AVAudioSession.sharedInstance()
+      do {
+        try audioSession.setActive(true)
+        if self.isCapturing, !self.audioEngine.isRunning {
+          try self.audioEngine.start()
+        }
+        if self.isCapturing, self.isPlayerNodeAttached, !self.playerNode.isPlaying {
+          self.playerNode.play()
+        }
+        NSLog("[Audio] Audio resumed successfully")
+      } catch {
+        NSLog("[Audio] Failed to resume audio: %@", error.localizedDescription)
+        self.attemptAudioReset()
+      }
     }
   }
 
   private func attemptAudioReset() {
     NSLog("[Audio] Attempting audio reset")
-    let wasCapturing = isCapturing
+    audioLifecycleQueue.async { [weak self] in
+      guard let self else { return }
+      let wasCapturing = self.isCapturing
+      let useIPhoneMode = self.useIPhoneMode
 
-    tearDownEngineGraph(flushPendingAudio: false)
-
-    if wasCapturing {
-      do {
-        try setupAudioSession(useIPhoneMode: useIPhoneMode)
-        try startCapture()
-        NSLog("[Audio] Audio reset successful")
-      } catch {
-        NSLog("[Audio] Audio reset failed: %@", error.localizedDescription)
+      self.tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: false) { [weak self] in
+        guard let self, wasCapturing else { return }
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          do {
+            try self.setupAudioSession(useIPhoneMode: useIPhoneMode)
+            try self.startCapture()
+            NSLog("[Audio] Audio reset successful")
+          } catch {
+            NSLog("[Audio] Audio reset failed: %@", error.localizedDescription)
+          }
+        }
       }
     }
   }
 
-  private func tearDownEngineGraph(flushPendingAudio: Bool, completion: (() -> Void)? = nil) {
+  private func tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: Bool, completion: (() -> Void)? = nil) {
+    audioGraphGeneration &+= 1
+    isCapturing = false
+
+    audioEngine.stop()
+
     if isInputTapInstalled {
       audioEngine.inputNode.removeTap(onBus: 0)
       isInputTapInstalled = false
     }
-    if audioEngine.isRunning {
-      audioEngine.stop()
-    }
+
     if playerNode.isPlaying {
       playerNode.stop()
     }
+
     if isPlayerNodeAttached {
       audioEngine.disconnectNodeOutput(playerNode)
       audioEngine.detach(playerNode)
       isPlayerNodeAttached = false
     }
-    isCapturing = false
 
     sendQueue.async {
       defer { completion?() }
+      self.accumulatorGeneration = 0
       guard !self.accumulatedData.isEmpty else { return }
       let chunk = self.accumulatedData
       self.accumulatedData = Data()
@@ -738,25 +780,28 @@ final class AudioManager: @unchecked Sendable {
           return
         }
 
-        if self.isInputTapInstalled {
-          self.audioEngine.inputNode.removeTap(onBus: 0)
-          self.isInputTapInstalled = false
+        self.tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: false) {
+          continuation.resume()
         }
-        if self.audioEngine.isRunning {
-          self.audioEngine.stop()
-        }
-        if self.playerNode.isPlaying {
-          self.playerNode.stop()
-        }
-        if self.isPlayerNodeAttached {
-          self.audioEngine.disconnectNodeOutput(self.playerNode)
-          self.audioEngine.detach(self.playerNode)
-          self.isPlayerNodeAttached = false
-        }
-        self.isCapturing = false
-        continuation.resume()
       }
     }
+  }
+
+  private func checkAndResetStoppedEngine() {
+    audioLifecycleQueue.async { [weak self] in
+      guard let self else { return }
+      if self.isCapturing, !self.audioEngine.isRunning {
+        NSLog("[Audio] Audio engine stopped while backgrounded, attempting reset")
+        self.attemptAudioReset()
+      }
+    }
+  }
+
+  private func syncOnAudioLifecycleQueue<T>(_ work: () throws -> T) rethrows -> T {
+    if DispatchQueue.getSpecific(key: audioLifecycleQueueKey) != nil {
+      return try work()
+    }
+    return try audioLifecycleQueue.sync(execute: work)
   }
 
   private func removeObservers() {
