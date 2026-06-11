@@ -5805,8 +5805,24 @@ class StreamSessionViewModel: ObservableObject {
 
     if humanConnected {
       hasActiveHelpEscalation = true
-      if !webrtcViewModel.isActive {
-        helpStatusMessage = "Back office answered. Opening live video and audio..."
+      if !webrtcViewModel.isActive || !webrtcViewModel.isSupportMode {
+        let wasObservationRoom = webrtcViewModel.isActive && !webrtcViewModel.isSupportMode
+        helpStatusMessage = wasObservationRoom
+          ? "Back office answered. Upgrading live room to video and audio..."
+          : "Back office answered. Opening live video and audio..."
+        if wasObservationRoom {
+          await WorkerTelemetry.shared.record(
+            "worker_live_support_upgrade_from_observation",
+            source: "ios_app",
+            stage: "handoff",
+            sessionID: response.sessionID,
+            payload: [
+              "previous_room_code_present": !webrtcViewModel.roomCode.isEmpty,
+              "support_mode": response.supportMode,
+              "human_support_status": response.humanSupportStatus
+            ]
+          )
+        }
         await ensureLiveRoomSession()
       } else if !webrtcViewModel.roomCode.isEmpty {
         await syncLiveRoomState(roomCode: webrtcViewModel.roomCode)
