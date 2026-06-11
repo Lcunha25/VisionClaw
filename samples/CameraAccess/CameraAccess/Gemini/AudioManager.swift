@@ -113,7 +113,7 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       try session.setActive(true, options: .notifyOthersOnDeactivation)
 
       var preferredInputName: String?
-      if mode == .glasses, !forceSpeaker, let input = preferredBluetoothHandsFreeInput(session) {
+      if let input = preferredBluetoothHandsFreeInput(session) {
         try session.setPreferredInput(input)
         preferredInputName = "\(input.portType.rawValue):\(input.portName)"
         try session.setActive(true, options: .notifyOthersOnDeactivation)
@@ -666,6 +666,7 @@ final class AudioManager: @unchecked Sendable {
     switch reason {
     case .newDeviceAvailable:
       NSLog("[Audio] New audio device available")
+      attemptAudioReset()
     case .oldDeviceUnavailable:
       NSLog("[Audio] Audio device removed")
       attemptAudioReset()

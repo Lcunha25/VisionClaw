@@ -582,7 +582,7 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
     let framesPerChunk = Int(GeminiConfig.outputAudioSampleRate)
     let bytesPerChunk = framesPerChunk * bytesPerFrame
     var byteOffset = 0
-    var frameOffset = 0
+    var accumulatedSampleCount = 0
     var appendFailed = false
 
     while byteOffset < data.count, !appendFailed {
@@ -594,7 +594,7 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
       guard alignedByteCount > 0 else { break }
       let chunkData = data.subdata(in: byteOffset..<(byteOffset + alignedByteCount))
       let presentationTime = CMTime(
-        value: CMTimeValue(frameOffset),
+        value: CMTimeValue(accumulatedSampleCount),
         timescale: CMTimeScale(GeminiConfig.outputAudioSampleRate)
       )
       guard let sampleBuffer = makeAudioSampleBuffer(
@@ -609,7 +609,7 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
       }
       appendFailed = !audioInput.append(sampleBuffer)
       byteOffset += alignedByteCount
-      frameOffset += alignedByteCount / bytesPerFrame
+      accumulatedSampleCount += alignedByteCount / bytesPerFrame
     }
 
     audioInput.markAsFinished()
@@ -682,11 +682,9 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
     }
     guard status == noErr else { return nil }
 
+    let sampleDuration = CMTime(value: 1, timescale: CMTimeScale(sampleRate))
     var timing = CMSampleTimingInfo(
-      duration: CMTime(
-        value: CMTimeValue(sampleCount),
-        timescale: CMTimeScale(sampleRate.rounded())
-      ),
+      duration: sampleDuration,
       presentationTimeStamp: presentationTime,
       decodeTimeStamp: .invalid
     )
@@ -1320,11 +1318,9 @@ private final class SopVideoRecorder: @unchecked Sendable {
     }
     guard status == noErr else { return nil }
 
+    let sampleDuration = CMTime(value: 1, timescale: CMTimeScale(sampleRate))
     var timing = CMSampleTimingInfo(
-      duration: CMTime(
-        value: CMTimeValue(sampleCount),
-        timescale: CMTimeScale(sampleRate.rounded())
-      ),
+      duration: sampleDuration,
       presentationTimeStamp: presentationTime,
       decodeTimeStamp: .invalid
     )
