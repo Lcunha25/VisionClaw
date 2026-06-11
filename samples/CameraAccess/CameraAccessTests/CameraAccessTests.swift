@@ -491,12 +491,22 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
             matched: true,
             confidence: 0.93,
             reason: "Clear visual evidence.",
-            evidenceTimestamp: request.capturedAt,
-            threshold: 0.88,
-            model: "gemini-3.5-flash",
-            autoComplete: true
-          )
-        : spotterResponses.removeFirst()
+	            evidenceTimestamp: request.capturedAt,
+	            threshold: 0.88,
+	            model: "gemini-3.5-flash",
+	            autoComplete: true,
+	            modelAutoComplete: nil,
+	            evidenceWindowSatisfied: nil,
+	            activeDurationSatisfied: nil,
+	            elapsedActiveMs: nil,
+	            minActiveSeconds: nil,
+	            stableObservations: nil,
+	            stableObservationsRequired: nil,
+	            advancedToStepIndex: nil,
+	            completedSop: nil,
+	            packageProgressWarning: nil
+	          )
+	        : spotterResponses.removeFirst()
       return (queuedError, response)
     }
 
@@ -674,7 +684,7 @@ final class WorkerAdminLiveSessionCoordinatorTests: XCTestCase {
     XCTAssertTrue(snapshot.uploadCalls.isEmpty)
   }
 
-  func testCompleteSessionUploadsVideoBeforeEndCallback() async throws {
+  func testPrepareVideoRecordingUploadReturnsPendingWithoutUploading() async throws {
     let api = WorkerAdminAPIMock()
     api.uploadTargetResponses = [
       WorkerMediaUploadTarget(
@@ -685,8 +695,36 @@ final class WorkerAdminLiveSessionCoordinatorTests: XCTestCase {
       )
     ]
 
-    let fileURL = try makeTempFile(data: Data([0x01, 0x02, 0x03]), suffix: "ordering")
-    defer { try? FileManager.default.removeItem(at: fileURL) }
+    let coordinator = WorkerAdminLiveSessionCoordinator(
+      api: api,
+      sessionID: "session-4",
+      heartbeatIntervalNanoseconds: 0,
+      sleeper: { _ in }
+    )
+
+    let preparedResult = await coordinator.prepareVideoRecordingUpload(source: "stream-capture")
+    let prepared = try XCTUnwrap(preparedResult)
+    let snapshot = api.snapshot()
+
+    XCTAssertEqual(prepared.result.uploadState, "pending")
+    XCTAssertEqual(prepared.result.assetID, "video-asset-2")
+    XCTAssertEqual(prepared.result.byteSize, 0)
+    XCTAssertEqual(snapshot.uploadTargetRequests.last?.byteSize, 0)
+    XCTAssertEqual(snapshot.uploadTargetRequests.last?.source, "stream-capture")
+    XCTAssertTrue(snapshot.uploadCalls.isEmpty)
+    XCTAssertTrue(snapshot.finalizeRequests.isEmpty)
+  }
+
+  func testCompleteSessionEndsBeforePreparedVideoUpload() async throws {
+    let api = WorkerAdminAPIMock()
+    api.uploadTargetResponses = [
+      WorkerMediaUploadTarget(
+        assetID: "video-asset-2",
+        bucket: "execution-videos",
+        path: "sessions/session-4/recording.mp4",
+        uploadURL: "https://upload.example/video-2"
+      )
+    ]
 
     let callOrder = CallOrderRecorder()
     api.onFinalizeAttempt = { finalize in
@@ -702,12 +740,85 @@ final class WorkerAdminLiveSessionCoordinatorTests: XCTestCase {
     )
 
     await coordinator.start(sessionID: "session-4", currentStepIndex: 0, helpRequested: false)
-    let result = await coordinator.completeSession(videoFileURL: fileURL) {
+    let preparedResult = await coordinator.prepareVideoRecordingUpload(source: "stream-capture")
+    let prepared = try XCTUnwrap(preparedResult)
+    let result = await coordinator.completeSession(pendingVideoUpload: prepared) {
       callOrder.append("end")
     }
+    let completionSnapshot = api.snapshot()
+
+    XCTAssertEqual(result.uploadState, "pending")
+    XCTAssertEqual(callOrder.values, ["end"])
+    XCTAssertTrue(completionSnapshot.uploadCalls.isEmpty)
+    XCTAssertTrue(completionSnapshot.finalizeRequests.isEmpty)
+  }
+
+  func testPreparedVideoUploadReusesReservedAssetID() async throws {
+    let api = WorkerAdminAPIMock()
+    api.uploadTargetResponses = [
+      WorkerMediaUploadTarget(
+        assetID: "video-asset-2",
+        bucket: "execution-videos",
+        path: "sessions/session-4/recording.mp4",
+        uploadURL: "https://upload.example/video-2"
+      )
+    ]
+
+    let fileURL = try makeTempFile(data: Data([0x01, 0x02, 0x03]), suffix: "prepared-reuse")
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    let coordinator = WorkerAdminLiveSessionCoordinator(
+      api: api,
+      sessionID: "session-4",
+      heartbeatIntervalNanoseconds: 0,
+      sleeper: { _ in }
+    )
+
+    let preparedResult = await coordinator.prepareVideoRecordingUpload(source: "stream-capture")
+    let prepared = try XCTUnwrap(preparedResult)
+    let result = await coordinator.uploadPreparedVideoRecording(
+      from: fileURL,
+      preparedUpload: prepared
+    )
+    let snapshot = api.snapshot()
 
     XCTAssertTrue(result.succeeded)
-    XCTAssertEqual(callOrder.values, ["finalize", "end"])
+    XCTAssertEqual(snapshot.uploadCalls.last?.assetID, "video-asset-2")
+    XCTAssertEqual(snapshot.finalizeRequests.last?.assetID, "video-asset-2")
+    XCTAssertEqual(snapshot.finalizeRequests.last?.status, "uploaded")
+  }
+
+  func testPreparedVideoUploadFinalizesFailedWhenRecordingIsMissing() async throws {
+    let api = WorkerAdminAPIMock()
+    api.uploadTargetResponses = [
+      WorkerMediaUploadTarget(
+        assetID: "video-asset-missing",
+        bucket: "execution-videos",
+        path: "sessions/session-missing/recording.mp4",
+        uploadURL: "https://upload.example/video-missing"
+      )
+    ]
+
+    let coordinator = WorkerAdminLiveSessionCoordinator(
+      api: api,
+      sessionID: "session-missing",
+      heartbeatIntervalNanoseconds: 0,
+      sleeper: { _ in }
+    )
+
+    let preparedResult = await coordinator.prepareVideoRecordingUpload(source: "phone-recording")
+    let prepared = try XCTUnwrap(preparedResult)
+    let result = await coordinator.uploadPreparedVideoRecording(
+      from: nil,
+      preparedUpload: prepared
+    )
+    let snapshot = api.snapshot()
+
+    XCTAssertEqual(result.uploadState, "failed")
+    XCTAssertEqual(result.assetID, "video-asset-missing")
+    XCTAssertTrue(snapshot.uploadCalls.isEmpty)
+    XCTAssertEqual(snapshot.finalizeRequests.last?.assetID, "video-asset-missing")
+    XCTAssertEqual(snapshot.finalizeRequests.last?.status, "failed")
   }
 
   func testVideoFinalizeRetriesTransientErrorsThenSucceeds() async throws {

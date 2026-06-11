@@ -23,6 +23,7 @@ import AVFoundation
 import Combine
 import Speech
 import SwiftUI
+import UIKit
 import VideoToolbox
 
 enum StreamingStatus {
@@ -760,7 +761,7 @@ private enum ConversationAudioMuxer {
       try? FileManager.default.removeItem(at: outputURL)
       guard let exporter = AVAssetExportSession(
         asset: composition,
-        presetName: AVAssetExportPresetHighestQuality
+        presetName: AVAssetExportPresetPassthrough
       ) else {
         continuation.resume(returning: nil)
         return
@@ -772,6 +773,65 @@ private enum ConversationAudioMuxer {
         continuation.resume(returning: exporter.status == .completed ? outputURL : nil)
       }
     }
+  }
+}
+
+private enum SopMediaBackgroundTask {
+  static func begin(name: String) async -> UIBackgroundTaskIdentifier {
+    await MainActor.run {
+      UIApplication.shared.beginBackgroundTask(withName: name) {
+        NSLog("[SOPRecorder] Background media finalize task expired")
+      }
+    }
+  }
+
+  static func end(_ identifier: UIBackgroundTaskIdentifier) async {
+    guard identifier != .invalid else { return }
+    await MainActor.run {
+      UIApplication.shared.endBackgroundTask(identifier)
+    }
+  }
+}
+
+private enum SopSessionMediaFinalizer {
+  static func finishRecording(
+    wasIPhoneRecording: Bool,
+    iPhoneCameraManager: IPhoneCameraManager?,
+    conversationAudioRecorder: ConversationAudioRecorder?,
+    sopVideoRecorder: SopVideoRecorder?
+  ) async -> URL? {
+    if wasIPhoneRecording {
+      let phoneVideoURL = await iPhoneCameraManager?.stopRecording()
+      let conversationAudioURL = await conversationAudioRecorder?.finishAudioFile()
+      iPhoneCameraManager?.stop()
+
+      guard let phoneVideoURL else {
+        return nil
+      }
+
+      guard let conversationAudioURL else {
+        return phoneVideoURL
+      }
+
+      let mixedURL = phoneVideoURL
+        .deletingLastPathComponent()
+        .appendingPathComponent(phoneVideoURL.deletingPathExtension().lastPathComponent + "_mixed")
+        .appendingPathExtension("mp4")
+      if let muxedURL = await ConversationAudioMuxer.mux(
+        videoURL: phoneVideoURL,
+        audioURL: conversationAudioURL,
+        outputURL: mixedURL
+      ) {
+        try? FileManager.default.removeItem(at: phoneVideoURL)
+        try? FileManager.default.removeItem(at: conversationAudioURL)
+        return muxedURL
+      }
+
+      NSLog("[SOPRecorder] iPhone mixed audio mux failed; returning phone recording")
+      return phoneVideoURL
+    }
+
+    return await sopVideoRecorder?.finishRecording()
   }
 }
 
@@ -1549,7 +1609,7 @@ private enum WorkerLiveLogger {
   }
 }
 
-struct WorkerMediaUploadResult: Equatable {
+struct WorkerMediaUploadResult: Equatable, Sendable {
   let assetType: String
   let assetID: String?
   let bucket: String?
@@ -1561,6 +1621,15 @@ struct WorkerMediaUploadResult: Equatable {
   var succeeded: Bool {
     uploadState == "uploaded"
   }
+
+  var isPending: Bool {
+    uploadState == "pending"
+  }
+}
+
+struct WorkerPreparedMediaUpload: Equatable, Sendable {
+  let target: WorkerMediaUploadTarget
+  let result: WorkerMediaUploadResult
 }
 
 actor WorkerAdminLiveSessionCoordinator {
@@ -1704,6 +1773,90 @@ actor WorkerAdminLiveSessionCoordinator {
     from fileURL: URL?,
     source: String = "session-recording"
   ) async -> WorkerMediaUploadResult {
+    guard let preparedUpload = await prepareVideoRecordingUpload(source: source) else {
+      return videoUploadFailureResult(errorMessage: "Recording upload target could not be prepared.")
+    }
+
+    return await uploadPreparedVideoRecording(from: fileURL, preparedUpload: preparedUpload)
+  }
+
+  func prepareVideoRecordingUpload(
+    source: String = "session-recording"
+  ) async -> WorkerPreparedMediaUpload? {
+    guard let sessionID else {
+      return nil
+    }
+
+    let targetStartedAt = CACurrentMediaTime()
+
+    do {
+      let target = try await retry(
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetType: "video",
+        byteSize: 0,
+        uploadState: "pending"
+      ) {
+        try await api.requestWorkerMediaUploadTarget(
+          sessionID: sessionID,
+          assetType: "video",
+          filename: "recording.mp4",
+          contentType: "video/mp4",
+          byteSize: 0,
+          source: source
+        )
+      }
+
+      WorkerLiveLogger.log(
+        "video_upload_target",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetID: target.assetID,
+        assetType: "video",
+        bucket: target.bucket,
+        path: target.path,
+        byteSize: 0,
+        uploadState: "pending",
+        durationMs: (CACurrentMediaTime() - targetStartedAt) * 1000,
+        telemetry: telemetry
+      )
+
+      return WorkerPreparedMediaUpload(
+        target: target,
+        result: WorkerMediaUploadResult(
+          assetType: "video",
+          assetID: target.assetID,
+          bucket: target.bucket,
+          path: target.path,
+          byteSize: 0,
+          uploadState: "pending",
+          errorMessage: nil
+        )
+      )
+    } catch {
+      WorkerLiveLogger.log(
+        "video_upload_target_failure",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetType: "video",
+        byteSize: 0,
+        uploadState: "failed",
+        error: error.localizedDescription,
+        durationMs: (CACurrentMediaTime() - targetStartedAt) * 1000,
+        telemetry: telemetry
+      )
+      return nil
+    }
+  }
+
+  func uploadPreparedVideoRecording(
+    from fileURL: URL?,
+    preparedUpload: WorkerPreparedMediaUpload
+  ) async -> WorkerMediaUploadResult {
+    guard let sessionID else {
+      return videoUploadFailureResult(errorMessage: "Recording upload session is missing.")
+    }
+
     let byteSize: Int
     let data: Data?
     let missingDataError: String
@@ -1728,50 +1881,54 @@ actor WorkerAdminLiveSessionCoordinator {
         "recording_missing",
         sessionID: sessionID,
         roomCode: roomCode,
+        assetID: preparedUpload.target.assetID,
         assetType: "video",
+        bucket: preparedUpload.target.bucket,
+        path: preparedUpload.target.path,
         byteSize: byteSize,
         uploadState: "failed",
         error: missingDataError,
         telemetry: telemetry
       )
-      return WorkerMediaUploadResult(
+
+      return await finalizeFailure(
+        logPrefix: "video",
+        sessionID: sessionID,
         assetType: "video",
-        assetID: nil,
-        bucket: nil,
-        path: nil,
+        target: preparedUpload.target,
         byteSize: byteSize,
-        uploadState: "failed",
         errorMessage: missingDataError
       )
     }
 
-    return await uploadAsset(
+    return await uploadPreparedAsset(
       assetType: "video",
-      filename: "recording.mp4",
       contentType: "video/mp4",
+      target: preparedUpload.target,
       data: data,
       byteSize: byteSize,
-      missingDataError: missingDataError,
-      source: source
+      missingDataError: missingDataError
     )
   }
 
   func completeSession(
-    videoFileURL: URL?,
-    videoSource: String = "session-recording",
+    pendingVideoUpload: WorkerPreparedMediaUpload?,
     onBeforeMarkEnded: () async -> Void
   ) async -> WorkerMediaUploadResult {
+    let result = pendingVideoUpload?.result
+      ?? videoUploadFailureResult(errorMessage: "Recording upload target could not be prepared.")
+
     queuedFrameData = nil
     frameUploadTask?.cancel()
     frameUploadTask = nil
+    heartbeatTask?.cancel()
+    heartbeatTask = nil
 
-    let result = await uploadVideoRecording(from: videoFileURL, source: videoSource)
-    await sendHeartbeat()
     await onBeforeMarkEnded()
     await telemetry?.record(
       "session_end_requested",
       source: "ios_app",
-      stage: result.succeeded ? "uploaded" : "failed",
+      stage: result.isPending ? "pending" : result.succeeded ? "uploaded" : "failed",
       sessionID: sessionID,
       payload: [
         "video_upload_state": result.uploadState,
@@ -1779,11 +1936,12 @@ actor WorkerAdminLiveSessionCoordinator {
         "error": result.errorMessage ?? NSNull()
       ]
     )
-    await telemetry?.flushAndStop()
-
-    heartbeatTask?.cancel()
-    heartbeatTask = nil
+    await telemetry?.flush()
     return result
+  }
+
+  func flushTelemetryAndStop() async {
+    await telemetry?.flushAndStop()
   }
 
   func stop() async {
@@ -1898,10 +2056,10 @@ actor WorkerAdminLiveSessionCoordinator {
     }
   }
 
-  private func uploadAsset(
-    assetType: String,
-    filename: String,
-    contentType: String,
+	  private func uploadAsset(
+	    assetType: String,
+	    filename: String,
+	    contentType: String,
     data: Data?,
     byteSize: Int,
     missingDataError: String,
@@ -2133,7 +2291,200 @@ actor WorkerAdminLiveSessionCoordinator {
         uploadState: "failed",
         errorMessage: error.localizedDescription
       )
+	    }
+	  }
+
+  private func uploadPreparedAsset(
+    assetType: String,
+    contentType: String,
+    target: WorkerMediaUploadTarget,
+    data: Data?,
+    byteSize: Int,
+    missingDataError: String
+  ) async -> WorkerMediaUploadResult {
+    guard let sessionID else {
+      return WorkerMediaUploadResult(
+        assetType: assetType,
+        assetID: target.assetID,
+        bucket: target.bucket,
+        path: target.path,
+        byteSize: byteSize,
+        uploadState: "failed",
+        errorMessage: "Session ID missing."
+      )
     }
+
+    let logPrefix = assetType == "frame" ? "frame" : "video"
+    let assetUploadStartedAt = CACurrentMediaTime()
+
+    guard let data, !data.isEmpty else {
+      WorkerLiveLogger.log(
+        "\(logPrefix)_upload_failure",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetID: target.assetID,
+        assetType: assetType,
+        bucket: target.bucket,
+        path: target.path,
+        byteSize: byteSize,
+        uploadState: "failed",
+        error: missingDataError,
+        durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+        telemetry: telemetry
+      )
+      return await finalizeFailure(
+        logPrefix: logPrefix,
+        sessionID: sessionID,
+        assetType: assetType,
+        target: target,
+        byteSize: byteSize,
+        errorMessage: missingDataError
+      )
+    }
+
+    do {
+      let binaryUploadStartedAt = CACurrentMediaTime()
+      try await retry(
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetID: target.assetID,
+        assetType: assetType,
+        bucket: target.bucket,
+        path: target.path,
+        byteSize: byteSize,
+        uploadState: "pending"
+      ) {
+        try await api.uploadBinary(to: target, data: data, contentType: contentType)
+      }
+
+      WorkerLiveLogger.log(
+        "\(logPrefix)_upload_success",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetID: target.assetID,
+        assetType: assetType,
+        bucket: target.bucket,
+        path: target.path,
+        byteSize: byteSize,
+        uploadState: "pending",
+        durationMs: (CACurrentMediaTime() - binaryUploadStartedAt) * 1000,
+        metricValue: Double(byteSize),
+        metricUnit: "bytes",
+        telemetry: telemetry
+      )
+
+      do {
+        let finalizeStartedAt = CACurrentMediaTime()
+        try await retry(
+          sessionID: sessionID,
+          roomCode: roomCode,
+          assetID: target.assetID,
+          assetType: assetType,
+          bucket: target.bucket,
+          path: target.path,
+          byteSize: byteSize,
+          uploadState: "uploaded"
+        ) {
+          try await api.finalizeWorkerMediaUpload(
+            WorkerMediaFinalizeRequest(
+              assetID: target.assetID,
+              sessionID: sessionID,
+              bucket: target.bucket,
+              path: target.path,
+              status: "uploaded",
+              byteSize: byteSize,
+              error: nil
+            )
+          )
+        }
+
+        WorkerLiveLogger.log(
+          "\(logPrefix)_finalize_success",
+          sessionID: sessionID,
+          roomCode: roomCode,
+          assetID: target.assetID,
+          assetType: assetType,
+          bucket: target.bucket,
+          path: target.path,
+          byteSize: byteSize,
+          uploadState: "uploaded",
+          durationMs: (CACurrentMediaTime() - finalizeStartedAt) * 1000,
+          metricValue: Double(byteSize),
+          metricUnit: "bytes",
+          telemetry: telemetry
+        )
+
+        return WorkerMediaUploadResult(
+          assetType: assetType,
+          assetID: target.assetID,
+          bucket: target.bucket,
+          path: target.path,
+          byteSize: byteSize,
+          uploadState: "uploaded",
+          errorMessage: nil
+        )
+      } catch {
+        let finalizeError = "Finalize uploaded failed: \(error.localizedDescription)"
+        WorkerLiveLogger.log(
+          "\(logPrefix)_finalize_failure",
+          sessionID: sessionID,
+          roomCode: roomCode,
+          assetID: target.assetID,
+          assetType: assetType,
+          bucket: target.bucket,
+          path: target.path,
+          byteSize: byteSize,
+          uploadState: "uploaded",
+          error: finalizeError,
+          durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+          telemetry: telemetry
+        )
+        return await finalizeFailure(
+          logPrefix: logPrefix,
+          sessionID: sessionID,
+          assetType: assetType,
+          target: target,
+          byteSize: byteSize,
+          errorMessage: finalizeError
+        )
+      }
+    } catch {
+      let uploadError = error.localizedDescription
+      WorkerLiveLogger.log(
+        "\(logPrefix)_upload_failure",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetID: target.assetID,
+        assetType: assetType,
+        bucket: target.bucket,
+        path: target.path,
+        byteSize: byteSize,
+        uploadState: "failed",
+        error: uploadError,
+        durationMs: (CACurrentMediaTime() - assetUploadStartedAt) * 1000,
+        telemetry: telemetry
+      )
+      return await finalizeFailure(
+        logPrefix: logPrefix,
+        sessionID: sessionID,
+        assetType: assetType,
+        target: target,
+        byteSize: byteSize,
+        errorMessage: uploadError
+      )
+    }
+  }
+
+  private func videoUploadFailureResult(errorMessage: String) -> WorkerMediaUploadResult {
+    WorkerMediaUploadResult(
+      assetType: "video",
+      assetID: nil,
+      bucket: nil,
+      path: nil,
+      byteSize: 0,
+      uploadState: "failed",
+      errorMessage: errorMessage
+    )
   }
 
   private func finalizeFailure(
@@ -2323,6 +2674,18 @@ struct ShippedSessionRecord: Identifiable, Codable {
 private struct PendingWorkerRecording: Codable, Equatable {
   let sessionID: String
   let filePath: String
+}
+
+private enum PendingWorkerRecordingStore {
+  static func remember(defaultsKey: String, sessionID: String, fileURL: URL) {
+    let pending = PendingWorkerRecording(sessionID: sessionID, filePath: fileURL.path)
+    guard let encoded = try? JSONEncoder().encode(pending) else { return }
+    UserDefaults.standard.set(encoded, forKey: defaultsKey)
+  }
+
+  static func clear(defaultsKey: String) {
+    UserDefaults.standard.removeObject(forKey: defaultsKey)
+  }
 }
 
 private struct IPhoneAnalysisFrameEnvelope: @unchecked Sendable {
@@ -2762,6 +3125,15 @@ class StreamSessionViewModel: ObservableObject {
   private var locallyCompletedSopsByPackageKey: [String: Set<String>] = [:]
   private var lastLivePreviewSyncAt: Date = .distantPast
   private var hasActiveHelpEscalation = false
+  private struct LiveRoomSyncSnapshot: Equatable {
+    let roomCode: String
+    let helpRequested: Bool
+    let backOfficeConnected: Bool
+  }
+  private var lastLiveRoomSyncSnapshot: LiveRoomSyncSnapshot?
+  private var lastLiveRoomSyncAt: Date = .distantPast
+  private let liveRoomRedundantSyncThrottleInterval: TimeInterval = 5
+  private var hasReceivedBackOfficeConnectedHandshake = false
   private var hasLoggedRoomCreatedForSession = false
   private var hasLoggedRoomJoinedForSession = false
   private var didAttemptPendingRecordingRecovery = false
@@ -3202,6 +3574,7 @@ class StreamSessionViewModel: ObservableObject {
     } else {
       await workerAdminSync?.stop()
       workerAdminSync = nil
+      resetLiveRoomSyncSnapshot()
     }
 
     if webrtcViewModel.isActive {
@@ -3992,6 +4365,7 @@ class StreamSessionViewModel: ObservableObject {
     isStepValidationRunning = false
     proofImagesByTargetID = [:]
     lastLivePreviewSyncAt = .distantPast
+    resetLiveRoomSyncSnapshot()
     lastGlassesAnalysisFrameQueuedAt = 0
     hasLoggedRoomCreatedForSession = false
     hasLoggedRoomJoinedForSession = false
@@ -4102,6 +4476,7 @@ class StreamSessionViewModel: ObservableObject {
     helpStatusMessage = "Supervisor room closed."
     hasActiveHelpEscalation = false
     shouldResumeAiSupportAfterBackOffice = false
+    resetLiveRoomSyncSnapshot()
     Task { @MainActor in
       await workerAdminSync?.updateHelpRequested(false)
       await patchActiveExecutionSession(
@@ -4169,6 +4544,76 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  private func launchBackgroundMediaFinalization(
+    sessionID: String,
+    workerAdminSync: WorkerAdminLiveSessionCoordinator?,
+    preparedUpload: WorkerPreparedMediaUpload?,
+    wasIPhoneRecording: Bool,
+    iPhoneCameraManager: IPhoneCameraManager?,
+    conversationAudioRecorder: ConversationAudioRecorder?,
+    sopVideoRecorder: SopVideoRecorder?
+  ) {
+    let pendingDefaultsKey = pendingRecordingDefaultsKey
+
+    Task.detached(priority: .utility) {
+      let backgroundTaskID = await SopMediaBackgroundTask.begin(name: "SOP media finalize")
+      let recordedVideoURL = await SopSessionMediaFinalizer.finishRecording(
+        wasIPhoneRecording: wasIPhoneRecording,
+        iPhoneCameraManager: iPhoneCameraManager,
+        conversationAudioRecorder: conversationAudioRecorder,
+        sopVideoRecorder: sopVideoRecorder
+      )
+
+      let result: WorkerMediaUploadResult
+      if let workerAdminSync, let preparedUpload {
+        result = await workerAdminSync.uploadPreparedVideoRecording(
+          from: recordedVideoURL,
+          preparedUpload: preparedUpload
+        )
+      } else {
+        result = WorkerMediaUploadResult(
+          assetType: "video",
+          assetID: preparedUpload?.result.assetID,
+          bucket: preparedUpload?.result.bucket,
+          path: preparedUpload?.result.path,
+          byteSize: 0,
+          uploadState: "failed",
+          errorMessage: workerAdminSync == nil
+            ? "Worker admin sync was unavailable during background media finalize."
+            : "Recording upload target could not be prepared."
+        )
+      }
+
+      if result.succeeded {
+        PendingWorkerRecordingStore.clear(defaultsKey: pendingDefaultsKey)
+        if let recordedVideoURL {
+          try? FileManager.default.removeItem(at: recordedVideoURL)
+        }
+      } else if let recordedVideoURL {
+        PendingWorkerRecordingStore.remember(
+          defaultsKey: pendingDefaultsKey,
+          sessionID: sessionID,
+          fileURL: recordedVideoURL
+        )
+      }
+
+      WorkerLiveLogger.log(
+        "session_media_background_finalize_completed",
+        sessionID: sessionID,
+        assetID: result.assetID,
+        assetType: result.assetType,
+        bucket: result.bucket,
+        path: result.path,
+        byteSize: result.byteSize,
+        uploadState: result.uploadState,
+        error: result.errorMessage
+      )
+
+      await workerAdminSync?.flushTelemetryAndStop()
+      await SopMediaBackgroundTask.end(backgroundTaskID)
+    }
+  }
+
   func endAndShip(status: SopTerminationStatus, cancelCountdownTask: Bool = true) async {
     guard !isFinalizingAndShipping, isSopAuditRunning, currentSopSessionId != nil else { return }
     isFinalizingAndShipping = true
@@ -4177,64 +4622,13 @@ class StreamSessionViewModel: ObservableObject {
     let syncedToBackend = activeExecutionSession != nil
     let completedSOP = selectedSOP
     let roomCodeAtEnd = webrtcViewModel.roomCode.isEmpty ? nil : webrtcViewModel.roomCode
-
-    WorkerLiveLogger.log(
-      "session_end_requested",
-      sessionID: sessionID,
-      roomCode: roomCodeAtEnd,
-      uploadState: "active"
-    )
-
-    isSopAuditRunning = false
-    isDossierUploading = true
-    updateDossierPipelineStatus("Finalizing session media...", kind: .active)
-    if cancelCountdownTask {
-      sopCountdownTask?.cancel()
-    }
-    sopCountdownTask = nil
-
-    if geminiAssistant.isGeminiActive {
-      await geminiAssistant.stopSession()
-      try? await Task.sleep(nanoseconds: 150_000_000)
-    }
-
+    let workerAdminSyncAtEnd = workerAdminSync
     let wasIPhoneRecording = streamingMode == .iPhone
-    var recordedVideoURL: URL?
-    if wasIPhoneRecording {
-      let phoneVideoURL = await iPhoneCameraManager?.stopRecording()
-      let conversationAudioURL = await conversationAudioRecorder?.finishAudioFile()
-      if let phoneVideoURL, let conversationAudioURL {
-        let mixedURL = phoneVideoURL
-          .deletingLastPathComponent()
-          .appendingPathComponent(phoneVideoURL.deletingPathExtension().lastPathComponent + "_mixed")
-          .appendingPathExtension("mp4")
-        if let muxedURL = await ConversationAudioMuxer.mux(
-          videoURL: phoneVideoURL,
-          audioURL: conversationAudioURL,
-          outputURL: mixedURL
-        ) {
-          recordedVideoURL = muxedURL
-          try? FileManager.default.removeItem(at: phoneVideoURL)
-          try? FileManager.default.removeItem(at: conversationAudioURL)
-        } else {
-          NSLog("[SOPRecorder] iPhone mixed audio mux failed; returning phone recording")
-          recordedVideoURL = phoneVideoURL
-        }
-      } else {
-        recordedVideoURL = phoneVideoURL
-      }
-      stopIPhoneSession()
-    } else {
-      await streamSession.stop()
-      if let videoRecorder = sopVideoRecorder {
-        recordedVideoURL = await videoRecorder.finishRecording()
-      }
-    }
-
+    let recordingSource = wasIPhoneRecording ? "phone-recording" : "stream-capture"
+    let iPhoneCameraForFinalization = wasIPhoneRecording ? iPhoneCameraManager : nil
+    let conversationAudioRecorderForFinalization = conversationAudioRecorder
+    let sopVideoRecorderForFinalization = sopVideoRecorder
     let proofImages = proofImagesByTargetID
-    sopVideoRecorder = nil
-    conversationAudioRecorder = nil
-    proofImagesByTargetID = [:]
     let checklistPayload: [[String: Any]] = checklistItems.map {
       [
         "name": $0.name,
@@ -4245,14 +4639,43 @@ class StreamSessionViewModel: ObservableObject {
     let completedCount = checklistItems.filter(\.isChecked).count
     let finalStepIndex = nextIncompleteStepIndex()
 
-    await workerAdminSync?.updateCurrentStepIndex(finalStepIndex)
-    await workerAdminSync?.updateHelpRequested(false, sendImmediateHeartbeat: false)
+    WorkerLiveLogger.log(
+      "session_end_requested",
+      sessionID: sessionID,
+      roomCode: roomCodeAtEnd,
+      uploadState: "active"
+    )
+
+    isSopAuditRunning = false
+    isDossierUploading = true
+    updateDossierPipelineStatus("Registering replay upload...", kind: .active)
+    if cancelCountdownTask {
+      sopCountdownTask?.cancel()
+    }
+    sopCountdownTask = nil
+
+    if wasIPhoneRecording {
+      resetIPhoneAnalysisLane()
+      iPhoneCameraManager = nil
+      iPhonePreviewSession = nil
+      currentVideoFrame = nil
+      hasReceivedFirstFrame = false
+      streamingStatus = .stopped
+      streamingMode = .glasses
+      geminiAssistant.streamingMode = .glasses
+    }
+    sopVideoRecorder = nil
+    conversationAudioRecorder = nil
+    proofImagesByTargetID = [:]
+
+    await workerAdminSyncAtEnd?.updateCurrentStepIndex(finalStepIndex)
+    await workerAdminSyncAtEnd?.updateHelpRequested(false, sendImmediateHeartbeat: false)
+    let preparedVideoUpload = await workerAdminSyncAtEnd?.prepareVideoRecordingUpload(source: recordingSource)
 
     let videoUploadResult: WorkerMediaUploadResult
-    if let workerAdminSync {
-      videoUploadResult = await workerAdminSync.completeSession(
-        videoFileURL: recordedVideoURL,
-        videoSource: wasIPhoneRecording ? "phone-recording" : "stream-capture"
+    if let workerAdminSyncAtEnd {
+      videoUploadResult = await workerAdminSyncAtEnd.completeSession(
+        pendingVideoUpload: preparedVideoUpload
       ) { [weak self] in
         guard let self else { return }
 
@@ -4270,13 +4693,13 @@ class StreamSessionViewModel: ObservableObject {
           await self.patchActiveExecutionSession(
             ExecutionSessionPatch(
               status: status == .allItemsChecked ? "completed" : "ended",
-              currentSopID: self.selectedSOP?.remoteID,
+              currentSopID: completedSOP?.remoteID,
               currentStepIndex: finalStepIndex,
               helpRequested: false,
               endedAt: ISO8601DateFormatter().string(from: Date())
             )
           )
-        } else if recordedVideoURL == nil {
+        } else {
           self.updateDossierPipelineStatus("Execution ended locally. No backend session was active.", kind: .info)
         }
       }
@@ -4303,18 +4726,34 @@ class StreamSessionViewModel: ObservableObject {
         )
 
         await patchActiveExecutionSession(
-          ExecutionSessionPatch(
-            status: status == .allItemsChecked ? "completed" : "ended",
-            currentSopID: selectedSOP?.remoteID,
-            currentStepIndex: finalStepIndex,
-            helpRequested: false,
-            endedAt: ISO8601DateFormatter().string(from: Date())
+            ExecutionSessionPatch(
+              status: status == .allItemsChecked ? "completed" : "ended",
+              currentSopID: completedSOP?.remoteID,
+              currentStepIndex: finalStepIndex,
+              helpRequested: false,
+              endedAt: ISO8601DateFormatter().string(from: Date())
+            )
           )
-        )
-      } else if recordedVideoURL == nil {
+        } else {
         updateDossierPipelineStatus("Execution ended locally. No backend session was active.", kind: .info)
       }
     }
+
+    if geminiAssistant.isGeminiActive {
+      await geminiAssistant.stopSession()
+      try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+
+    didAttemptPendingRecordingRecovery = false
+    launchBackgroundMediaFinalization(
+      sessionID: sessionID ?? UUID().uuidString,
+      workerAdminSync: workerAdminSyncAtEnd,
+      preparedUpload: preparedVideoUpload,
+      wasIPhoneRecording: wasIPhoneRecording,
+      iPhoneCameraManager: iPhoneCameraForFinalization,
+      conversationAudioRecorder: conversationAudioRecorderForFinalization,
+      sopVideoRecorder: sopVideoRecorderForFinalization
+    )
 
     if let activeExecutionSession {
       if let remoteSOPID = completedSOP?.remoteID {
@@ -4338,28 +4777,17 @@ class StreamSessionViewModel: ObservableObject {
       markPendingTaskComplete(completedSOP)
     }
 
-    if videoUploadResult.succeeded {
-      clearPendingRecording()
-    } else if let recordedVideoURL, let sessionID {
-      rememberPendingRecording(sessionID: sessionID, fileURL: recordedVideoURL)
-      didAttemptPendingRecordingRecovery = false
-    }
-
-    if let recordedVideoURL, videoUploadResult.succeeded {
-      try? FileManager.default.removeItem(at: recordedVideoURL)
-    }
-
-    if !videoUploadResult.succeeded {
+    if videoUploadResult.uploadState == "failed" {
       let errorMessage = videoUploadResult.errorMessage ?? "Video finalize failed."
       let recordingLabel = wasIPhoneRecording ? "Phone recording" : "Session recording"
       setCriticalOperationsSyncIssue(
-        phase: "media_finalize",
-        message: "\(recordingLabel) finalize failed: \(errorMessage)"
+        phase: "media_reservation",
+        message: "\(recordingLabel) upload could not be reserved: \(errorMessage)"
       )
-      updateDossierPipelineStatus("\(recordingLabel) finalize failed.", kind: .error)
+      updateDossierPipelineStatus("\(recordingLabel) upload reservation failed.", kind: .error)
     } else {
       updateDossierPipelineStatus(
-        wasIPhoneRecording ? "Phone recording finalized." : "Session recording finalized.",
+        wasIPhoneRecording ? "Phone recording upload pending." : "Session recording upload pending.",
         kind: .success
       )
     }
@@ -4370,7 +4798,9 @@ class StreamSessionViewModel: ObservableObject {
       ShippedSessionRecord(
         timestamp: Date(),
         sopName: completedSOP?.name ?? "Unknown SOP",
-        status: videoUploadResult.succeeded ? "Replay ready" : "Finalize failed"
+        status: videoUploadResult.isPending
+          ? "Upload pending"
+          : videoUploadResult.succeeded ? "Replay ready" : "Finalize failed"
       )
     )
 
@@ -4392,12 +4822,11 @@ class StreamSessionViewModel: ObservableObject {
     if webrtcViewModel.isActive {
       webrtcViewModel.stopSession()
     }
-    await geminiAssistant.stopSession()
-    await workerAdminSync?.stop()
     workerAdminSync = nil
 
     hasActiveHelpEscalation = false
     shouldResumeAiSupportAfterBackOffice = false
+    resetLiveRoomSyncSnapshot()
     activeExecutionSession = nil
     currentSopSessionId = nil
     activeCaptureSOP = nil
@@ -4407,13 +4836,15 @@ class StreamSessionViewModel: ObservableObject {
     if canCloseCurrentPackage {
       packageClosureStatusMessage = "All required SOPs are complete. Close the package from NOW."
     }
-    sopAuditStatusMessage = videoUploadResult.succeeded
+    sopAuditStatusMessage = videoUploadResult.uploadState != "failed"
       ? (syncedToBackend ? "Execution synced" : "Execution uploaded")
-      : "Execution ended with media finalize issues"
+      : "Execution ended with media reservation issues"
     isSpotterInferenceInFlight = false
     shouldDismissCapture = true
     showShipSuccessToast = true
-    await startHomeCameraPreviewIfNeeded()
+    if !wasIPhoneRecording {
+      await startHomeCameraPreviewIfNeeded()
+    }
     successToastTask?.cancel()
     successToastTask = Task { @MainActor [weak self] in
       try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -4654,13 +5085,15 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func rememberPendingRecording(sessionID: String, fileURL: URL) {
-    let pending = PendingWorkerRecording(sessionID: sessionID, filePath: fileURL.path)
-    guard let encoded = try? JSONEncoder().encode(pending) else { return }
-    UserDefaults.standard.set(encoded, forKey: pendingRecordingDefaultsKey)
+    PendingWorkerRecordingStore.remember(
+      defaultsKey: pendingRecordingDefaultsKey,
+      sessionID: sessionID,
+      fileURL: fileURL
+    )
   }
 
   private func clearPendingRecording() {
-    UserDefaults.standard.removeObject(forKey: pendingRecordingDefaultsKey)
+    PendingWorkerRecordingStore.clear(defaultsKey: pendingRecordingDefaultsKey)
   }
 
   private func loadPendingRecording() -> PendingWorkerRecording? {
@@ -5785,9 +6218,28 @@ class StreamSessionViewModel: ObservableObject {
         "gemini_audio_ready": geminiAssistant.isAudioReady,
         "webrtc_active": webrtcViewModel.isActive,
         "has_active_help_escalation": hasActiveHelpEscalation,
+        "audio_route_lease_protected": true,
+        "av_audio_engine_state_protected": true,
         "support_mode_trusted": false
       ]
     )
+  }
+
+  private func isAuthoritativeHumanSupportEnd(_ response: WorkerLiveHeartbeatResponse) -> Bool {
+    guard response.supportMode == "ai", response.humanSupportStatus == "ended" else {
+      return false
+    }
+
+    return hasActiveHelpEscalation ||
+      shouldResumeAiSupportAfterBackOffice ||
+      (webrtcViewModel.isActive && webrtcViewModel.isSupportMode) ||
+      response.supportUpdatedAt != nil
+  }
+
+  private func resetLiveRoomSyncSnapshot() {
+    lastLiveRoomSyncSnapshot = nil
+    lastLiveRoomSyncAt = .distantPast
+    hasReceivedBackOfficeConnectedHandshake = false
   }
 
   private func handleWorkerLiveHeartbeatResponse(_ response: WorkerLiveHeartbeatResponse) async {
@@ -5798,13 +6250,15 @@ class StreamSessionViewModel: ObservableObject {
     let humanConnected =
       response.shouldOpenLiveRoom ||
       (response.supportMode == "back_office" && response.humanSupportStatus == "connected")
-    let humanEnded =
+    let reportedHumanEnded =
       response.supportMode == "ai" && response.humanSupportStatus == "ended"
+    let humanEnded = isAuthoritativeHumanSupportEnd(response)
     let humanRinging =
       response.supportMode == "handoff_requested" || response.humanSupportStatus == "ringing"
 
     if humanConnected {
       hasActiveHelpEscalation = true
+      hasReceivedBackOfficeConnectedHandshake = true
       if !webrtcViewModel.isActive || !webrtcViewModel.isSupportMode {
         let wasObservationRoom = webrtcViewModel.isActive && !webrtcViewModel.isSupportMode
         helpStatusMessage = wasObservationRoom
@@ -5830,11 +6284,32 @@ class StreamSessionViewModel: ObservableObject {
       return
     }
 
+    if reportedHumanEnded && !humanEnded {
+      await WorkerTelemetry.shared.record(
+        "worker_live_support_end_ignored_non_authoritative",
+        source: "ios_app",
+        stage: "non_authoritative_heartbeat",
+        sessionID: response.sessionID,
+        payload: [
+          "support_mode": response.supportMode,
+          "human_support_status": response.humanSupportStatus,
+          "webrtc_active": webrtcViewModel.isActive,
+          "webrtc_support_mode": webrtcViewModel.isSupportMode,
+          "has_active_help_escalation": hasActiveHelpEscalation,
+          "should_resume_ai": shouldResumeAiSupportAfterBackOffice,
+          "support_updated_at_present": response.supportUpdatedAt != nil,
+          "audio_route_lease_protected": true
+        ]
+      )
+      return
+    }
+
     if humanEnded {
-      if webrtcViewModel.isActive {
+      if webrtcViewModel.isActive && webrtcViewModel.isSupportMode {
         webrtcViewModel.stopSession()
       }
       hasActiveHelpEscalation = false
+      resetLiveRoomSyncSnapshot()
       await workerAdminSync?.updateHelpRequested(false, sendImmediateHeartbeat: false)
       helpStatusMessage = "Back office ended. AI support is available again."
       await ensureObservationLiveRoomSession()
@@ -5866,7 +6341,7 @@ class StreamSessionViewModel: ObservableObject {
     let notes = helpRequestNotes.trimmingCharacters(in: .whitespacesAndNewlines)
     shouldResumeAiSupportAfterBackOffice = geminiAssistant.isGeminiActive
     if geminiAssistant.isGeminiActive {
-      await geminiAssistant.stopSession()
+      await geminiAssistant.stopSessionForHumanSupportHandoff()
       aiGuideStatusMessage = "AI guide paused while back office support is requested."
       sopAuditStatusMessage = aiGuideStatusMessage
     }
@@ -5898,7 +6373,6 @@ class StreamSessionViewModel: ObservableObject {
           helpRequested: true
         )
       )
-      await workerAdminSync?.updateHelpRequested(true)
       helpStatusMessage = "Calling back office. Live video and audio will open after they answer."
     } catch {
       hasActiveHelpEscalation = false
@@ -5912,20 +6386,65 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func syncLiveRoomState(roomCode: String) async {
-    guard !roomCode.isEmpty else { return }
-    await workerAdminSync?.updateRoomCode(roomCode)
-    guard activeExecutionSession != nil else {
-      helpStatusMessage = liveRoomStatusMessage(localOnly: true, helpRequested: hasActiveHelpEscalation, roomCode: roomCode)
+    let normalizedRoomCode = roomCode.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedRoomCode.isEmpty else { return }
+
+    let backOfficeConnected =
+      hasReceivedBackOfficeConnectedHandshake ||
+      (hasActiveHelpEscalation &&
+        webrtcViewModel.isActive &&
+        webrtcViewModel.isSupportMode &&
+        webrtcViewModel.connectionState == .connected)
+    let nextSnapshot = LiveRoomSyncSnapshot(
+      roomCode: normalizedRoomCode,
+      helpRequested: hasActiveHelpEscalation,
+      backOfficeConnected: backOfficeConnected
+    )
+    let previousSnapshot = lastLiveRoomSyncSnapshot
+    let now = Date()
+    let isFirstRoomCodePublish = previousSnapshot?.roomCode == nil
+    let didChangeRoomCode = previousSnapshot?.roomCode != nil &&
+      previousSnapshot?.roomCode != normalizedRoomCode
+    let didInitiallyRequestHelp = hasActiveHelpEscalation &&
+      previousSnapshot?.helpRequested != true
+    let didInitiallyConnectBackOffice = backOfficeConnected &&
+      previousSnapshot?.backOfficeConnected != true
+    let shouldSendImmediateHeartbeat =
+      isFirstRoomCodePublish ||
+      didChangeRoomCode ||
+      didInitiallyRequestHelp ||
+      didInitiallyConnectBackOffice
+    let isRedundantSync = previousSnapshot == nextSnapshot
+    let didClearThrottle =
+      now.timeIntervalSince(lastLiveRoomSyncAt) >= liveRoomRedundantSyncThrottleInterval
+
+    let localOnly = activeExecutionSession == nil
+    helpStatusMessage = liveRoomStatusMessage(
+      localOnly: localOnly,
+      helpRequested: hasActiveHelpEscalation,
+      roomCode: normalizedRoomCode
+    )
+
+    guard shouldSendImmediateHeartbeat || !isRedundantSync || didClearThrottle else {
       return
     }
 
-    helpStatusMessage = liveRoomStatusMessage(localOnly: false, helpRequested: hasActiveHelpEscalation, roomCode: roomCode)
-    await patchActiveExecutionSession(
-      ExecutionSessionPatch(
-        helpRequested: hasActiveHelpEscalation,
-        webrtcRoomCode: roomCode
-      )
+    await workerAdminSync?.updateRoomCode(
+      normalizedRoomCode,
+      sendImmediateHeartbeat: shouldSendImmediateHeartbeat
     )
+
+    if !localOnly {
+      await patchActiveExecutionSession(
+        ExecutionSessionPatch(
+          helpRequested: hasActiveHelpEscalation,
+          webrtcRoomCode: normalizedRoomCode
+        )
+      )
+    }
+
+    lastLiveRoomSyncSnapshot = nextSnapshot
+    lastLiveRoomSyncAt = now
   }
 
   private func closeCurrentPackageFlow() async {
@@ -6025,7 +6544,7 @@ class StreamSessionViewModel: ObservableObject {
       shouldResumeAiSupportAfterBackOffice = true
       aiGuideStatusMessage = "AI guide paused while back office support connects."
       sopAuditStatusMessage = aiGuideStatusMessage
-      await geminiAssistant.stopSession()
+      await geminiAssistant.stopSessionForHumanSupportHandoff()
     }
 
     let hasRoomCode = !webrtcViewModel.roomCode.isEmpty

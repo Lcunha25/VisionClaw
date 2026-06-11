@@ -10,6 +10,32 @@ enum GeminiConnectionState: Equatable {
   case error(String)
 }
 
+enum GeminiRecoverableDisconnectReason: Equatable {
+  case socketClosed(String)
+  case socketError(String)
+  case receiveError(String)
+  case sendError(String)
+  case pingError(String)
+  case goAway(seconds: Int)
+
+  var message: String {
+    switch self {
+    case .socketClosed(let message):
+      return message
+    case .socketError(let message):
+      return message
+    case .receiveError(let message):
+      return message
+    case .sendError(let message):
+      return message
+    case .pingError(let message):
+      return message
+    case .goAway(let seconds):
+      return "Server closing (time left: \(seconds)s)"
+    }
+  }
+}
+
 @MainActor
 class GeminiLiveService: ObservableObject {
   @Published var connectionState: GeminiConnectionState = .disconnected
@@ -23,6 +49,7 @@ class GeminiLiveService: ObservableObject {
   var onOutputTranscription: ((String) -> Void)?
   var onSocketOpened: (() -> Void)?
   var onSocketClosed: ((String?) -> Void)?
+  var onRecoverableDisconnect: ((GeminiRecoverableDisconnectReason) -> Void)?
 
   // Latency tracking
   private var lastUserSpeechEnd: Date?
@@ -30,6 +57,7 @@ class GeminiLiveService: ObservableObject {
 
   private var webSocketTask: URLSessionWebSocketTask?
   private var receiveTask: Task<Void, Never>?
+  private var pingTask: Task<Void, Never>?
   private var connectContinuation: CheckedContinuation<Bool, Never>?
   private var closeWaitContinuation: CheckedContinuation<Void, Never>?
   private let delegate = WebSocketDelegate()
@@ -40,6 +68,10 @@ class GeminiLiveService: ObservableObject {
   private var setupModel: String = GeminiConfig.model
   private var videoFrameSendCount: Int64 = 0
   private var videoFrameStatsWindowStart = CACurrentMediaTime()
+  private var connectionGeneration = 0
+  private var isClosingIntentionally = false
+  private var didNotifyRecoverableDisconnect = false
+  private let keepaliveIntervalNanoseconds: UInt64 = 15_000_000_000
 
   var lastVideoFrameBase64: String? { latestVideoFrameBase64 }
 
@@ -61,6 +93,11 @@ class GeminiLiveService: ObservableObject {
     setupSystemInstruction = resolvedSystemInstruction(systemInstruction)
     setupModel = credential.model
     connectionState = .connecting
+    connectionGeneration += 1
+    let generation = connectionGeneration
+    isClosingIntentionally = false
+    didNotifyRecoverableDisconnect = false
+    stopKeepalive()
 
     let result = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
       self.connectContinuation = continuation
@@ -68,6 +105,7 @@ class GeminiLiveService: ObservableObject {
       self.delegate.onOpen = { [weak self] protocol_ in
         guard let self else { return }
         Task { @MainActor in
+          guard self.connectionGeneration == generation else { return }
           Task {
             await WorkerTelemetry.shared.record(
               "gemini_socket_open",
@@ -78,6 +116,7 @@ class GeminiLiveService: ObservableObject {
           }
           self.onSocketOpened?()
           self.connectionState = .settingUp
+          self.startKeepalive(generation: generation)
           self.sendSetupMessage()
           self.startReceiving()
         }
@@ -87,6 +126,7 @@ class GeminiLiveService: ObservableObject {
         guard let self else { return }
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason"
         Task { @MainActor in
+          guard self.connectionGeneration == generation else { return }
           Task {
             await WorkerTelemetry.shared.record(
               "gemini_socket_closed",
@@ -98,12 +138,16 @@ class GeminiLiveService: ObservableObject {
               ]
             )
           }
-          self.resolveConnect(success: false)
-          self.connectionState = .disconnected
-          self.isModelSpeaking = false
-          self.resolveCloseWait()
-          self.onSocketClosed?("Connection closed (code \(code.rawValue): \(reasonStr))")
-          self.onDisconnected?("Connection closed (code \(code.rawValue): \(reasonStr))")
+          let message = "Connection closed (code \(code.rawValue): \(reasonStr))"
+          if self.isClosingIntentionally || code == .normalClosure {
+            self.stopKeepalive()
+            self.resolveConnect(success: false)
+            self.connectionState = .disconnected
+            self.isModelSpeaking = false
+            self.resolveCloseWait()
+            return
+          }
+          self.notifyRecoverableDisconnect(.socketClosed(message), state: .disconnected)
         }
       }
 
@@ -111,6 +155,7 @@ class GeminiLiveService: ObservableObject {
         guard let self else { return }
         let msg = error?.localizedDescription ?? "Unknown error"
         Task { @MainActor in
+          guard self.connectionGeneration == generation else { return }
           Task {
             await WorkerTelemetry.shared.record(
               "gemini_socket_error",
@@ -119,12 +164,15 @@ class GeminiLiveService: ObservableObject {
               payload: ["error": msg]
             )
           }
-          self.resolveConnect(success: false)
-          self.connectionState = .error(msg)
-          self.isModelSpeaking = false
-          self.resolveCloseWait()
-          self.onSocketClosed?(msg)
-          self.onDisconnected?(msg)
+          guard !self.isClosingIntentionally else {
+            self.stopKeepalive()
+            self.resolveConnect(success: false)
+            self.connectionState = .disconnected
+            self.isModelSpeaking = false
+            self.resolveCloseWait()
+            return
+          }
+          self.notifyRecoverableDisconnect(.socketError(msg), state: .error(msg))
         }
       }
 
@@ -135,6 +183,7 @@ class GeminiLiveService: ObservableObject {
       Task {
         try? await Task.sleep(nanoseconds: 15_000_000_000)
         await MainActor.run {
+          guard self.connectionGeneration == generation else { return }
           self.resolveConnect(success: false)
           if self.connectionState == .connecting || self.connectionState == .settingUp {
             self.connectionState = .error("Connection timed out")
@@ -147,6 +196,9 @@ class GeminiLiveService: ObservableObject {
   }
 
   func disconnect() {
+    isClosingIntentionally = true
+    connectionGeneration += 1
+    stopKeepalive()
     receiveTask?.cancel()
     receiveTask = nil
     webSocketTask?.cancel(with: .normalClosure, reason: nil)
@@ -156,6 +208,7 @@ class GeminiLiveService: ObservableObject {
     delegate.onError = nil
     onSocketOpened = nil
     onSocketClosed = nil
+    onRecoverableDisconnect = nil
     connectionState = .disconnected
     isModelSpeaking = false
     resolveConnect(success: false)
@@ -163,6 +216,8 @@ class GeminiLiveService: ObservableObject {
   }
 
   func disconnectAndWaitForClose(timeout: TimeInterval = 1.0) async {
+    isClosingIntentionally = true
+    stopKeepalive()
     receiveTask?.cancel()
     receiveTask = nil
 
@@ -193,6 +248,7 @@ class GeminiLiveService: ObservableObject {
     delegate.onError = nil
     onSocketOpened = nil
     onSocketClosed = nil
+    onRecoverableDisconnect = nil
     connectionState = .disconnected
     isModelSpeaking = false
     resolveConnect(success: false)
@@ -315,6 +371,58 @@ class GeminiLiveService: ObservableObject {
     cont.resume()
   }
 
+  private func startKeepalive(generation: Int) {
+    stopKeepalive()
+    let interval = keepaliveIntervalNanoseconds
+    pingTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: interval)
+        guard !Task.isCancelled else { break }
+        await MainActor.run {
+          self?.sendKeepalivePingIfCurrent(generation: generation)
+        }
+      }
+    }
+  }
+
+  private func stopKeepalive() {
+    pingTask?.cancel()
+    pingTask = nil
+  }
+
+  private func sendKeepalivePingIfCurrent(generation: Int) {
+    guard connectionGeneration == generation,
+          !isClosingIntentionally,
+          let task = webSocketTask else {
+      return
+    }
+
+    task.sendPing { [weak self] error in
+      guard let error else { return }
+      Task { @MainActor in
+        guard let self, self.connectionGeneration == generation else { return }
+        self.notifyRecoverableDisconnect(
+          .pingError(error.localizedDescription),
+          state: .disconnected
+        )
+      }
+    }
+  }
+
+  private func notifyRecoverableDisconnect(
+    _ reason: GeminiRecoverableDisconnectReason,
+    state: GeminiConnectionState
+  ) {
+    guard !isClosingIntentionally, !didNotifyRecoverableDisconnect else { return }
+    didNotifyRecoverableDisconnect = true
+    stopKeepalive()
+    resolveConnect(success: false)
+    connectionState = state
+    isModelSpeaking = false
+    resolveCloseWait()
+    onRecoverableDisconnect?(reason)
+  }
+
   private func resolvedSystemInstruction(_ override: String?) -> String {
     let candidate = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if !candidate.isEmpty {
@@ -371,12 +479,10 @@ class GeminiLiveService: ObservableObject {
       guard let self, let error else { return }
       Task { @MainActor in
         NSLog("[Gemini] WebSocket send failed: %@", error.localizedDescription)
-        self.resolveConnect(success: false)
-        self.connectionState = .error("WebSocket send failed: \(error.localizedDescription)")
-        self.isModelSpeaking = false
-        self.resolveCloseWait()
-        self.onSocketClosed?(error.localizedDescription)
-        self.onDisconnected?(error.localizedDescription)
+        self.notifyRecoverableDisconnect(
+          .sendError(error.localizedDescription),
+          state: .error("WebSocket send failed: \(error.localizedDescription)")
+        )
       }
     }
   }
@@ -402,11 +508,10 @@ class GeminiLiveService: ObservableObject {
           if !Task.isCancelled {
             let reason = error.localizedDescription
             await MainActor.run {
-              self.resolveConnect(success: false)
-              self.connectionState = .disconnected
-              self.isModelSpeaking = false
-              self.resolveCloseWait()
-              self.onDisconnected?(reason)
+              self.notifyRecoverableDisconnect(
+                .receiveError(reason),
+                state: .disconnected
+              )
             }
           }
           break
@@ -455,11 +560,7 @@ class GeminiLiveService: ObservableObject {
     if let goAway = json["goAway"] as? [String: Any] {
       let timeLeft = goAway["timeLeft"] as? [String: Any]
       let seconds = timeLeft?["seconds"] as? Int ?? 0
-      connectionState = .disconnected
-      isModelSpeaking = false
-      resolveCloseWait()
-      onSocketClosed?("Server closing (time left: \(seconds)s)")
-      onDisconnected?("Server closing (time left: \(seconds)s)")
+      notifyRecoverableDisconnect(.goAway(seconds: seconds), state: .disconnected)
       return
     }
 

@@ -561,26 +561,24 @@ final class AudioManager: @unchecked Sendable {
   func stopCapture() async {
     // AVAudioEngine graph teardown runs on a serial lifecycle queue so callers
     // can await the barrier without blocking the MainActor on audio hardware.
-    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+    let lease = await withCheckedContinuation { (continuation: CheckedContinuation<WorkerAudioRouteLease?, Never>) in
       audioLifecycleQueue.async { [weak self] in
         guard let self else {
-          continuation.resume()
+          continuation.resume(returning: nil)
           return
         }
 
+        let lease = self.audioRouteLease
+        self.audioRouteLease = nil
         self.tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: true) {
           self.removeObservers()
-          continuation.resume()
+          continuation.resume(returning: lease)
         }
       }
     }
 
-    let lease = audioRouteLease
-    audioRouteLease = nil
     if let lease {
-      await WorkerAudioRouteCoordinator.shared.release(lease: lease) { [weak self] in
-        await self?.waitForAudioGraphClean()
-      }
+      await WorkerAudioRouteCoordinator.shared.release(lease: lease)
     }
   }
 
@@ -743,18 +741,18 @@ final class AudioManager: @unchecked Sendable {
     audioGraphGeneration &+= 1
     isCapturing = false
 
+    let inputNode = audioEngine.inputNode
     audioEngine.stop()
 
     if isInputTapInstalled {
-      audioEngine.inputNode.removeTap(onBus: 0)
+      inputNode.removeTap(onBus: 0)
       isInputTapInstalled = false
     }
 
-    if playerNode.isPlaying {
-      playerNode.stop()
-    }
-
     if isPlayerNodeAttached {
+      if playerNode.isPlaying {
+        playerNode.stop()
+      }
       audioEngine.disconnectNodeOutput(playerNode)
       audioEngine.detach(playerNode)
       isPlayerNodeAttached = false

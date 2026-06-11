@@ -19,6 +19,12 @@ class GeminiSessionViewModel: ObservableObject {
     let provider: String?
   }
 
+  private enum GeminiSessionIntent {
+    case idle
+    case active
+    case humanSupport
+  }
+
   private let geminiService = GeminiLiveService()
   private let audioManager = AudioManager()
   private var lastVideoFrameTime: Date = .distantPast
@@ -29,6 +35,11 @@ class GeminiSessionViewModel: ObservableObject {
   private var currentSessionInstruction: String?
   private var lastDiagnosticsID: String?
   private var isStoppingSession = false
+  private var sessionIntent: GeminiSessionIntent = .idle
+  private var sessionGeneration = 0
+  private var reconnectTask: Task<Void, Never>?
+  private var autoReconnectAttempts = 0
+  private let maxAutoReconnectAttempts = 3
 
   var streamingMode: StreamingMode = .glasses
   var onInputCommand: ((String) -> Void)?
@@ -46,12 +57,18 @@ class GeminiSessionViewModel: ObservableObject {
       return
     }
 
+    sessionGeneration += 1
+    sessionIntent = .active
+    autoReconnectAttempts = 0
+    reconnectTask?.cancel()
+    reconnectTask = nil
     errorMessage = nil
     userTranscript = ""
     aiTranscript = ""
     isStoppingSession = false
 
     guard let liveConfig = await resolveLiveSessionConfig(fallbackInstruction: systemInstruction) else {
+      sessionIntent = .idle
       errorMessage = "Gemini Live token unavailable. Check Admin AI Settings and the worker backend connection."
       return
     }
@@ -66,6 +83,7 @@ class GeminiSessionViewModel: ObservableObject {
     do {
       try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
     } catch {
+      sessionIntent = .idle
       await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
       return
     }
@@ -80,6 +98,7 @@ class GeminiSessionViewModel: ObservableObject {
         fallback: "Failed to connect to Gemini",
         diagnosticsID: liveConfig.diagnosticsID
       )
+      sessionIntent = .idle
       await resetToIdle(message: message)
       await recordTelemetry(
         "gemini_live_connect_failed",
@@ -95,6 +114,7 @@ class GeminiSessionViewModel: ObservableObject {
     do {
       try audioManager.startCapture()
     } catch {
+      sessionIntent = .idle
       await resetToIdle(message: "Mic capture failed: \(error.localizedDescription)")
       return
     }
@@ -113,12 +133,28 @@ class GeminiSessionViewModel: ObservableObject {
   }
 
   func stopSession() async {
+    sessionIntent = .idle
+    sessionGeneration += 1
+    reconnectTask?.cancel()
+    reconnectTask = nil
+    await resetToIdle(message: nil)
+  }
+
+  func stopSessionForHumanSupportHandoff() async {
+    sessionIntent = .humanSupport
+    sessionGeneration += 1
+    reconnectTask?.cancel()
+    reconnectTask = nil
     await resetToIdle(message: nil)
   }
 
   func refreshSessionInstruction(_ systemInstruction: String?) async {
     guard isGeminiActive else { return }
     guard let liveConfig = await resolveLiveSessionConfig(fallbackInstruction: systemInstruction) else {
+      sessionIntent = .idle
+      sessionGeneration += 1
+      reconnectTask?.cancel()
+      reconnectTask = nil
       await resetToIdle(message: "Gemini Live token refresh failed. Check Admin AI Settings and try again.")
       return
     }
@@ -192,19 +228,24 @@ class GeminiSessionViewModel: ObservableObject {
       }
     }
 
+    geminiService.onRecoverableDisconnect = { [weak self] reason in
+      guard let self else { return }
+      Task { @MainActor in
+        await self.handleRecoverableDisconnect(reason)
+      }
+    }
+
     geminiService.onDisconnected = { [weak self] reason in
       guard let self else { return }
       Task { @MainActor in
-        guard self.isGeminiActive, !self.isStoppingSession else { return }
-        await self.resetToIdle(message: "Gemini connection lost: \(reason ?? "Unknown error")")
+        await self.handleFatalDisconnect("Gemini connection lost: \(reason ?? "Unknown error")")
       }
     }
 
     geminiService.onSocketClosed = { [weak self] reason in
       guard let self else { return }
       Task { @MainActor in
-        guard self.isGeminiActive, !self.isStoppingSession else { return }
-        await self.resetToIdle(message: "Gemini socket closed: \(reason ?? "Unknown error")")
+        await self.handleFatalDisconnect("Gemini socket closed: \(reason ?? "Unknown error")")
       }
     }
   }
@@ -222,7 +263,108 @@ class GeminiSessionViewModel: ObservableObject {
     }
   }
 
-  private func reconnectTransport(with liveConfig: LiveSessionConfig) async {
+  private func handleFatalDisconnect(_ message: String) async {
+    guard isGeminiActive, !isStoppingSession else { return }
+    sessionIntent = .idle
+    sessionGeneration += 1
+    reconnectTask?.cancel()
+    reconnectTask = nil
+    await resetToIdle(message: message)
+  }
+
+  private func handleRecoverableDisconnect(_ reason: GeminiRecoverableDisconnectReason) async {
+    guard isGeminiActive, !isStoppingSession, sessionIntent == .active else { return }
+    isAudioReady = false
+    isModelSpeaking = false
+
+    let generation = sessionGeneration
+    guard reconnectTask == nil else { return }
+    reconnectTask = Task { @MainActor [weak self] in
+      await self?.runAutoReconnect(reason: reason, generation: generation)
+    }
+  }
+
+  private func shouldContinueAutoReconnect(generation: Int) -> Bool {
+    sessionIntent == .active && sessionGeneration == generation
+  }
+
+  private func shouldUseReconnectGeneration(_ generation: Int?) -> Bool {
+    guard let generation else { return true }
+    return shouldContinueAutoReconnect(generation: generation)
+  }
+
+  private func runAutoReconnect(
+    reason: GeminiRecoverableDisconnectReason,
+    generation: Int
+  ) async {
+    defer {
+      if sessionGeneration == generation {
+        reconnectTask = nil
+      }
+    }
+
+    while autoReconnectAttempts < maxAutoReconnectAttempts {
+      guard shouldContinueAutoReconnect(generation: generation), !Task.isCancelled else { return }
+      autoReconnectAttempts += 1
+      let attempt = autoReconnectAttempts
+      let delayNanoseconds = UInt64(Double(attempt) * 750_000_000)
+
+      try? await Task.sleep(nanoseconds: delayNanoseconds)
+      guard shouldContinueAutoReconnect(generation: generation), !Task.isCancelled else { return }
+
+      await recordTelemetry(
+        "gemini_live_auto_reconnect_attempt",
+        stage: "retrying",
+        payload: [
+          "attempt": attempt,
+          "max_attempts": maxAutoReconnectAttempts,
+          "reason": reason.message
+        ]
+      )
+
+      let fallbackInstruction = currentSessionInstruction
+      guard let liveConfig = await resolveLiveSessionConfig(fallbackInstruction: fallbackInstruction) else {
+        continue
+      }
+      guard shouldContinueAutoReconnect(generation: generation), !Task.isCancelled else { return }
+
+      let didReconnect = await reconnectTransport(
+        with: liveConfig,
+        preserveTranscripts: true,
+        resetOnFailure: false,
+        requiredGeneration: generation
+      )
+      guard shouldContinueAutoReconnect(generation: generation), !Task.isCancelled else { return }
+
+      if didReconnect {
+        autoReconnectAttempts = 0
+        await recordTelemetry(
+          "gemini_live_auto_reconnect_succeeded",
+          stage: "ready",
+          payload: [
+            "attempt": attempt,
+            "reason": reason.message,
+            "diagnostics_id": liveConfig.diagnosticsID ?? NSNull()
+          ]
+        )
+        return
+      }
+    }
+
+    guard shouldContinueAutoReconnect(generation: generation) else { return }
+    reconnectTask = nil
+    sessionIntent = .idle
+    sessionGeneration += 1
+    await resetToIdle(message: "Gemini connection lost: \(reason.message)")
+  }
+
+  @discardableResult
+  private func reconnectTransport(
+    with liveConfig: LiveSessionConfig,
+    preserveTranscripts: Bool = false,
+    resetOnFailure: Bool = true,
+    requiredGeneration: Int? = nil
+  ) async -> Bool {
     let wasActive = isGeminiActive
     isGeminiActive = false
     isAudioReady = false
@@ -237,11 +379,14 @@ class GeminiSessionViewModel: ObservableObject {
     stateObservation = nil
     isStoppingSession = false
 
-    guard wasActive else { return }
+    guard wasActive || shouldUseReconnectGeneration(requiredGeneration) else { return false }
+    guard shouldUseReconnectGeneration(requiredGeneration) else { return false }
 
     errorMessage = nil
-    userTranscript = ""
-    aiTranscript = ""
+    if !preserveTranscripts {
+      userTranscript = ""
+      aiTranscript = ""
+    }
     currentLiveCredential = liveConfig.credential
     currentSessionInstruction = liveConfig.systemInstruction
     lastDiagnosticsID = liveConfig.diagnosticsID
@@ -252,31 +397,54 @@ class GeminiSessionViewModel: ObservableObject {
     do {
       try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
     } catch {
-      await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
-      return
+      if resetOnFailure {
+        await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
+      } else {
+        errorMessage = "Audio setup failed: \(error.localizedDescription)"
+      }
+      return false
     }
+    guard shouldUseReconnectGeneration(requiredGeneration) else { return false }
 
     let setupOk = await geminiService.connect(
       systemInstruction: liveConfig.systemInstruction,
       credential: liveConfig.credential
     )
     guard setupOk else {
-      await resetToIdle(message: liveConnectionError(
+      let message = liveConnectionError(
         fallback: "Failed to reconnect to Gemini",
         diagnosticsID: liveConfig.diagnosticsID
-      ))
-      return
+      )
+      if resetOnFailure {
+        await resetToIdle(message: message)
+      } else {
+        errorMessage = message
+        await geminiService.disconnectAndWaitForClose(timeout: 1.0)
+      }
+      return false
+    }
+    guard shouldUseReconnectGeneration(requiredGeneration) else {
+      await geminiService.disconnectAndWaitForClose(timeout: 1.0)
+      return false
     }
 
     do {
       try audioManager.startCapture()
     } catch {
-      await resetToIdle(message: "Mic capture failed: \(error.localizedDescription)")
-      return
+      if resetOnFailure {
+        await resetToIdle(message: "Mic capture failed: \(error.localizedDescription)")
+      } else {
+        errorMessage = "Mic capture failed: \(error.localizedDescription)"
+      }
+      return false
+    }
+    guard shouldUseReconnectGeneration(requiredGeneration) else {
+      return false
     }
 
     isGeminiActive = true
     isAudioReady = true
+    return true
   }
 
   private func resolveLiveSessionConfig(fallbackInstruction: String?) async -> LiveSessionConfig? {
@@ -373,6 +541,7 @@ class GeminiSessionViewModel: ObservableObject {
     isGeminiActive = false
     isAudioReady = false
     isModelSpeaking = false
+    autoReconnectAttempts = 0
     stateObservation?.cancel()
     stateObservation = nil
     clearGeminiCallbacks()
@@ -395,6 +564,7 @@ class GeminiSessionViewModel: ObservableObject {
   private func clearGeminiCallbacks() {
     geminiService.onDisconnected = nil
     geminiService.onSocketClosed = nil
+    geminiService.onRecoverableDisconnect = nil
     geminiService.onSocketOpened = nil
     geminiService.onAudioReceived = nil
     geminiService.onInterrupted = nil

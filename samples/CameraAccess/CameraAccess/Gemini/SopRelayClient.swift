@@ -1435,7 +1435,7 @@ struct WorkerLiveHeartbeatResponse: Decodable, Equatable {
   }
 }
 
-struct WorkerMediaUploadTarget: Decodable, Equatable {
+struct WorkerMediaUploadTarget: Decodable, Equatable, Sendable {
   let assetID: String
   let bucket: String
   let path: String
