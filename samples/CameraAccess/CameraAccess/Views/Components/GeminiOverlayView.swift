@@ -5,11 +5,7 @@ struct GeminiStatusBar: View {
 
   var body: some View {
     HStack(spacing: 8) {
-      // Gemini connection pill
       StatusPill(color: geminiStatusColor, text: geminiStatusText)
-
-      // Video AI Analyst bridge connection pill
-      StatusPill(color: openClawStatusColor, text: openClawStatusText)
     }
   }
 
@@ -31,23 +27,6 @@ struct GeminiStatusBar: View {
     }
   }
 
-  private var openClawStatusColor: Color {
-    switch geminiVM.openClawConnectionState {
-    case .connected: return .green
-    case .checking: return .yellow
-    case .unreachable: return .red
-    case .notConfigured: return .gray
-    }
-  }
-
-  private var openClawStatusText: String {
-    switch geminiVM.openClawConnectionState {
-    case .connected: return "Video AI Analyst"
-    case .checking: return "Video AI Analyst..."
-    case .unreachable: return "Analyst Off"
-    case .notConfigured: return "No Analyst"
-    }
-  }
 }
 
 struct StatusPill: View {
@@ -92,60 +71,6 @@ struct TranscriptView: View {
     .padding(.vertical, 10)
     .background(Color.black.opacity(0.6))
     .cornerRadius(12)
-  }
-}
-
-struct ToolCallStatusView: View {
-  let status: ToolCallStatus
-
-  var body: some View {
-    if status != .idle {
-      HStack(spacing: 8) {
-        statusIcon
-        Text(status.displayText)
-          .font(.system(size: 13, weight: .medium))
-          .foregroundColor(.white)
-          .lineLimit(1)
-      }
-      .padding(.horizontal, 14)
-      .padding(.vertical, 8)
-      .background(statusBackground)
-      .cornerRadius(16)
-    }
-  }
-
-  @ViewBuilder
-  private var statusIcon: some View {
-    switch status {
-    case .executing:
-      ProgressView()
-        .scaleEffect(0.7)
-        .tint(.white)
-    case .completed:
-      Image(systemName: "checkmark.circle.fill")
-        .foregroundColor(.green)
-        .font(.system(size: 14))
-    case .failed:
-      Image(systemName: "exclamationmark.circle.fill")
-        .foregroundColor(.red)
-        .font(.system(size: 14))
-    case .cancelled:
-      Image(systemName: "xmark.circle.fill")
-        .foregroundColor(.yellow)
-        .font(.system(size: 14))
-    case .idle:
-      EmptyView()
-    }
-  }
-
-  private var statusBackground: Color {
-    switch status {
-    case .executing: return Color.black.opacity(0.7)
-    case .completed: return Color.black.opacity(0.6)
-    case .failed: return Color.red.opacity(0.3)
-    case .cancelled: return Color.black.opacity(0.6)
-    case .idle: return Color.clear
-    }
   }
 }
 
@@ -200,7 +125,6 @@ struct GeminiAssistantOverlay: View {
       }
 
       HStack(spacing: 10) {
-        ToolCallStatusView(status: geminiVM.toolCallStatus)
         if geminiVM.isModelSpeaking {
           SpeakingIndicator()
             .padding(.horizontal, 10)

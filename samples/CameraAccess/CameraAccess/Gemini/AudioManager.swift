@@ -2,14 +2,344 @@ import AVFoundation
 import Foundation
 import UIKit
 
-class AudioManager {
+enum WorkerAudioRouteOwner: String, Sendable {
+  case aiGuide = "ai_guide"
+  case backOfficeWebRTC = "back_office_webrtc"
+  case holdToTalk = "hold_to_talk"
+  case viewer = "viewer"
+}
+
+struct WorkerAudioRouteLease: Equatable, Sendable {
+  let owner: WorkerAudioRouteOwner
+  let token: UUID
+  let generation: UInt64
+
+  var payload: [String: Any] {
+    [
+      "owner": owner.rawValue,
+      "token": token.uuidString,
+      "generation": generation
+    ]
+  }
+}
+
+struct WorkerAudioRouteSnapshot {
+  let lease: WorkerAudioRouteLease
+  let owner: WorkerAudioRouteOwner
+  let mode: StreamingMode
+  let reason: String
+  let category: String
+  let audioMode: String
+  let inputs: [String]
+  let outputs: [String]
+  let preferredInput: String?
+  let usesHandsFreeRoute: Bool
+  let fallbackMessage: String?
+  let sampleRate: Double
+  let ioBufferDuration: Double
+
+  var payload: [String: Any] {
+    [
+      "owner": owner.rawValue,
+      "token": lease.token.uuidString,
+      "generation": lease.generation,
+      "mode": mode == .iPhone ? "iphone" : "glasses",
+      "reason": reason,
+      "category": category,
+      "audio_mode": audioMode,
+      "inputs": inputs,
+      "outputs": outputs,
+      "preferred_input": preferredInput ?? NSNull(),
+      "uses_hands_free_route": usesHandsFreeRoute,
+      "fallback_message": fallbackMessage ?? NSNull(),
+      "sample_rate": sampleRate,
+      "io_buffer_duration": ioBufferDuration
+    ]
+  }
+}
+
+final class WorkerAudioRouteCoordinator: @unchecked Sendable {
+  static let shared = WorkerAudioRouteCoordinator()
+
+  private let stateQueue = DispatchQueue(label: "worker.audio.route.state")
+  private let deactivationQueue = DispatchQueue(
+    label: "worker.audio.route.deactivation",
+    qos: .userInitiated
+  )
+  private var activeLease: WorkerAudioRouteLease?
+  private var routeGeneration: UInt64 = 0
+
+  @discardableResult
+  func acquire(
+    owner: WorkerAudioRouteOwner,
+    mode: StreamingMode,
+    reason: String,
+    forceSpeaker: Bool = false,
+    preferredSampleRate: Double? = nil,
+    preferredIOBufferDuration: TimeInterval = 0.02
+  ) throws -> WorkerAudioRouteSnapshot {
+    let lease = stateQueue.sync { () -> WorkerAudioRouteLease in
+      routeGeneration &+= 1
+      let lease = WorkerAudioRouteLease(
+        owner: owner,
+        token: UUID(),
+        generation: routeGeneration
+      )
+      activeLease = lease
+      return lease
+    }
+
+    let session = AVAudioSession.sharedInstance()
+    do {
+      var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP]
+      let audioMode: AVAudioSession.Mode
+
+      switch mode {
+      case .iPhone:
+        audioMode = .voiceChat
+        options.formUnion([.defaultToSpeaker, .duckOthers])
+      case .glasses:
+        audioMode = forceSpeaker ? .voiceChat : .videoChat
+        if forceSpeaker {
+          options.formUnion([.defaultToSpeaker])
+        }
+      }
+
+      try session.setCategory(.playAndRecord, mode: audioMode, options: options)
+      if let preferredSampleRate {
+        try session.setPreferredSampleRate(preferredSampleRate)
+      }
+      try session.setPreferredIOBufferDuration(preferredIOBufferDuration)
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+      var preferredInputName: String?
+      if mode == .glasses, !forceSpeaker, let input = preferredBluetoothHandsFreeInput(session) {
+        try session.setPreferredInput(input)
+        preferredInputName = "\(input.portType.rawValue):\(input.portName)"
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+      }
+
+      let routeBeforeOverride = session.currentRoute
+      let hasHandsFree = hasBluetoothHandsFreeRoute(routeBeforeOverride)
+      let fallbackMessage: String?
+
+      if mode == .iPhone || forceSpeaker {
+        try session.overrideOutputAudioPort(.speaker)
+        fallbackMessage = mode == .glasses
+          ? "Glasses audio route unavailable. Using phone speaker."
+          : nil
+      } else if hasHandsFree {
+        try session.overrideOutputAudioPort(.none)
+        fallbackMessage = nil
+      } else {
+        try session.overrideOutputAudioPort(.speaker)
+        fallbackMessage = "Meta audio route unavailable. Using phone audio until Bluetooth HFP connects."
+      }
+
+      let snapshot = WorkerAudioRouteSnapshot(
+        lease: lease,
+        owner: owner,
+        mode: mode,
+        reason: reason,
+        category: session.category.rawValue,
+        audioMode: session.mode.rawValue,
+        inputs: describePorts(session.currentRoute.inputs),
+        outputs: describePorts(session.currentRoute.outputs),
+        preferredInput: preferredInputName,
+        usesHandsFreeRoute: hasBluetoothHandsFreeRoute(session.currentRoute),
+        fallbackMessage: fallbackMessage,
+        sampleRate: session.sampleRate,
+        ioBufferDuration: session.ioBufferDuration
+      )
+      log(snapshot)
+      Task {
+        await WorkerTelemetry.shared.record(
+          "audio_route_acquired",
+          source: "ios_audio",
+          stage: owner.rawValue,
+          payload: snapshot.payload
+        )
+      }
+      return snapshot
+    } catch {
+      stateQueue.sync {
+        if activeLease?.token == lease.token {
+          activeLease = nil
+        }
+      }
+      throw error
+    }
+  }
+
+  func release(
+    lease: WorkerAudioRouteLease,
+    afterAudioGraphStops: @escaping () async -> Void = {}
+  ) async {
+    let didRelease = stateQueue.sync { () -> Bool in
+      guard activeLease?.token == lease.token else { return false }
+      activeLease = nil
+      return true
+    }
+
+    guard didRelease else {
+      let currentLease = stateQueue.sync { activeLease }
+      print("[Audio] Stale release ignored; newer session active")
+      var payload: [String: Any] = [
+        "release_owner": lease.owner.rawValue,
+        "release_token": lease.token.uuidString,
+        "release_generation": lease.generation
+      ]
+      if let currentLease {
+        payload["current_owner"] = currentLease.owner.rawValue
+        payload["current_token"] = currentLease.token.uuidString
+        payload["current_generation"] = currentLease.generation
+      } else {
+        payload["current_owner"] = NSNull()
+        payload["current_token"] = NSNull()
+        payload["current_generation"] = NSNull()
+      }
+      await WorkerTelemetry.shared.record(
+        "audio_route_stale_release_ignored",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: payload
+      )
+      return
+    }
+
+    NSLog("[WorkerAudio] released owner=%@ token=%@", lease.owner.rawValue, lease.token.uuidString)
+    await WorkerTelemetry.shared.record(
+      "audio_route_released",
+      source: "ios_audio",
+      stage: lease.owner.rawValue,
+      payload: lease.payload
+    )
+
+    await afterAudioGraphStops()
+    await Task.yield()
+
+    let currentState = stateQueue.sync { () -> (lease: WorkerAudioRouteLease?, generation: UInt64) in
+      (activeLease, routeGeneration)
+    }
+    let currentLease = currentState.lease
+    let currentGeneration = currentState.generation
+    let shouldDeactivate = currentLease == nil && currentGeneration == lease.generation
+
+    guard shouldDeactivate else {
+      var payload: [String: Any] = [
+        "owner": lease.owner.rawValue,
+        "token": lease.token.uuidString,
+        "release_generation": lease.generation,
+        "current_generation": currentGeneration
+      ]
+      payload["current_owner"] = currentLease?.owner.rawValue ?? NSNull()
+      payload["current_token"] = currentLease?.token.uuidString ?? NSNull()
+      NSLog(
+        "[WorkerAudio] skip deactivate owner=%@ token=%@ generation=%llu currentOwner=%@ currentGeneration=%llu",
+        lease.owner.rawValue,
+        lease.token.uuidString,
+        lease.generation,
+        currentLease?.owner.rawValue ?? "none",
+        currentGeneration
+      )
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivation_skipped",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: payload
+      )
+      return
+    }
+
+    let result = await deactivateSharedAudioSession()
+    switch result {
+    case .success:
+      NSLog("[WorkerAudio] deactivated owner=%@ token=%@", lease.owner.rawValue, lease.token.uuidString)
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivated",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: lease.payload
+      )
+    case .failure(let error):
+      NSLog("[WorkerAudio] deactivate failed owner=%@ token=%@ error=%@",
+            lease.owner.rawValue, lease.token.uuidString, error.localizedDescription)
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivate_failed",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: [
+          "owner": lease.owner.rawValue,
+          "token": lease.token.uuidString,
+          "generation": lease.generation,
+          "error": error.localizedDescription
+        ]
+      )
+    }
+  }
+
+  private func deactivateSharedAudioSession() async -> Result<Void, Error> {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Result<Void, Error>, Never>) in
+      deactivationQueue.async {
+        do {
+          try AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+          )
+          continuation.resume(returning: .success(()))
+        } catch {
+          continuation.resume(returning: .failure(error))
+        }
+      }
+    }
+  }
+
+  private func preferredBluetoothHandsFreeInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
+    session.availableInputs?.first {
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+    }
+  }
+
+  private func hasBluetoothHandsFreeRoute(_ route: AVAudioSessionRouteDescription) -> Bool {
+    route.inputs.contains {
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+    } || route.outputs.contains {
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+    }
+  }
+
+  private func describePorts(_ ports: [AVAudioSessionPortDescription]) -> [String] {
+    ports.map { "\($0.portType.rawValue):\($0.portName)" }
+  }
+
+  private func log(_ snapshot: WorkerAudioRouteSnapshot) {
+    NSLog(
+      "[WorkerAudio] owner=%@ mode=%@ reason=%@ inputs=%@ outputs=%@ fallback=%@",
+      snapshot.owner.rawValue,
+      snapshot.mode == .iPhone ? "iphone" : "glasses",
+      snapshot.reason,
+      snapshot.inputs.joined(separator: ","),
+      snapshot.outputs.joined(separator: ","),
+      snapshot.fallbackMessage ?? "none"
+    )
+  }
+}
+
+final class AudioManager: @unchecked Sendable {
   var onAudioCaptured: ((Data) -> Void)?
 
   private let audioEngine = AVAudioEngine()
+  private let audioLifecycleQueue = DispatchQueue(
+    label: "gemini.audio.lifecycle",
+    qos: .userInitiated
+  )
   private let playerNode = AVAudioPlayerNode()
   private var isCapturing = false
+  private var isInputTapInstalled = false
+  private var isPlayerNodeAttached = false
   private var wasCapturingBeforeInterruption = false
   private var useIPhoneMode = false
+  private var audioRouteLease: WorkerAudioRouteLease?
 
   private let outputFormat: AVAudioFormat
 
@@ -35,33 +365,22 @@ class AudioManager {
 
   func setupAudioSession(useIPhoneMode: Bool = false) throws {
     self.useIPhoneMode = useIPhoneMode
-    let session = AVAudioSession.sharedInstance()
-    // voiceChat: aggressive echo cancellation (mic + speaker co-located on phone)
-    // videoChat: mild AEC (mic on glasses, speaker on glasses)
-    // When Speaker Output is ON, speaker is on phone so always use voiceChat AEC
     let forceSpeaker = SettingsManager.shared.speakerOutputEnabled
-    if useIPhoneMode || forceSpeaker {
-      try session.setCategory(
-        .playAndRecord,
-        mode: .voiceChat,
-        options: [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers]
-      )
-    } else {
-      try session.setCategory(
-        .playAndRecord,
-        mode: .videoChat,
-        options: [.allowBluetoothHFP, .mixWithOthers, .defaultToSpeaker]
-      )
+    let captureMode: StreamingMode = useIPhoneMode ? .iPhone : .glasses
+    let snapshot = try WorkerAudioRouteCoordinator.shared.acquire(
+      owner: .aiGuide,
+      mode: captureMode,
+      reason: "gemini_live",
+      forceSpeaker: forceSpeaker,
+      preferredSampleRate: GeminiConfig.inputAudioSampleRate,
+      preferredIOBufferDuration: 0.064
+    )
+    audioRouteLease = snapshot.lease
+    if let fallback = snapshot.fallbackMessage {
+      NSLog("[Audio] %@", fallback)
     }
-    try session.setPreferredSampleRate(GeminiConfig.inputAudioSampleRate)
-    try session.setPreferredIOBufferDuration(0.064)
-    try session.setActive(true)
-    if SettingsManager.shared.speakerOutputEnabled {
-      try session.overrideOutputAudioPort(.speaker)
-      NSLog("[Audio] Speaker output override: ON (iPhone speaker)")
-    }
-    NSLog("[Audio] Session mode: %@", useIPhoneMode ? "voiceChat (iPhone)" : "videoChat (glasses)")
 
+    removeObservers()
     setupInterruptionHandling()
     setupAppLifecycleObservers()
   }
@@ -69,13 +388,23 @@ class AudioManager {
   func startCapture() throws {
     guard !isCapturing else { return }
 
-    audioEngine.attach(playerNode)
+    if isInputTapInstalled {
+      audioEngine.inputNode.removeTap(onBus: 0)
+      isInputTapInstalled = false
+    }
+
+    if !isPlayerNodeAttached {
+      audioEngine.attach(playerNode)
+      isPlayerNodeAttached = true
+    }
+
     let playerFormat = AVAudioFormat(
       commonFormat: .pcmFormatFloat32,
       sampleRate: GeminiConfig.outputAudioSampleRate,
       channels: GeminiConfig.audioChannels,
       interleaved: false
     )!
+    audioEngine.disconnectNodeOutput(playerNode)
     audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: playerFormat)
 
     let inputNode = audioEngine.inputNode
@@ -111,6 +440,10 @@ class AudioManager {
       guard let self else { return }
 
       tapCount += 1
+      let rmsValue = self.computeRMS(buffer)
+      if tapCount % 15 == 0 {
+        print("[Audio Monitor] App Mic Level: \(rmsValue)")
+      }
       let pcmData: Data
 
       if let converter {
@@ -143,10 +476,16 @@ class AudioManager {
         }
       }
     }
+    isInputTapInstalled = true
 
-    try audioEngine.start()
-    playerNode.play()
-    isCapturing = true
+    do {
+      try audioEngine.start()
+      playerNode.play()
+      isCapturing = true
+    } catch {
+      tearDownEngineGraph(flushPendingAudio: false)
+      throw error
+    }
   }
 
   func playAudio(data: Data) {
@@ -180,26 +519,43 @@ class AudioManager {
   }
 
   func stopPlayback() {
+    guard isPlayerNodeAttached else { return }
     playerNode.stop()
-    playerNode.play()
+    if isCapturing {
+      playerNode.play()
+    }
   }
 
-  func stopCapture() {
-    guard isCapturing else { return }
-    audioEngine.inputNode.removeTap(onBus: 0)
-    playerNode.stop()
-    audioEngine.stop()
-    audioEngine.detach(playerNode)
-    isCapturing = false
-    // Flush any remaining accumulated audio
-    sendQueue.async {
-      if !self.accumulatedData.isEmpty {
-        let chunk = self.accumulatedData
-        self.accumulatedData = Data()
-        self.onAudioCaptured?(chunk)
+  func stopCapture() async {
+    // AVAudioEngine graph teardown runs on a serial lifecycle queue so callers
+    // can await the barrier without blocking the MainActor on audio hardware.
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      audioLifecycleQueue.async { [weak self] in
+        guard let self else {
+          continuation.resume()
+          return
+        }
+
+        guard self.isCapturing || self.isInputTapInstalled || self.isPlayerNodeAttached else {
+          self.removeObservers()
+          continuation.resume()
+          return
+        }
+
+        self.tearDownEngineGraph(flushPendingAudio: true) {
+          self.removeObservers()
+          continuation.resume()
+        }
       }
     }
-    removeObservers()
+
+    let lease = audioRouteLease
+    audioRouteLease = nil
+    if let lease {
+      await WorkerAudioRouteCoordinator.shared.release(lease: lease) { [weak self] in
+        await self?.waitForAudioGraphClean()
+      }
+    }
   }
 
   // MARK: - Audio Interruption & Route Change Handling
@@ -298,6 +654,23 @@ class AudioManager {
     }
   }
 
+  private func preferredBluetoothHFPInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
+    session.availableInputs?.first {
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+    }
+  }
+
+  private func hasBluetoothHandsFreeRoute(_ route: AVAudioSessionRouteDescription) -> Bool {
+    route.inputs.contains {
+      $0.portType == .bluetoothHFP ||
+        $0.portType == .bluetoothLE
+    } ||
+      route.outputs.contains {
+        $0.portType == .bluetoothHFP ||
+          $0.portType == .bluetoothLE
+      }
+  }
+
   private func resumeAudioAfterInterruption() {
     NSLog("[Audio] Resuming audio after interruption")
     let audioSession = AVAudioSession.sharedInstance()
@@ -315,11 +688,7 @@ class AudioManager {
     NSLog("[Audio] Attempting audio reset")
     let wasCapturing = isCapturing
 
-    if audioEngine.isRunning {
-      audioEngine.stop()
-    }
-    audioEngine.inputNode.removeTap(onBus: 0)
-    isCapturing = false
+    tearDownEngineGraph(flushPendingAudio: false)
 
     if wasCapturing {
       do {
@@ -328,6 +697,64 @@ class AudioManager {
         NSLog("[Audio] Audio reset successful")
       } catch {
         NSLog("[Audio] Audio reset failed: %@", error.localizedDescription)
+      }
+    }
+  }
+
+  private func tearDownEngineGraph(flushPendingAudio: Bool, completion: (() -> Void)? = nil) {
+    if isInputTapInstalled {
+      audioEngine.inputNode.removeTap(onBus: 0)
+      isInputTapInstalled = false
+    }
+    if audioEngine.isRunning {
+      audioEngine.stop()
+    }
+    if playerNode.isPlaying {
+      playerNode.stop()
+    }
+    if isPlayerNodeAttached {
+      audioEngine.disconnectNodeOutput(playerNode)
+      audioEngine.detach(playerNode)
+      isPlayerNodeAttached = false
+    }
+    isCapturing = false
+
+    sendQueue.async {
+      defer { completion?() }
+      guard !self.accumulatedData.isEmpty else { return }
+      let chunk = self.accumulatedData
+      self.accumulatedData = Data()
+      if flushPendingAudio {
+        self.onAudioCaptured?(chunk)
+      }
+    }
+  }
+
+  private func waitForAudioGraphClean() async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      audioLifecycleQueue.async { [weak self] in
+        guard let self else {
+          continuation.resume()
+          return
+        }
+
+        if self.isInputTapInstalled {
+          self.audioEngine.inputNode.removeTap(onBus: 0)
+          self.isInputTapInstalled = false
+        }
+        if self.audioEngine.isRunning {
+          self.audioEngine.stop()
+        }
+        if self.playerNode.isPlaying {
+          self.playerNode.stop()
+        }
+        if self.isPlayerNodeAttached {
+          self.audioEngine.disconnectNodeOutput(self.playerNode)
+          self.audioEngine.detach(self.playerNode)
+          self.isPlayerNodeAttached = false
+        }
+        self.isCapturing = false
+        continuation.resume()
       }
     }
   }

@@ -349,16 +349,490 @@ private struct RemoteSOPItem: Decodable {
   }
 }
 
+private final class ConversationAudioRecorder: @unchecked Sendable {
+  private enum Source: String {
+    case input = "worker_input"
+    case output = "gemini_output"
+  }
+
+  private struct AudioChunk {
+    let data: Data
+    let sampleRate: Double
+    let source: Source
+    let hostTime: CFTimeInterval
+  }
+
+  private let queue = DispatchQueue(label: "sop.conversation.audio.recorder", qos: .userInitiated)
+  private let sessionID: String?
+  private let recordingStartHostTime: CFTimeInterval
+  private let outputURL: URL
+  private var chunks: [AudioChunk] = []
+  private var isFinishing = false
+  private var inputAudioChunkCount = 0
+  private var outputAudioChunkCount = 0
+
+  init(sessionID: String?, recordingStartHostTime: CFTimeInterval = CACurrentMediaTime()) {
+    self.sessionID = sessionID
+    self.recordingStartHostTime = recordingStartHostTime
+    self.outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("sop_\(sessionID ?? UUID().uuidString)_conversation")
+      .appendingPathExtension("m4a")
+    try? FileManager.default.removeItem(at: outputURL)
+  }
+
+  func appendInputAudio(_ data: Data) {
+    append(data, sampleRate: GeminiConfig.inputAudioSampleRate, source: .input)
+  }
+
+  func appendOutputAudio(_ data: Data) {
+    append(data, sampleRate: GeminiConfig.outputAudioSampleRate, source: .output)
+  }
+
+  func finishAudioFile() async -> URL? {
+    await withCheckedContinuation { continuation in
+      queue.async { [weak self] in
+        guard let self else {
+          continuation.resume(returning: nil)
+          return
+        }
+
+        self.isFinishing = true
+        let chunks = self.chunks
+        let inputCount = self.inputAudioChunkCount
+        let outputCount = self.outputAudioChunkCount
+        guard !chunks.isEmpty else {
+          continuation.resume(returning: nil)
+          return
+        }
+
+        let mixedPCM = Self.renderMixedPCM(
+          chunks: chunks,
+          recordingStartHostTime: self.recordingStartHostTime
+        )
+        guard !mixedPCM.isEmpty else {
+          continuation.resume(returning: nil)
+          return
+        }
+
+        Self.writeAACAudio(data: mixedPCM, outputURL: self.outputURL) { url in
+          let byteCount = url.flatMap { url -> Int? in
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+              return nil
+            }
+            return attributes[.size] as? Int
+          } ?? 0
+          Task {
+            await WorkerTelemetry.shared.record(
+              "conversation_audio_finish",
+              source: "media_upload",
+              stage: url == nil ? "failed" : "completed",
+              sessionID: self.sessionID,
+              metricValue: Double(byteCount),
+              metricUnit: "bytes",
+              payload: [
+                "bytes": byteCount,
+                "input_audio_chunks": inputCount,
+                "output_audio_chunks": outputCount
+              ]
+            )
+          }
+          continuation.resume(returning: url)
+        }
+      }
+    }
+  }
+
+  private func append(_ data: Data, sampleRate: Double, source: Source) {
+    guard !data.isEmpty else { return }
+    let hostTime = CACurrentMediaTime()
+    queue.async { [weak self] in
+      guard let self, !self.isFinishing else { return }
+      switch source {
+      case .input:
+        self.inputAudioChunkCount += 1
+      case .output:
+        self.outputAudioChunkCount += 1
+      }
+      self.chunks.append(
+        AudioChunk(
+          data: data,
+          sampleRate: sampleRate,
+          source: source,
+          hostTime: hostTime
+        )
+      )
+    }
+  }
+
+  private static func renderMixedPCM(
+    chunks: [AudioChunk],
+    recordingStartHostTime: CFTimeInterval
+  ) -> Data {
+    let targetSampleRate = GeminiConfig.outputAudioSampleRate
+    var renderedChunks: [(startFrame: Int, samples: [Float])] = []
+    var totalFrameCount = 0
+
+    for chunk in chunks {
+      let samples = resampledFloatSamples(
+        from: chunk.data,
+        sourceSampleRate: chunk.sampleRate,
+        targetSampleRate: targetSampleRate
+      )
+      guard !samples.isEmpty else { continue }
+      let startFrame = max(0, Int((chunk.hostTime - recordingStartHostTime) * targetSampleRate))
+      totalFrameCount = max(totalFrameCount, startFrame + samples.count)
+      renderedChunks.append((startFrame, samples))
+    }
+
+    guard totalFrameCount > 0 else { return Data() }
+
+    var mixed = [Float](repeating: 0, count: totalFrameCount)
+    var contributors = [UInt8](repeating: 0, count: totalFrameCount)
+    for rendered in renderedChunks {
+      for (offset, sample) in rendered.samples.enumerated() {
+        let index = rendered.startFrame + offset
+        guard index < mixed.count else { continue }
+        mixed[index] += sample
+        if contributors[index] < UInt8.max {
+          contributors[index] += 1
+        }
+      }
+    }
+
+    var int16Samples = [Int16](repeating: 0, count: totalFrameCount)
+    for index in mixed.indices {
+      let count = contributors[index]
+      let normalized = count > 1 ? mixed[index] / Float(count) : mixed[index]
+      let clamped = max(-1.0, min(1.0, normalized))
+      int16Samples[index] = Int16(clamped * Float(Int16.max))
+    }
+
+    return int16Samples.withUnsafeBufferPointer { Data(buffer: $0) }
+  }
+
+  private static func resampledFloatSamples(
+    from data: Data,
+    sourceSampleRate: Double,
+    targetSampleRate: Double
+  ) -> [Float] {
+    let sourceFrameCount = data.count / MemoryLayout<Int16>.size
+    guard sourceFrameCount > 0 else { return [] }
+
+    let sourceSamples: [Float] = data.withUnsafeBytes { rawBuffer in
+      guard let baseAddress = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return [] }
+      return (0..<sourceFrameCount).map { Float(baseAddress[$0]) / Float(Int16.max) }
+    }
+
+    guard sourceSampleRate != targetSampleRate else { return sourceSamples }
+
+    let outputFrameCount = max(
+      1,
+      Int((Double(sourceSamples.count) * targetSampleRate / sourceSampleRate).rounded())
+    )
+    var output = [Float](repeating: 0, count: outputFrameCount)
+    for index in 0..<outputFrameCount {
+      let sourcePosition = Double(index) * sourceSampleRate / targetSampleRate
+      let lowerIndex = min(Int(sourcePosition), sourceSamples.count - 1)
+      let upperIndex = min(lowerIndex + 1, sourceSamples.count - 1)
+      let fraction = Float(sourcePosition - Double(lowerIndex))
+      output[index] = sourceSamples[lowerIndex] * (1 - fraction) + sourceSamples[upperIndex] * fraction
+    }
+    return output
+  }
+
+  private static func writeAACAudio(
+    data: Data,
+    outputURL: URL,
+    completion: @escaping (URL?) -> Void
+  ) {
+    try? FileManager.default.removeItem(at: outputURL)
+    guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .m4a) else {
+      completion(nil)
+      return
+    }
+
+    let audioInput = AVAssetWriterInput(
+      mediaType: .audio,
+      outputSettings: [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: GeminiConfig.outputAudioSampleRate,
+        AVNumberOfChannelsKey: Int(GeminiConfig.audioChannels),
+        AVEncoderBitRateKey: 64_000
+      ]
+    )
+    audioInput.expectsMediaDataInRealTime = false
+    guard writer.canAdd(audioInput) else {
+      completion(nil)
+      return
+    }
+    writer.add(audioInput)
+    guard writer.startWriting() else {
+      completion(nil)
+      return
+    }
+    writer.startSession(atSourceTime: .zero)
+
+    guard let formatDescription = makePCMFormatDescription() else {
+      completion(nil)
+      return
+    }
+
+    let bytesPerFrame = MemoryLayout<Int16>.size * Int(GeminiConfig.audioChannels)
+    let framesPerChunk = Int(GeminiConfig.outputAudioSampleRate)
+    let bytesPerChunk = framesPerChunk * bytesPerFrame
+    var byteOffset = 0
+    var frameOffset = 0
+    var appendFailed = false
+
+    while byteOffset < data.count, !appendFailed {
+      while !audioInput.isReadyForMoreMediaData {
+        Thread.sleep(forTimeInterval: 0.005)
+      }
+      let byteCount = min(bytesPerChunk, data.count - byteOffset)
+      let alignedByteCount = byteCount - (byteCount % bytesPerFrame)
+      guard alignedByteCount > 0 else { break }
+      let chunkData = data.subdata(in: byteOffset..<(byteOffset + alignedByteCount))
+      let presentationTime = CMTime(
+        value: CMTimeValue(frameOffset),
+        timescale: CMTimeScale(GeminiConfig.outputAudioSampleRate)
+      )
+      guard let sampleBuffer = makeAudioSampleBuffer(
+        data: chunkData,
+        sampleRate: GeminiConfig.outputAudioSampleRate,
+        channels: GeminiConfig.audioChannels,
+        formatDescription: formatDescription,
+        presentationTime: presentationTime
+      ) else {
+        appendFailed = true
+        break
+      }
+      appendFailed = !audioInput.append(sampleBuffer)
+      byteOffset += alignedByteCount
+      frameOffset += alignedByteCount / bytesPerFrame
+    }
+
+    audioInput.markAsFinished()
+    writer.finishWriting {
+      completion(!appendFailed && writer.status == .completed ? outputURL : nil)
+    }
+  }
+
+  private static func makePCMFormatDescription() -> CMAudioFormatDescription? {
+    var streamDescription = AudioStreamBasicDescription(
+      mSampleRate: GeminiConfig.outputAudioSampleRate,
+      mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: AudioFormatFlags(kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked),
+      mBytesPerPacket: UInt32(MemoryLayout<Int16>.size) * GeminiConfig.audioChannels,
+      mFramesPerPacket: 1,
+      mBytesPerFrame: UInt32(MemoryLayout<Int16>.size) * GeminiConfig.audioChannels,
+      mChannelsPerFrame: GeminiConfig.audioChannels,
+      mBitsPerChannel: UInt32(MemoryLayout<Int16>.size * 8),
+      mReserved: 0
+    )
+    var formatDescription: CMAudioFormatDescription?
+    let status = CMAudioFormatDescriptionCreate(
+      allocator: kCFAllocatorDefault,
+      asbd: &streamDescription,
+      layoutSize: 0,
+      layout: nil,
+      magicCookieSize: 0,
+      magicCookie: nil,
+      extensions: nil,
+      formatDescriptionOut: &formatDescription
+    )
+    guard status == noErr else { return nil }
+    return formatDescription
+  }
+
+  private static func makeAudioSampleBuffer(
+    data: Data,
+    sampleRate: Double,
+    channels: UInt32,
+    formatDescription: CMAudioFormatDescription,
+    presentationTime: CMTime
+  ) -> CMSampleBuffer? {
+    let bytesPerFrame = Int(MemoryLayout<Int16>.size * Int(channels))
+    guard bytesPerFrame > 0 else { return nil }
+    let sampleCount = data.count / bytesPerFrame
+    guard sampleCount > 0 else { return nil }
+
+    var blockBuffer: CMBlockBuffer?
+    var status = CMBlockBufferCreateWithMemoryBlock(
+      allocator: kCFAllocatorDefault,
+      memoryBlock: nil,
+      blockLength: data.count,
+      blockAllocator: nil,
+      customBlockSource: nil,
+      offsetToData: 0,
+      dataLength: data.count,
+      flags: 0,
+      blockBufferOut: &blockBuffer
+    )
+    guard status == noErr, let blockBuffer else { return nil }
+
+    status = data.withUnsafeBytes { rawBuffer in
+      guard let baseAddress = rawBuffer.baseAddress else { return OSStatus(-1) }
+      return CMBlockBufferReplaceDataBytes(
+        with: baseAddress,
+        blockBuffer: blockBuffer,
+        offsetIntoDestination: 0,
+        dataLength: data.count
+      )
+    }
+    guard status == noErr else { return nil }
+
+    var timing = CMSampleTimingInfo(
+      duration: CMTime(
+        value: CMTimeValue(sampleCount),
+        timescale: CMTimeScale(sampleRate.rounded())
+      ),
+      presentationTimeStamp: presentationTime,
+      decodeTimeStamp: .invalid
+    )
+    var sampleBuffer: CMSampleBuffer?
+    status = CMSampleBufferCreate(
+      allocator: kCFAllocatorDefault,
+      dataBuffer: blockBuffer,
+      dataReady: true,
+      makeDataReadyCallback: nil,
+      refcon: nil,
+      formatDescription: formatDescription,
+      sampleCount: sampleCount,
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: &timing,
+      sampleSizeEntryCount: 0,
+      sampleSizeArray: nil,
+      sampleBufferOut: &sampleBuffer
+    )
+    guard status == noErr else { return nil }
+    return sampleBuffer
+  }
+}
+
+private enum ConversationAudioMuxer {
+  static func mux(videoURL: URL, audioURL: URL, outputURL: URL) async -> URL? {
+    await withCheckedContinuation { continuation in
+      let videoAsset = AVURLAsset(url: videoURL)
+      let audioAsset = AVURLAsset(url: audioURL)
+      let composition = AVMutableComposition()
+
+      guard
+        let videoTrack = videoAsset.tracks(withMediaType: .video).first,
+        let compositionVideoTrack = composition.addMutableTrack(
+          withMediaType: .video,
+          preferredTrackID: kCMPersistentTrackID_Invalid
+        )
+      else {
+        continuation.resume(returning: nil)
+        return
+      }
+
+      do {
+        try compositionVideoTrack.insertTimeRange(
+          CMTimeRange(start: .zero, duration: videoAsset.duration),
+          of: videoTrack,
+          at: .zero
+        )
+        compositionVideoTrack.preferredTransform = videoTrack.preferredTransform
+
+        if let audioTrack = audioAsset.tracks(withMediaType: .audio).first,
+           let compositionAudioTrack = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+           ) {
+          let audioDuration = CMTimeCompare(audioAsset.duration, videoAsset.duration) > 0
+            ? videoAsset.duration
+            : audioAsset.duration
+          if CMTimeCompare(audioDuration, .zero) > 0 {
+            try compositionAudioTrack.insertTimeRange(
+              CMTimeRange(start: .zero, duration: audioDuration),
+              of: audioTrack,
+              at: .zero
+            )
+          }
+        }
+      } catch {
+        NSLog("[SOPRecorder] Failed to build mixed replay composition: %@", error.localizedDescription)
+        continuation.resume(returning: nil)
+        return
+      }
+
+      try? FileManager.default.removeItem(at: outputURL)
+      guard let exporter = AVAssetExportSession(
+        asset: composition,
+        presetName: AVAssetExportPresetHighestQuality
+      ) else {
+        continuation.resume(returning: nil)
+        return
+      }
+      exporter.outputURL = outputURL
+      exporter.outputFileType = .mp4
+      exporter.shouldOptimizeForNetworkUse = true
+      exporter.exportAsynchronously {
+        continuation.resume(returning: exporter.status == .completed ? outputURL : nil)
+      }
+    }
+  }
+}
+
 private final class SopVideoRecorder: @unchecked Sendable {
+  private enum AudioTrackKind: String {
+    case input = "worker_input"
+    case output = "gemini_output"
+  }
+
+  private struct PendingAudioChunk {
+    let data: Data
+    let sampleRate: Double
+    let source: AudioTrackKind
+    let hostTime: CFTimeInterval
+  }
+
   private let queue = DispatchQueue(label: "sop.video.recorder", qos: .userInitiated)
+  private let sessionID: String?
   private var writer: AVAssetWriter?
   private var writerInput: AVAssetWriterInput?
+  private var inputAudioInput: AVAssetWriterInput?
+  private var outputAudioInput: AVAssetWriterInput?
+  private var inputAudioFormatDescription: CMAudioFormatDescription?
+  private var outputAudioFormatDescription: CMAudioFormatDescription?
   private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-  private var recordingStartHostTime: CFTimeInterval?
+  private let recordingStartHostTime: CFTimeInterval
+  private let conversationRecorder: ConversationAudioRecorder
   private(set) var outputURL: URL?
   private var isFinishing = false
   private var appendedFrameCount = 0
+  private var inputAudioChunkCount = 0
+  private var outputAudioChunkCount = 0
+  private var droppedAudioChunkCount = 0
+  private var pendingAudioChunks: [PendingAudioChunk] = []
   private let sourcePixelFormat = VideoFrameBufferFactory.pixelFormat
+  private let maxPendingAudioChunks = 160
+
+  init(sessionID: String? = nil) {
+    self.sessionID = sessionID
+    let startHostTime = CACurrentMediaTime()
+    self.recordingStartHostTime = startHostTime
+    self.conversationRecorder = ConversationAudioRecorder(
+      sessionID: sessionID,
+      recordingStartHostTime: startHostTime
+    )
+    let fileURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("sop_\(sessionID ?? UUID().uuidString)")
+      .appendingPathExtension("mp4")
+    try? FileManager.default.removeItem(at: fileURL)
+    self.outputURL = fileURL
+    NSLog("[SOPRecorder] Prepared output path at %@", fileURL.path)
+    Task {
+      await WorkerTelemetry.shared.record(
+        "sop_recorder_start",
+        source: "media_upload",
+        stage: "prepared",
+        sessionID: sessionID,
+        payload: ["path_ready": true]
+      )
+    }
+  }
 
   func appendFrame(_ image: UIImage) {
     queue.async { [weak self] in
@@ -390,6 +864,22 @@ private final class SopVideoRecorder: @unchecked Sendable {
     }
   }
 
+  func appendInputAudio(_ data: Data) {
+    guard !data.isEmpty else { return }
+    conversationRecorder.appendInputAudio(data)
+    queue.async { [weak self] in
+      self?.inputAudioChunkCount += 1
+    }
+  }
+
+  func appendOutputAudio(_ data: Data) {
+    guard !data.isEmpty else { return }
+    conversationRecorder.appendOutputAudio(data)
+    queue.async { [weak self] in
+      self?.outputAudioChunkCount += 1
+    }
+  }
+
   func finishRecording() async -> URL? {
     await withCheckedContinuation { continuation in
       queue.async { [weak self] in
@@ -399,8 +889,11 @@ private final class SopVideoRecorder: @unchecked Sendable {
         }
 
         NSLog(
-          "[SOPRecorder] finishRecording called (frames=%d, hasWriter=%@, outputURL=%@)",
+          "[SOPRecorder] finishRecording called (frames=%d, inputAudio=%d, outputAudio=%d, droppedAudio=%d, hasWriter=%@, outputURL=%@)",
           self.appendedFrameCount,
+          self.inputAudioChunkCount,
+          self.outputAudioChunkCount,
+          self.droppedAudioChunkCount,
           self.writer == nil ? "no" : "yes",
           self.outputURL?.path ?? "nil")
 
@@ -410,7 +903,22 @@ private final class SopVideoRecorder: @unchecked Sendable {
           if let writer = self.writer {
             NSLog("[SOPRecorder] finishRecording returning nil because writer status=%d", writer.status.rawValue)
           } else {
-            NSLog("[SOPRecorder] finishRecording returning nil because writer was never created")
+            NSLog("[SOPRecorder] finishRecording returning nil because no video frames were recorded")
+          }
+          Task {
+            await WorkerTelemetry.shared.record(
+              "sop_recorder_finish",
+              source: "media_upload",
+              stage: "missing_video",
+              sessionID: self.sessionID,
+              payload: [
+                "frame_count": self.appendedFrameCount,
+                "audio_input_chunks": self.inputAudioChunkCount,
+                "audio_output_chunks": self.outputAudioChunkCount,
+                "dropped_audio_chunks": self.droppedAudioChunkCount,
+                "reason": "no_video_frames_recorded"
+              ]
+            )
           }
           continuation.resume(returning: nil)
           return
@@ -419,11 +927,60 @@ private final class SopVideoRecorder: @unchecked Sendable {
         self.isFinishing = true
         writerInput.markAsFinished()
         writer.finishWriting {
-          NSLog(
-            "[SOPRecorder] finishWriting completed (status=%d, outputURL=%@)",
-            writer.status.rawValue,
-            self.outputURL?.path ?? "nil")
-          continuation.resume(returning: writer.status == .completed ? self.outputURL : nil)
+          Task {
+            let videoURL = self.outputURL
+            let audioURL = await self.conversationRecorder.finishAudioFile()
+            var finalURL = videoURL
+            if writer.status == .completed, let videoURL, let audioURL {
+              let mixedURL = videoURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(videoURL.deletingPathExtension().lastPathComponent + "_mixed")
+                .appendingPathExtension("mp4")
+              if let muxedURL = await ConversationAudioMuxer.mux(
+                videoURL: videoURL,
+                audioURL: audioURL,
+                outputURL: mixedURL
+              ) {
+                finalURL = muxedURL
+                try? FileManager.default.removeItem(at: videoURL)
+                try? FileManager.default.removeItem(at: audioURL)
+              } else {
+                NSLog("[SOPRecorder] Mixed audio mux failed; returning video-only recording")
+              }
+            }
+
+            let fileSize = finalURL.flatMap { url -> Int? in
+              guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                return nil
+              }
+              return attributes[.size] as? Int
+            }
+            NSLog(
+              "[SOPRecorder] finishWriting completed (status=%d, outputURL=%@, bytes=%d)",
+              writer.status.rawValue,
+              finalURL?.path ?? "nil",
+              fileSize ?? 0)
+            Task {
+              await WorkerTelemetry.shared.record(
+                "sop_recorder_finish",
+                source: "media_upload",
+                stage: writer.status == .completed ? "completed" : "failed",
+                sessionID: self.sessionID,
+                metricValue: Double(fileSize ?? 0),
+                metricUnit: "bytes",
+                payload: [
+                  "frame_count": self.appendedFrameCount,
+                  "file_size": fileSize ?? 0,
+                  "audio_input_chunks": self.inputAudioChunkCount,
+                  "audio_output_chunks": self.outputAudioChunkCount,
+                  "dropped_audio_chunks": self.droppedAudioChunkCount,
+                  "writer_status": writer.status.rawValue,
+                  "writer_error": writer.error?.localizedDescription ?? NSNull()
+                ]
+              )
+            }
+            continuation.resume(returning: writer.status == .completed ? finalURL : nil)
+          }
         }
       }
     }
@@ -434,8 +991,7 @@ private final class SopVideoRecorder: @unchecked Sendable {
           writer.status == .writing,
           let writerInput = writerInput,
           let adaptor = pixelBufferAdaptor,
-          writerInput.isReadyForMoreMediaData,
-          let start = recordingStartHostTime else {
+          writerInput.isReadyForMoreMediaData else {
       if writer == nil {
         NSLog("[SOPRecorder] Dropping frame because writer was never configured")
       } else if let writer {
@@ -444,7 +1000,7 @@ private final class SopVideoRecorder: @unchecked Sendable {
       return
     }
 
-    let elapsed = CACurrentMediaTime() - start
+    let elapsed = CACurrentMediaTime() - recordingStartHostTime
     let presentationTime = CMTime(seconds: max(0, elapsed), preferredTimescale: 600)
     let bufferForWriter =
       VideoFrameBufferFactory.copyPixelBuffer(pixelBuffer, using: adaptor.pixelBufferPool)
@@ -455,6 +1011,14 @@ private final class SopVideoRecorder: @unchecked Sendable {
       appendedFrameCount += 1
       if appendedFrameCount == 1 {
         NSLog("[SOPRecorder] First frame appended successfully")
+        Task {
+          await WorkerTelemetry.shared.record(
+            "sop_recorder_first_frame",
+            source: "media_upload",
+            stage: "recording",
+            sessionID: sessionID
+          )
+        }
       } else if appendedFrameCount % 60 == 0 {
         NSLog("[SOPRecorder] Appended %d frames", appendedFrameCount)
       }
@@ -476,8 +1040,8 @@ private final class SopVideoRecorder: @unchecked Sendable {
       return
     }
 
-    let fileURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("sop_\(UUID().uuidString)")
+    let fileURL = outputURL ?? FileManager.default.temporaryDirectory
+      .appendingPathComponent("sop_\(sessionID ?? UUID().uuidString)")
       .appendingPathExtension("mp4")
 
     try? FileManager.default.removeItem(at: fileURL)
@@ -516,6 +1080,8 @@ private final class SopVideoRecorder: @unchecked Sendable {
       return
     }
     writer.add(input)
+    // Conversation audio is mixed into one AAC track during finishRecording(),
+    // so the live writer stays focused on video frames.
 
     guard writer.startWriting() else {
       NSLog("[SOPRecorder] startWriting failed: %@", writer.error?.localizedDescription ?? "unknown")
@@ -527,8 +1093,198 @@ private final class SopVideoRecorder: @unchecked Sendable {
     self.writer = writer
     self.writerInput = input
     self.pixelBufferAdaptor = adaptor
-    self.recordingStartHostTime = CACurrentMediaTime()
     self.outputURL = fileURL
+    drainPendingAudioChunks()
+  }
+
+  private func appendAudio(
+    _ data: Data,
+    sampleRate: Double,
+    source: AudioTrackKind
+  ) {
+    guard !data.isEmpty else { return }
+    let hostTime = CACurrentMediaTime()
+    queue.async { [weak self] in
+      guard let self, !self.isFinishing else { return }
+      switch source {
+      case .input:
+        self.inputAudioChunkCount += 1
+      case .output:
+        self.outputAudioChunkCount += 1
+      }
+      let chunk = PendingAudioChunk(
+        data: data,
+        sampleRate: sampleRate,
+        source: source,
+        hostTime: hostTime
+      )
+
+      guard self.writer?.status == .writing else {
+        self.pendingAudioChunks.append(chunk)
+        if self.pendingAudioChunks.count > self.maxPendingAudioChunks {
+          self.pendingAudioChunks.removeFirst(self.pendingAudioChunks.count - self.maxPendingAudioChunks)
+          self.droppedAudioChunkCount += 1
+        }
+        return
+      }
+
+      self.appendAudioChunkInternal(chunk)
+    }
+  }
+
+  private func drainPendingAudioChunks() {
+    guard !pendingAudioChunks.isEmpty else { return }
+    let chunks = pendingAudioChunks
+    pendingAudioChunks.removeAll()
+    for chunk in chunks {
+      appendAudioChunkInternal(chunk)
+    }
+  }
+
+  private func appendAudioChunkInternal(_ chunk: PendingAudioChunk) {
+    let audioInput: AVAssetWriterInput?
+    let formatDescription: CMAudioFormatDescription?
+    switch chunk.source {
+    case .input:
+      audioInput = inputAudioInput
+      formatDescription = inputAudioFormatDescription
+    case .output:
+      audioInput = outputAudioInput
+      formatDescription = outputAudioFormatDescription
+    }
+
+    guard let audioInput, let formatDescription else {
+      droppedAudioChunkCount += 1
+      return
+    }
+    guard audioInput.isReadyForMoreMediaData else {
+      droppedAudioChunkCount += 1
+      return
+    }
+    guard let sampleBuffer = Self.makeAudioSampleBuffer(
+      data: chunk.data,
+      sampleRate: chunk.sampleRate,
+      channels: GeminiConfig.audioChannels,
+      formatDescription: formatDescription,
+      presentationTime: CMTime(
+        seconds: max(0, chunk.hostTime - recordingStartHostTime),
+        preferredTimescale: 600
+      )
+    ) else {
+      droppedAudioChunkCount += 1
+      return
+    }
+
+    if !audioInput.append(sampleBuffer) {
+      droppedAudioChunkCount += 1
+      NSLog("[SOPRecorder] Failed appending %@ audio chunk", chunk.source.rawValue)
+    }
+  }
+
+  private func makeAudioInput(sampleRate: Double, channels: UInt32) -> AVAssetWriterInput {
+    let outputSettings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatMPEG4AAC,
+      AVSampleRateKey: sampleRate,
+      AVNumberOfChannelsKey: Int(channels),
+      AVEncoderBitRateKey: 64_000
+    ]
+    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
+    input.expectsMediaDataInRealTime = true
+    return input
+  }
+
+  private static func makePCMFormatDescription(
+    sampleRate: Double,
+    channels: UInt32
+  ) -> CMAudioFormatDescription? {
+    var streamDescription = AudioStreamBasicDescription(
+      mSampleRate: sampleRate,
+      mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: AudioFormatFlags(kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked),
+      mBytesPerPacket: UInt32(MemoryLayout<Int16>.size) * channels,
+      mFramesPerPacket: 1,
+      mBytesPerFrame: UInt32(MemoryLayout<Int16>.size) * channels,
+      mChannelsPerFrame: channels,
+      mBitsPerChannel: UInt32(MemoryLayout<Int16>.size * 8),
+      mReserved: 0
+    )
+    var formatDescription: CMAudioFormatDescription?
+    let status = CMAudioFormatDescriptionCreate(
+      allocator: kCFAllocatorDefault,
+      asbd: &streamDescription,
+      layoutSize: 0,
+      layout: nil,
+      magicCookieSize: 0,
+      magicCookie: nil,
+      extensions: nil,
+      formatDescriptionOut: &formatDescription
+    )
+    guard status == noErr else { return nil }
+    return formatDescription
+  }
+
+  private static func makeAudioSampleBuffer(
+    data: Data,
+    sampleRate: Double,
+    channels: UInt32,
+    formatDescription: CMAudioFormatDescription,
+    presentationTime: CMTime
+  ) -> CMSampleBuffer? {
+    let bytesPerFrame = Int(MemoryLayout<Int16>.size * Int(channels))
+    guard bytesPerFrame > 0 else { return nil }
+    let sampleCount = data.count / bytesPerFrame
+    guard sampleCount > 0 else { return nil }
+
+    var blockBuffer: CMBlockBuffer?
+    var status = CMBlockBufferCreateWithMemoryBlock(
+      allocator: kCFAllocatorDefault,
+      memoryBlock: nil,
+      blockLength: data.count,
+      blockAllocator: nil,
+      customBlockSource: nil,
+      offsetToData: 0,
+      dataLength: data.count,
+      flags: 0,
+      blockBufferOut: &blockBuffer
+    )
+    guard status == noErr, let blockBuffer else { return nil }
+
+    status = data.withUnsafeBytes { rawBuffer in
+      guard let baseAddress = rawBuffer.baseAddress else { return OSStatus(-1) }
+      return CMBlockBufferReplaceDataBytes(
+        with: baseAddress,
+        blockBuffer: blockBuffer,
+        offsetIntoDestination: 0,
+        dataLength: data.count
+      )
+    }
+    guard status == noErr else { return nil }
+
+    var timing = CMSampleTimingInfo(
+      duration: CMTime(
+        value: CMTimeValue(sampleCount),
+        timescale: CMTimeScale(sampleRate.rounded())
+      ),
+      presentationTimeStamp: presentationTime,
+      decodeTimeStamp: .invalid
+    )
+    var sampleBuffer: CMSampleBuffer?
+    status = CMSampleBufferCreate(
+      allocator: kCFAllocatorDefault,
+      dataBuffer: blockBuffer,
+      dataReady: true,
+      makeDataReadyCallback: nil,
+      refcon: nil,
+      formatDescription: formatDescription,
+      sampleCount: sampleCount,
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: &timing,
+      sampleSizeEntryCount: 0,
+      sampleSizeArray: nil,
+      sampleBufferOut: &sampleBuffer
+    )
+    guard status == noErr else { return nil }
+    return sampleBuffer
   }
 
   private static func normalizedSize(width: Int, height: Int) -> CGSize {
@@ -810,12 +1566,14 @@ struct WorkerMediaUploadResult: Equatable {
 actor WorkerAdminLiveSessionCoordinator {
   typealias Sleeper = @Sendable (UInt64) async -> Void
   typealias FileLoader = @Sendable (URL) async -> Data?
+  typealias HeartbeatResponseHandler = @Sendable (WorkerLiveHeartbeatResponse) async -> Void
 
   private let api: WorkerAdminAPI
   private let telemetry: WorkerTelemetry?
   private let heartbeatIntervalNanoseconds: UInt64
   private let sleeper: Sleeper
   private let fileLoader: FileLoader
+  private let onHeartbeatResponse: HeartbeatResponseHandler?
 
   private var sessionID: String?
   private var roomCode: String?
@@ -832,6 +1590,7 @@ actor WorkerAdminLiveSessionCoordinator {
     sessionID: String? = nil,
     heartbeatIntervalNanoseconds: UInt64 = 7_000_000_000,
     telemetry: WorkerTelemetry? = nil,
+    onHeartbeatResponse: HeartbeatResponseHandler? = nil,
     sleeper: @escaping Sleeper = { nanoseconds in
       guard nanoseconds > 0 else { return }
       try? await Task.sleep(nanoseconds: nanoseconds)
@@ -848,6 +1607,7 @@ actor WorkerAdminLiveSessionCoordinator {
     self.heartbeatIntervalNanoseconds = heartbeatIntervalNanoseconds
     self.sleeper = sleeper
     self.fileLoader = fileLoader
+    self.onHeartbeatResponse = onHeartbeatResponse
   }
 
   func start(
@@ -956,7 +1716,29 @@ actor WorkerAdminLiveSessionCoordinator {
     } else {
       data = nil
       byteSize = 0
-      missingDataError = "Recording file was not created."
+      missingDataError = "Recording file was not created because no video frames were recorded."
+    }
+
+    guard let data, !data.isEmpty else {
+      WorkerLiveLogger.log(
+        "recording_missing",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetType: "video",
+        byteSize: byteSize,
+        uploadState: "failed",
+        error: missingDataError,
+        telemetry: telemetry
+      )
+      return WorkerMediaUploadResult(
+        assetType: "video",
+        assetID: nil,
+        bucket: nil,
+        path: nil,
+        byteSize: byteSize,
+        uploadState: "failed",
+        errorMessage: missingDataError
+      )
     }
 
     return await uploadAsset(
@@ -1050,7 +1832,8 @@ actor WorkerAdminLiveSessionCoordinator {
         path: lastFramePath,
         uploadState: "active"
       ) {
-        try await api.sendWorkerLiveHeartbeat(heartbeat)
+        let response = try await api.sendWorkerLiveHeartbeat(heartbeat)
+        await onHeartbeatResponse?(response)
       }
 
       WorkerLiveLogger.log(
@@ -1542,6 +2325,77 @@ private struct IPhoneAnalysisFrameEnvelope: @unchecked Sendable {
   let enqueuedAt: CFTimeInterval
 }
 
+private struct SendableStreamPixelBuffer: @unchecked Sendable {
+  let pixelBuffer: CVPixelBuffer
+}
+
+private struct SendableSampleBuffer: @unchecked Sendable {
+  let sampleBuffer: CMSampleBuffer
+}
+
+private struct SendableDecodedVideoFrame: @unchecked Sendable {
+  let pixelBuffer: CVPixelBuffer
+  let presentationTimeStamp: CMTime
+
+  init(_ frame: VideoDecoder.DecodedFrame) {
+    pixelBuffer = frame.pixelBuffer
+    presentationTimeStamp = frame.presentationTimeStamp
+  }
+}
+
+private final class StreamPixelBufferImageRenderer: @unchecked Sendable {
+  private let context = CIContext(options: [.useSoftwareRenderer: true])
+
+  func makeUIImage(from pixelBuffer: CVPixelBuffer) -> UIImage? {
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    guard width > 0, height > 0 else { return nil }
+
+    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    let rect = CGRect(x: 0, y: 0, width: width, height: height)
+    guard let cgImage = context.createCGImage(ciImage, from: rect) else { return nil }
+    return UIImage(cgImage: cgImage)
+  }
+}
+
+private final class GlassesVideoDecodeLane: @unchecked Sendable {
+  private let queue = DispatchQueue(
+    label: "visionclaw.glasses-video-decode-lane",
+    qos: .userInitiated
+  )
+  private let decoder = VideoDecoder()
+  private var onFrameDecoded: (@Sendable (SendableDecodedVideoFrame) -> Void)?
+
+  init() {
+    decoder.setFrameCallback { [weak self] frame in
+      self?.onFrameDecoded?(SendableDecodedVideoFrame(frame))
+    }
+  }
+
+  func setFrameCallback(_ callback: @escaping @Sendable (SendableDecodedVideoFrame) -> Void) {
+    queue.sync {
+      self.onFrameDecoded = callback
+    }
+  }
+
+  func decode(_ sampleBuffer: CMSampleBuffer, onError: @escaping @Sendable (String) -> Void) {
+    let sendableSampleBuffer = SendableSampleBuffer(sampleBuffer: sampleBuffer)
+    queue.async {
+      do {
+        try self.decoder.decode(sendableSampleBuffer.sampleBuffer)
+      } catch {
+        onError(String(describing: error))
+      }
+    }
+  }
+
+  func invalidateSession() {
+    queue.async {
+      self.decoder.invalidateSession()
+    }
+  }
+}
+
 private final class IPhoneAnalysisLane: @unchecked Sendable {
   private let queue = DispatchQueue(
     label: "visionclaw.iphone.analysis-lane",
@@ -1621,6 +2475,26 @@ private final class IPhoneAnalysisLane: @unchecked Sendable {
   }
 }
 
+private final class LivePreviewFrameEncoder: @unchecked Sendable {
+  private let queue = DispatchQueue(
+    label: "visionclaw.live-preview-frame-encoder",
+    qos: .utility
+  )
+
+  func encode(
+    image: UIImage,
+    maxDimension: CGFloat,
+    compressionQuality: CGFloat
+  ) async -> Data? {
+    await withCheckedContinuation { continuation in
+      queue.async {
+        let previewImage = image.resizedForLivePreview(maxDimension: maxDimension)
+        continuation.resume(returning: previewImage.jpegData(compressionQuality: compressionQuality))
+      }
+    }
+  }
+}
+
 @MainActor
 class StreamSessionViewModel: ObservableObject {
   @Published var currentVideoFrame: UIImage?
@@ -1640,7 +2514,11 @@ class StreamSessionViewModel: ObservableObject {
   @Published var shouldDismissCapture: Bool = false
   @Published var showShipSuccessToast: Bool = false
   @Published var isListeningForVoice: Bool = false
+  @Published var isAiGuideStarting: Bool = false
+  @Published var isStepValidationRunning: Bool = false
+  @Published var aiGuideStatusMessage: String = ""
   @Published var isDossierUploading: Bool = false
+  @Published var isSwitchingCaptureMode: Bool = false
   @Published var dossierPipelineStatusMessage: String = ""
   @Published var dossierPipelineStatusKind: DossierPipelineStatusKind = .info
   @Published var dossierPipelineStatusTimestamp: String = ""
@@ -1757,6 +2635,23 @@ class StreamSessionViewModel: ObservableObject {
     isSopAuditRunning
   }
 
+  var canTapBackOfficeCall: Bool {
+    canRequestHelp && !isRequestingHelp && !hasActiveHelpEscalation
+  }
+
+  var backOfficeCallButtonTitle: String {
+    if webrtcViewModel.isActive {
+      return "LIVE"
+    }
+    if isRequestingHelp {
+      return "CALLING"
+    }
+    if hasActiveHelpEscalation {
+      return "RINGING"
+    }
+    return "CALL"
+  }
+
   var canCloseCurrentPackage: Bool {
     guard activePackageRunID != nil else { return false }
     guard let key = currentPackageCompletionKey, !currentPackageRequiredRemoteIDs.isEmpty else { return false }
@@ -1799,6 +2694,35 @@ class StreamSessionViewModel: ObservableObject {
       : "Using iPhone until glasses are available."
   }
 
+  var aiGuideButtonTitle: String {
+    if isAiGuideStarting {
+      return "STARTING AI"
+    }
+    if geminiAssistant.isGeminiActive && geminiAssistant.isAudioReady {
+      return "AI LISTENING"
+    }
+    if geminiAssistant.isGeminiActive {
+      return "AI CONNECTING"
+    }
+    return "RESUME AI"
+  }
+
+  var canToggleAiGuide: Bool {
+    isSopAuditRunning && !isAiGuideStarting && !hasActiveHelpEscalation
+  }
+
+  var canSwitchCaptureMode: Bool {
+    !isSwitchingCaptureMode &&
+      !isRequestingHelp &&
+      !webrtcViewModel.isActive &&
+      !isDossierUploading &&
+      !isFinalizingAndShipping
+  }
+
+  var canRequestStepValidation: Bool {
+    isSopAuditRunning && !isStepValidationRunning && !hasActiveHelpEscalation
+  }
+
   // Photo capture properties
   @Published var capturedPhoto: UIImage?
   @Published var showPhotoPreview: Bool = false
@@ -1819,21 +2743,24 @@ class StreamSessionViewModel: ObservableObject {
   private var proofImagesByTargetID: [String: Data] = [:]
   private var spotterEvidenceWindow = SpotterEvidenceWindow()
   private var lastSpotterInferenceTime: Date = .distantPast
+  private var currentStepBecameActiveAt: Date = Date()
   private var isSpotterInferenceInFlight = false
   private var isFinalizingAndShipping = false
   private var successToastTask: Task<Void, Never>?
   private var hasLoadedWorkerContext = false
   private var hasEnteredWorkerHome = false
-  private var autoPresentedAssignmentKeys: Set<String> = []
   private var isUsingLocalSessionFallback = false
   private var roomCodeCancellable: AnyCancellable?
   private var connectionStateCancellable: AnyCancellable?
+  private var livePressureCancellable: AnyCancellable?
   private var locallyCompletedSopsByPackageKey: [String: Set<String>] = [:]
   private var lastLivePreviewSyncAt: Date = .distantPast
   private var hasActiveHelpEscalation = false
   private var hasLoggedRoomCreatedForSession = false
   private var hasLoggedRoomJoinedForSession = false
   private var didAttemptPendingRecordingRecovery = false
+  private var shouldResumeAiSupportAfterBackOffice = false
+  private var isLiveRoomHandoffInProgress = false
 
   private var isDemoWorkerMode: Bool {
     let configuredCode = GeminiConfig.workerLoginCode.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1857,6 +2784,8 @@ class StreamSessionViewModel: ObservableObject {
   private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
   private var speechTask: SFSpeechRecognitionTask?
   private var lastProcessedTranscript: String = ""
+  private var lastAiCommandKey: String = ""
+  private var lastAiCommandAt: Date = .distantPast
 
   private var currentPackageCompletionKey: String? {
     if let runID = activePackageRunID {
@@ -1902,14 +2831,17 @@ class StreamSessionViewModel: ObservableObject {
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
   private var iPhoneCameraManager: IPhoneCameraManager?
+  private var conversationAudioRecorder: ConversationAudioRecorder?
+  private var holdToTalkAudioLease: WorkerAudioRouteLease?
+  private var viewerAudioRouteLease: WorkerAudioRouteLease?
   private let iPhoneAnalysisLane = IPhoneAnalysisLane()
+  private let livePreviewFrameEncoder = LivePreviewFrameEncoder()
+  private let streamImageRenderer = StreamPixelBufferImageRenderer()
+  private let videoDecodeLane = GlassesVideoDecodeLane()
 
-  // CPU-based CIContext for rendering decoded pixel buffers in background
-  private let cpuCIContext = CIContext(options: [.useSoftwareRenderer: true])
-  // VideoDecoder for decompressing HEVC/H.264 frames in background
-  private let videoDecoder = VideoDecoder()
   private var backgroundFrameCount = 0
   private var bgDiagLogged = false
+  private var lastGlassesAnalysisFrameQueuedAt: CFTimeInterval = 0
 
   init(wearables: WearablesInterface) {
     self.wearables = wearables
@@ -1934,6 +2866,19 @@ class StreamSessionViewModel: ObservableObject {
     loadHistoryFromDefaults()
     requestSpeechPermissionsIfNeeded()
     observeWebRTCSession()
+    geminiAssistant.onInputCommand = { [weak self] transcript in
+      Task { @MainActor [weak self] in
+        self?.handleVoiceTranscript(transcript)
+      }
+    }
+    geminiAssistant.onInputAudioChunk = { [weak self] data in
+      self?.sopVideoRecorder?.appendInputAudio(data)
+      self?.conversationAudioRecorder?.appendInputAudio(data)
+    }
+    geminiAssistant.onOutputAudioChunk = { [weak self] data in
+      self?.sopVideoRecorder?.appendOutputAudio(data)
+      self?.conversationAudioRecorder?.appendOutputAudio(data)
+    }
     iPhoneAnalysisLane.onFrameReady = { [weak self] frame, completion in
       Task { @MainActor [weak self] in
         guard let self else {
@@ -1947,14 +2892,13 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func setupVideoDecoder() {
-    videoDecoder.setFrameCallback { [weak self] decodedFrame in
+    let imageRenderer = streamImageRenderer
+    videoDecodeLane.setFrameCallback { [weak self, imageRenderer] decodedFrame in
       Task { @MainActor [weak self] in
         guard let self else { return }
         let pixelBuffer = decodedFrame.pixelBuffer
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let rect = CGRect(x: 0, y: 0, width: width, height: height)
         let timeStampNs = decodedFrame.presentationTimeStamp.isValid
           ? Int64(CMTimeGetSeconds(decodedFrame.presentationTimeStamp) * 1_000_000_000)
           : VideoFrameBufferFactory.currentTimestampNs()
@@ -1964,18 +2908,22 @@ class StreamSessionViewModel: ObservableObject {
             timeStampNs: timeStampNs
           )
         }
-        if let cgImage = self.cpuCIContext.createCGImage(ciImage, from: rect) {
-          let image = UIImage(cgImage: cgImage)
-          self.handleProcessedLiveFrame(
-            image: image,
-            pixelBuffer: pixelBuffer,
-            timeStampNs: timeStampNs,
-            shouldForwardToWebRTC: false,
-            shouldRecordAudit: self.isSopAuditRunning
-          )
-          if self.backgroundFrameCount <= 5 || self.backgroundFrameCount % 120 == 0 {
-            NSLog("[Stream] Background frame #%d decoded and forwarded (%dx%d)",
-                  self.backgroundFrameCount, width, height)
+        let shouldRecordAudit = self.isSopAuditRunning
+        if shouldRecordAudit {
+          self.sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
+        }
+
+        guard self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) else { return }
+        let sendablePixelBuffer = SendableStreamPixelBuffer(pixelBuffer: pixelBuffer)
+        self.liveFrameProcessingQueue.async { [weak self] in
+          guard let image = imageRenderer.makeUIImage(from: sendablePixelBuffer.pixelBuffer) else { return }
+          Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.handleAnalysisImageFrame(image, shouldRecordAudit: shouldRecordAudit)
+            if self.backgroundFrameCount <= 5 || self.backgroundFrameCount % 120 == 0 {
+              NSLog("[Stream] Background frame #%d decoded and forwarded (%dx%d)",
+                    self.backgroundFrameCount, width, height)
+            }
           }
         }
       }
@@ -2021,32 +2969,49 @@ class StreamSessionViewModel: ObservableObject {
           self.backgroundFrameCount = 0
           self.bgDiagLogged = false
 
-          self.liveFrameProcessingQueue.async { [weak self] in
-            guard let self else { return }
-            guard let image = videoFrame.makeUIImage() else { return }
-
-            let pixelBuffer =
-              (shouldForwardToWebRTC || shouldRecordAudit)
-              ? VideoFrameBufferFactory.makePixelBuffer(from: image)
-              : nil
-            let timeStampNs = VideoFrameBufferFactory.currentTimestampNs()
-
+          let sampleBuffer = videoFrame.sampleBuffer
+          let timeStampNs = Self.rtcTimestampNs(from: sampleBuffer)
+          if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
             if shouldForwardToWebRTC {
-              if let pixelBuffer {
-                realtimeVideoForwarder.enqueuePixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
-              } else {
-                realtimeVideoForwarder.enqueueImage(image)
+              realtimeVideoForwarder.enqueuePixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
+            }
+            if shouldRecordAudit {
+              self.sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
+            }
+            guard self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) else { return }
+            let sendablePixelBuffer = SendableStreamPixelBuffer(pixelBuffer: pixelBuffer)
+            let imageRenderer = self.streamImageRenderer
+            self.liveFrameProcessingQueue.async { [weak self] in
+              guard let image = imageRenderer.makeUIImage(from: sendablePixelBuffer.pixelBuffer) else { return }
+              Task { @MainActor [weak self] in
+                self?.handleAnalysisImageFrame(image, shouldRecordAudit: shouldRecordAudit)
               }
             }
+          } else if CMSampleBufferGetDataBuffer(sampleBuffer) != nil {
+            let decodeLane = self.videoDecodeLane
+            decodeLane.decode(sampleBuffer) { errorMessage in
+              NSLog("[Stream] Foreground decode error: %@", errorMessage)
+            }
+          } else {
+            guard self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) else { return }
+            self.liveFrameProcessingQueue.async { [weak self] in
+              guard let self else { return }
+              guard let image = videoFrame.makeUIImage() else { return }
+              let timeStampNs = VideoFrameBufferFactory.currentTimestampNs()
 
-            Task { @MainActor [weak self] in
-              self?.handleProcessedLiveFrame(
-                image: image,
-                pixelBuffer: pixelBuffer,
-                timeStampNs: timeStampNs,
-                shouldForwardToWebRTC: false,
-                shouldRecordAudit: shouldRecordAudit
-              )
+              if shouldForwardToWebRTC {
+                realtimeVideoForwarder.enqueueImage(image)
+              }
+
+              Task { @MainActor [weak self] in
+                self?.handleProcessedLiveFrame(
+                  image: image,
+                  pixelBuffer: nil,
+                  timeStampNs: timeStampNs,
+                  shouldForwardToWebRTC: false,
+                  shouldRecordAudit: shouldRecordAudit
+                )
+              }
             }
           }
         } else {
@@ -2060,35 +3025,34 @@ class StreamSessionViewModel: ObservableObject {
 
           if hasCompressedData {
             // Compressed frame (HEVC/H.264) - decode via VTDecompressionSession
-            do {
-              try self.videoDecoder.decode(sampleBuffer)
-            } catch {
-              if self.backgroundFrameCount <= 5 || self.backgroundFrameCount % 120 == 0 {
+            let decodeLane = self.videoDecodeLane
+            let frameCount = self.backgroundFrameCount
+            decodeLane.decode(sampleBuffer) { errorMessage in
+              if frameCount <= 5 || frameCount % 120 == 0 {
                 NSLog("[Stream] Background frame #%d decode error: %@",
-                      self.backgroundFrameCount, String(describing: error))
+                      frameCount, errorMessage)
               }
             }
           } else if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
             // Raw pixel buffer - convert directly via CPU CIContext
-            let width = CVPixelBufferGetWidth(pixelBuffer)
-            let height = CVPixelBufferGetHeight(pixelBuffer)
             let timeStampNs = Self.rtcTimestampNs(from: sampleBuffer)
             if shouldForwardToWebRTC {
               realtimeVideoForwarder.enqueuePixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
             }
-            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            let rect = CGRect(x: 0, y: 0, width: width, height: height)
-            if let cgImage = self.cpuCIContext.createCGImage(ciImage, from: rect) {
-              let image = UIImage(cgImage: cgImage)
-              self.handleProcessedLiveFrame(
-                image: image,
-                pixelBuffer: pixelBuffer,
-                timeStampNs: timeStampNs,
-                shouldForwardToWebRTC: false,
-                shouldRecordAudit: shouldRecordAudit
-              )
+            if shouldRecordAudit {
+              self.sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
             }
-            self.videoDecoder.invalidateSession()
+            if self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) {
+              let sendablePixelBuffer = SendableStreamPixelBuffer(pixelBuffer: pixelBuffer)
+              let imageRenderer = self.streamImageRenderer
+              self.liveFrameProcessingQueue.async { [weak self] in
+                guard let image = imageRenderer.makeUIImage(from: sendablePixelBuffer.pixelBuffer) else { return }
+                Task { @MainActor [weak self] in
+                  self?.handleAnalysisImageFrame(image, shouldRecordAudit: shouldRecordAudit)
+                }
+              }
+            }
+            self.videoDecodeLane.invalidateSession()
           }
         }
       }
@@ -2168,6 +3132,18 @@ class StreamSessionViewModel: ObservableObject {
       }
     }
 
+    handleAnalysisImageFrame(image, shouldRecordAudit: shouldRecordAudit)
+
+    if shouldRecordAudit {
+      if let pixelBuffer {
+        sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
+      } else {
+        sopVideoRecorder?.appendFrame(image)
+      }
+    }
+  }
+
+  private func handleAnalysisImageFrame(_ image: UIImage, shouldRecordAudit: Bool) {
     currentVideoFrame = image
     if !hasReceivedFirstFrame {
       hasReceivedFirstFrame = true
@@ -2177,13 +3153,16 @@ class StreamSessionViewModel: ObservableObject {
 
     if shouldRecordAudit {
       Task { await syncLivePreviewFrameIfNeeded(image: image) }
-      if let pixelBuffer {
-        sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
-      } else {
-        sopVideoRecorder?.appendFrame(image)
-      }
-      spotChecklistItemsIfThrottled(image: image)
     }
+  }
+
+  private func shouldQueueGlassesAnalysisFrame(now: CFTimeInterval) -> Bool {
+    let interval: CFTimeInterval = webrtcViewModel.isUnderLiveVideoPressure ? 0.2 : 0.1
+    if !hasReceivedFirstFrame || now - lastGlassesAnalysisFrameQueuedAt >= interval {
+      lastGlassesAnalysisFrameQueuedAt = now
+      return true
+    }
+    return false
   }
 
   private func enqueueIPhoneAnalysisFrame(_ image: UIImage, shouldRecordAudit: Bool) {
@@ -2191,13 +3170,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func handleIPhoneAnalysisFrame(_ frame: IPhoneAnalysisFrameEnvelope) {
-    currentVideoFrame = frame.image
-    geminiAssistant.sendVideoFrameIfThrottled(image: frame.image)
-
-    if frame.shouldRecordAudit {
-      Task { await syncLivePreviewFrameIfNeeded(image: frame.image) }
-      spotChecklistItemsIfThrottled(image: frame.image)
-    }
+    handleAnalysisImageFrame(frame.image, shouldRecordAudit: frame.shouldRecordAudit)
   }
 
   private func resetIPhoneAnalysisLane() {
@@ -2213,7 +3186,10 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func stopSession() async {
-    geminiAssistant.stopSession()
+    await geminiAssistant.stopSession()
+    isAiGuideStarting = false
+    isStepValidationRunning = false
+    aiGuideStatusMessage = ""
     if isSopAuditRunning {
       await endAndShip(status: .userEnded)
     } else {
@@ -2234,20 +3210,198 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func toggleGeminiAssistant() async {
+    guard canToggleAiGuide else { return }
+    if geminiAssistant.isGeminiActive {
+      await geminiAssistant.stopSession()
+      aiGuideStatusMessage = "AI guide paused."
+      sopAuditStatusMessage = aiGuideStatusMessage
+      return
+    }
+
+    await startGeminiAssistant(
+      startingMessage: "Loading checklist guide...",
+      listeningMessage: "AI guide listening. Say \"I'm done\" when you want me to check this step."
+    )
+  }
+
+  @discardableResult
+  private func startGeminiAssistant(
+    startingMessage: String,
+    listeningMessage: String
+  ) async -> Bool {
+    guard isSopAuditRunning, !isAiGuideStarting, !hasActiveHelpEscalation else { return false }
     geminiAssistant.streamingMode = streamingMode
     geminiAssistant.configureWorkerAdminAPI(
       opsAPIClient,
       sessionID: activeExecutionSession?.id
     )
-    if geminiAssistant.isGeminiActive {
-      geminiAssistant.stopSession()
-      return
-    }
 
+    isAiGuideStarting = true
+    aiGuideStatusMessage = startingMessage
+    sopAuditStatusMessage = aiGuideStatusMessage
     await geminiAssistant.startSession(systemInstruction: buildGeminiSessionInstruction())
+    isAiGuideStarting = false
     if let errorMessage = geminiAssistant.errorMessage, !errorMessage.isEmpty {
       sopAuditStatusMessage = errorMessage
+      aiGuideStatusMessage = errorMessage
+      await postExecutionEvent(
+        type: "ai_guide_failed",
+        payload: [
+          "error": errorMessage,
+          "capture_mode": selectedCaptureModeLabel.lowercased()
+        ]
+      )
+      return false
+    } else if geminiAssistant.isGeminiActive {
+      aiGuideStatusMessage = listeningMessage
+      sopAuditStatusMessage = aiGuideStatusMessage
+      await postExecutionEvent(
+        type: "ai_guide_started",
+        payload: [
+          "capture_mode": selectedCaptureModeLabel.lowercased()
+        ]
+      )
+      return true
     }
+    return false
+  }
+
+  private func autoStartAiGuideWhenCaptureIsReady() async {
+    await ensureAiGuideStarted(reason: "capture_ready")
+  }
+
+  private func waitForMediaReadyBeforeAiStart(reason: String) async -> Bool {
+    guard streamingMode == .iPhone else { return true }
+    guard let camera = iPhoneCameraManager else {
+      await recordAiGuideMediaReadyTimeout(reason: reason, cameraReady: false)
+      return false
+    }
+
+    aiGuideStatusMessage = "Waiting for phone camera and mic..."
+    sopAuditStatusMessage = aiGuideStatusMessage
+
+    let timeout: CFTimeInterval = 3.0
+    let deadline = CACurrentMediaTime() + timeout
+    var cameraReady = false
+
+    while CACurrentMediaTime() < deadline {
+      guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+      let remaining = max(0, deadline - CACurrentMediaTime())
+      cameraReady = await camera.waitUntilRunningAndAudioConfigured(
+        timeout: min(0.25, remaining)
+      )
+      if cameraReady && hasReceivedFirstFrame {
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        return true
+      }
+      try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+
+    await recordAiGuideMediaReadyTimeout(reason: reason, cameraReady: cameraReady)
+    return false
+  }
+
+  private func recordAiGuideMediaReadyTimeout(reason: String, cameraReady: Bool) async {
+    let message = "Phone camera/mic still warming up. Tap Start AI to retry."
+    aiGuideStatusMessage = message
+    sopAuditStatusMessage = message
+    await WorkerTelemetry.shared.record(
+      "ai_guide_media_ready_timeout",
+      source: "gemini_live",
+      stage: "timeout",
+      sessionID: currentSopSessionId,
+      payload: [
+        "reason": reason,
+        "camera_ready": cameraReady,
+        "has_first_frame": hasReceivedFirstFrame,
+        "capture_mode": captureModeEventValue(streamingMode)
+      ]
+    )
+    await postExecutionEvent(
+      type: "ai_guide_media_ready_timeout",
+      payload: [
+        "reason": reason,
+        "camera_ready": cameraReady,
+        "has_first_frame": hasReceivedFirstFrame,
+        "capture_mode": captureModeEventValue(streamingMode)
+      ]
+    )
+  }
+
+  @discardableResult
+  private func ensureAiGuideStarted(
+    reason: String,
+    maxAttempts: Int = 3
+  ) async -> Bool {
+    guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+    if geminiAssistant.isGeminiActive {
+      return true
+    }
+    guard !isAiGuideStarting else { return false }
+    guard await waitForMediaReadyBeforeAiStart(reason: reason) else { return false }
+
+    aiGuideStatusMessage = "Connecting AI voice..."
+    sopAuditStatusMessage = aiGuideStatusMessage
+
+    for attempt in 1...maxAttempts {
+      guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+      await WorkerTelemetry.shared.record(
+        "ai_guide_autostart_attempt",
+        source: "gemini_live",
+        stage: "attempt",
+        sessionID: currentSopSessionId,
+        payload: [
+          "reason": reason,
+          "attempt": attempt,
+          "max_attempts": maxAttempts,
+          "has_first_frame": hasReceivedFirstFrame,
+          "capture_mode": captureModeEventValue(streamingMode)
+        ]
+      )
+      await postExecutionEvent(
+        type: "ai_guide_autostart_attempt",
+        payload: [
+          "reason": reason,
+          "attempt": attempt,
+          "has_first_frame": hasReceivedFirstFrame,
+          "capture_mode": captureModeEventValue(streamingMode)
+        ]
+      )
+
+      let started = await startGeminiAssistant(
+        startingMessage: attempt == 1 ? "Connecting AI voice..." : "Retrying AI voice...",
+        listeningMessage: "AI guide listening. Say \"I'm done\" or \"next step\" when you finish a step."
+      )
+      if started {
+        await WorkerTelemetry.shared.record(
+          "ai_guide_autostart_ready",
+          source: "gemini_live",
+          stage: "ready",
+          sessionID: currentSopSessionId,
+          payload: [
+            "reason": reason,
+            "attempt": attempt,
+            "has_first_frame": hasReceivedFirstFrame
+          ]
+        )
+        return true
+      }
+
+      guard attempt < maxAttempts else { break }
+      try? await Task.sleep(nanoseconds: UInt64(attempt) * 850_000_000)
+    }
+
+    await WorkerTelemetry.shared.record(
+      "ai_guide_autostart_failed",
+      source: "gemini_live",
+      stage: "failed",
+      sessionID: currentSopSessionId,
+      payload: [
+        "reason": reason,
+        "error": geminiAssistant.errorMessage ?? NSNull()
+      ]
+    )
+    return false
   }
 
   func beginLiveCapture(for sop: SOPTemplate) async {
@@ -2256,7 +3410,10 @@ class StreamSessionViewModel: ObservableObject {
     configureChecklist(for: sop)
     showShipSuccessToast = false
     shouldDismissCapture = false
-    sopAuditStatusMessage = ""
+    sopAuditStatusMessage = "Loading checklist guide..."
+    aiGuideStatusMessage = sopAuditStatusMessage
+    isAiGuideStarting = false
+    isStepValidationRunning = false
     helpStatusMessage = ""
 
     if !hasLoadedWorkerContext {
@@ -2270,6 +3427,9 @@ class StreamSessionViewModel: ObservableObject {
     guard isStreaming else { return }
 
     await startSopAudit(for: sop)
+    if isSopAuditRunning && !geminiAssistant.isGeminiActive {
+      await ensureAiGuideStarted(reason: "begin_live_capture")
+    }
   }
 
   func selectCaptureMode(_ mode: StreamingMode) {
@@ -2278,7 +3438,7 @@ class StreamSessionViewModel: ObservableObject {
       return
     }
     preferredCaptureMode = mode
-    if webrtcViewModel.isActive {
+    if webrtcViewModel.isActive && webrtcViewModel.isSupportMode {
       do {
         if let routeWarning = try configureWorkerAudioRoute(for: mode, reason: .viewer) {
           helpStatusMessage = routeWarning
@@ -2286,6 +3446,13 @@ class StreamSessionViewModel: ObservableObject {
       } catch {
         helpStatusMessage = "Audio route update failed: \(error.localizedDescription)"
       }
+    }
+  }
+
+  func selectCaptureModeFromUI(_ mode: StreamingMode) {
+    selectCaptureMode(mode)
+    Task { @MainActor [weak self] in
+      await self?.switchToPreferredCaptureModeIfNeeded()
     }
   }
 
@@ -2317,18 +3484,18 @@ class StreamSessionViewModel: ObservableObject {
       await loadWorkerContextIfNeeded()
     }
     reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: false)
+    await startHomeCameraPreviewIfNeeded()
 
     guard !hasEnteredWorkerHome else { return }
     hasEnteredWorkerHome = true
     await resetDemoShiftForHomeIfNeeded(reloadAssignments: false)
-    autoPresentCurrentAssignmentIfNeeded()
   }
 
   func handleWorkerAppBecameActive() async {
     guard hasEnteredWorkerHome else { return }
     guard !isSopAuditRunning, activeCaptureSOP == nil else { return }
     await resetDemoShiftForHomeIfNeeded(reloadAssignments: true)
-    autoPresentCurrentAssignmentIfNeeded()
+    await startHomeCameraPreviewIfNeeded()
   }
 
   func restoreActiveCaptureIfNeeded() {
@@ -2340,7 +3507,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func switchToPreferredCaptureModeIfNeeded() async {
-    guard let _ = selectedSOP else { return }
+    guard canSwitchCaptureMode else { return }
 
     if preferredCaptureMode == .glasses, !hasActiveDevice {
       sopAuditStatusMessage = "Meta camera not connected."
@@ -2351,22 +3518,31 @@ class StreamSessionViewModel: ObservableObject {
       return
     }
 
+    let previousMode = streamingMode
+    isSwitchingCaptureMode = true
+    defer { isSwitchingCaptureMode = false }
+
     await stopCurrentCameraTransportOnly()
     await startPreferredCamera()
+
+    if isStreaming, streamingMode == preferredCaptureMode, previousMode != streamingMode {
+      geminiAssistant.streamingMode = streamingMode
+      if isSopAuditRunning {
+        await postExecutionEvent(
+          type: "capture_mode_switched",
+          payload: [
+            "from": captureModeEventValue(previousMode),
+            "to": captureModeEventValue(streamingMode),
+            "label": selectedCaptureModeLabel
+          ]
+        )
+      }
+    }
   }
 
   func loadWorkerContextIfNeeded() async {
     guard !hasLoadedWorkerContext else { return }
     await refreshWorkerContext()
-  }
-
-  private func autoPresentCurrentAssignmentIfNeeded() {
-    guard activeCaptureSOP == nil, !isSopAuditRunning else { return }
-    guard let sop = currentAssignedSOP else { return }
-    let key = pendingTaskKey(for: sop)
-    guard !autoPresentedAssignmentKeys.contains(key) else { return }
-    autoPresentedAssignmentKeys.insert(key)
-    startCurrentAssignmentFromHome()
   }
 
   func refreshWorkerContext() async {
@@ -2786,7 +3962,12 @@ class StreamSessionViewModel: ObservableObject {
     await workerAdminSync?.stop()
     workerAdminSync = WorkerAdminLiveSessionCoordinator(
       api: opsAPIClient,
-      telemetry: WorkerTelemetry.shared
+      telemetry: WorkerTelemetry.shared,
+      onHeartbeatResponse: { [weak self] response in
+        Task { @MainActor [weak self] in
+          await self?.handleWorkerLiveHeartbeatResponse(response)
+        }
+      }
     )
     geminiLiveSpotter.configure(api: opsAPIClient)
     currentSopSessionId = sessionId
@@ -2794,14 +3975,23 @@ class StreamSessionViewModel: ObservableObject {
     isSopAuditRunning = true
     sopAuditSecondsRemaining = sop.estimatedDuration
     sopAuditStatusMessage = ""
+    aiGuideStatusMessage = ""
+    isAiGuideStarting = false
+    isStepValidationRunning = false
     proofImagesByTargetID = [:]
     lastLivePreviewSyncAt = .distantPast
+    lastGlassesAnalysisFrameQueuedAt = 0
     hasLoggedRoomCreatedForSession = false
     hasLoggedRoomJoinedForSession = false
     if streamingMode == .iPhone {
       sopVideoRecorder = nil
+      conversationAudioRecorder = ConversationAudioRecorder(sessionID: sessionId)
     } else {
-      sopVideoRecorder = SopVideoRecorder()
+      conversationAudioRecorder = nil
+      sopVideoRecorder = SopVideoRecorder(sessionID: sessionId)
+      if let fileURL = sopVideoRecorder?.outputURL {
+        rememberPendingRecording(sessionID: sessionId, fileURL: fileURL)
+      }
     }
     isDossierUploading = false
     dossierSpotterHitCount = 0
@@ -2812,36 +4002,37 @@ class StreamSessionViewModel: ObservableObject {
     lastProcessedTranscript = ""
     helpStatusMessage = ""
     hasActiveHelpEscalation = false
+    shouldResumeAiSupportAfterBackOffice = false
     packageClosureStatusMessage = ""
     clearOperationsSyncState()
+
+    if webrtcViewModel.isActive {
+      webrtcViewModel.stopSession()
+    }
 
     WorkerLiveLogger.log(
       "session_start",
       sessionID: sessionId,
-      roomCode: webrtcViewModel.roomCode.isEmpty ? nil : webrtcViewModel.roomCode,
+      roomCode: nil,
       uploadState: "active"
     )
     await workerAdminSync?.start(
       sessionID: sessionId,
       currentStepIndex: nextIncompleteStepIndex(),
       helpRequested: false,
-      roomCode: webrtcViewModel.roomCode
+      roomCode: nil
     )
-
-    do {
-      if let routeWarning = try configureWorkerAudioRoute(for: preferredCaptureMode, reason: .viewer) {
-        helpStatusMessage = routeWarning
-      }
-    } catch {
-      helpStatusMessage = "Audio route error: \(error.localizedDescription)"
-    }
 
     if streamingMode == .iPhone {
       iPhoneCameraManager?.startRecording(sessionID: sessionId)
       rememberPendingRecording(sessionID: sessionId, fileURL: expectedIPhoneRecordingURL(for: sessionId))
     }
 
-    await ensureLiveRoomSession()
+    if isSopAuditRunning && !geminiAssistant.isGeminiActive {
+      await ensureAiGuideStarted(reason: "sop_started")
+    }
+
+    await ensureObservationLiveRoomSession()
 
     // No countdown/auto-timeout for long SOP runs.
     sopCountdownTask?.cancel()
@@ -2897,6 +4088,7 @@ class StreamSessionViewModel: ObservableObject {
     webrtcViewModel.stopSession()
     helpStatusMessage = "Supervisor room closed."
     hasActiveHelpEscalation = false
+    shouldResumeAiSupportAfterBackOffice = false
     Task { @MainActor in
       await workerAdminSync?.updateHelpRequested(false)
       await patchActiveExecutionSession(
@@ -2904,6 +4096,10 @@ class StreamSessionViewModel: ObservableObject {
           helpRequested: false
         )
       )
+      await ensureObservationLiveRoomSession()
+      if isSopAuditRunning, !geminiAssistant.isGeminiActive {
+        await ensureAiGuideStarted(reason: "support_closed")
+      }
     }
   }
 
@@ -2984,10 +4180,36 @@ class StreamSessionViewModel: ObservableObject {
     }
     sopCountdownTask = nil
 
+    if geminiAssistant.isGeminiActive {
+      await geminiAssistant.stopSession()
+      try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+
     let wasIPhoneRecording = streamingMode == .iPhone
     var recordedVideoURL: URL?
     if wasIPhoneRecording {
-      recordedVideoURL = await iPhoneCameraManager?.stopRecording()
+      let phoneVideoURL = await iPhoneCameraManager?.stopRecording()
+      let conversationAudioURL = await conversationAudioRecorder?.finishAudioFile()
+      if let phoneVideoURL, let conversationAudioURL {
+        let mixedURL = phoneVideoURL
+          .deletingLastPathComponent()
+          .appendingPathComponent(phoneVideoURL.deletingPathExtension().lastPathComponent + "_mixed")
+          .appendingPathExtension("mp4")
+        if let muxedURL = await ConversationAudioMuxer.mux(
+          videoURL: phoneVideoURL,
+          audioURL: conversationAudioURL,
+          outputURL: mixedURL
+        ) {
+          recordedVideoURL = muxedURL
+          try? FileManager.default.removeItem(at: phoneVideoURL)
+          try? FileManager.default.removeItem(at: conversationAudioURL)
+        } else {
+          NSLog("[SOPRecorder] iPhone mixed audio mux failed; returning phone recording")
+          recordedVideoURL = phoneVideoURL
+        }
+      } else {
+        recordedVideoURL = phoneVideoURL
+      }
       stopIPhoneSession()
     } else {
       await streamSession.stop()
@@ -2998,6 +4220,7 @@ class StreamSessionViewModel: ObservableObject {
 
     let proofImages = proofImagesByTargetID
     sopVideoRecorder = nil
+    conversationAudioRecorder = nil
     proofImagesByTargetID = [:]
     let checklistPayload: [[String: Any]] = checklistItems.map {
       [
@@ -3156,11 +4379,12 @@ class StreamSessionViewModel: ObservableObject {
     if webrtcViewModel.isActive {
       webrtcViewModel.stopSession()
     }
-    geminiAssistant.stopSession()
+    await geminiAssistant.stopSession()
     await workerAdminSync?.stop()
     workerAdminSync = nil
 
     hasActiveHelpEscalation = false
+    shouldResumeAiSupportAfterBackOffice = false
     activeExecutionSession = nil
     currentSopSessionId = nil
     activeCaptureSOP = nil
@@ -3176,6 +4400,7 @@ class StreamSessionViewModel: ObservableObject {
     isSpotterInferenceInFlight = false
     shouldDismissCapture = true
     showShipSuccessToast = true
+    await startHomeCameraPreviewIfNeeded()
     successToastTask?.cancel()
     successToastTask = Task { @MainActor [weak self] in
       try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -3185,6 +4410,30 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   // MARK: - iPhone Camera Mode
+
+  private func startHomeCameraPreviewIfNeeded() async {
+    guard !isSopAuditRunning, activeCaptureSOP == nil else { return }
+    if isStreaming, streamingMode == preferredCaptureMode {
+      return
+    }
+
+    if isStreaming {
+      await stopCurrentCameraTransportOnly()
+    }
+
+    switch preferredCaptureMode {
+    case .glasses where hasActiveDevice:
+      await handleStartStreaming()
+    default:
+      let granted = await IPhoneCameraManager.requestPermission()
+      if granted {
+        preferredCaptureMode = .iPhone
+        startIPhoneSession()
+      } else if !showError {
+        showError("Camera permission denied. Please grant access in Settings.")
+      }
+    }
+  }
 
   func handleStartIPhone() async {
     let granted = await IPhoneCameraManager.requestPermission()
@@ -3202,6 +4451,7 @@ class StreamSessionViewModel: ObservableObject {
     hasReceivedFirstFrame = false
     resetIPhoneAnalysisLane()
     let camera = IPhoneCameraManager()
+    camera.analysisFrameInterval = webrtcViewModel.isUnderLiveVideoPressure ? 0.45 : 0.2
     let realtimeVideoForwarder = webrtcViewModel.realtimeVideoForwarder
     camera.onFirstPreviewFrame = { [weak self] in
       Task { @MainActor [weak self] in
@@ -3256,6 +4506,15 @@ class StreamSessionViewModel: ObservableObject {
         guard let self else { return }
         Task { @MainActor [weak self] in
           self?.updateHelpStatus(for: state)
+        }
+      }
+
+    livePressureCancellable = webrtcViewModel.$isUnderLiveVideoPressure
+      .removeDuplicates()
+      .sink { [weak self] isUnderPressure in
+        guard let self else { return }
+        Task { @MainActor [weak self] in
+          self?.iPhoneCameraManager?.analysisFrameInterval = isUnderPressure ? 0.45 : 0.2
         }
       }
   }
@@ -3354,6 +4613,7 @@ class StreamSessionViewModel: ObservableObject {
       )
     }
     spotterEvidenceWindow.resetAll()
+    currentStepBecameActiveAt = Date()
     updateGuidancePolicy(.nextInstruction, reason: "A new SOP assignment started.")
 
     Task { @MainActor [weak self] in
@@ -3469,6 +4729,11 @@ class StreamSessionViewModel: ObservableObject {
 
   func startHoldToTalk() {
     guard !isListeningForVoice else { return }
+    guard !geminiAssistant.isGeminiActive else {
+      sopAuditStatusMessage = "AI guide is already listening through the active audio route."
+      aiGuideStatusMessage = sopAuditStatusMessage
+      return
+    }
     guard let speechRecognizer, speechRecognizer.isAvailable else {
       sopAuditStatusMessage = "Speech recognizer unavailable"
       return
@@ -3535,8 +4800,15 @@ class StreamSessionViewModel: ObservableObject {
     speechTask?.cancel()
     speechTask = nil
     isListeningForVoice = false
+    let lease = holdToTalkAudioLease
+    holdToTalkAudioLease = nil
+    Task {
+      if let lease {
+        await WorkerAudioRouteCoordinator.shared.release(lease: lease)
+      }
+    }
 
-    if webrtcViewModel.isActive {
+    if webrtcViewModel.isActive && webrtcViewModel.isSupportMode {
       do {
         if let routeWarning = try configureWorkerAudioRoute(for: preferredCaptureMode, reason: .viewer) {
           helpStatusMessage = routeWarning
@@ -3544,31 +4816,133 @@ class StreamSessionViewModel: ObservableObject {
       } catch {
         NSLog("[Speech] Failed to restore talkback audio route: %@", error.localizedDescription)
       }
-    } else {
-      do {
-        try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-      } catch {
-        NSLog("[Speech] Failed to deactivate audio session: %@", error.localizedDescription)
-      }
     }
   }
 
   private func handleVoiceTranscript(_ transcript: String) {
-    guard transcript != lastProcessedTranscript else { return }
-    lastProcessedTranscript = transcript
+    let normalized = transcript
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    guard !normalized.isEmpty, normalized != lastProcessedTranscript else { return }
+    lastProcessedTranscript = normalized
 
-    if transcript.contains("done") {
-      markFirstUncheckedAsVoice()
+    if isBackOfficeCallIntent(normalized) {
+      recordAiCommandDetected("call_back_office", transcript: normalized)
+      requestSupervisorHelp()
       return
     }
 
-    guard let checkRange = transcript.range(of: "check ") else { return }
-    let spokenItem = transcript[checkRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+    if isStopAiGuideIntent(normalized) {
+      if geminiAssistant.isGeminiActive {
+        Task { @MainActor [weak self] in
+          await self?.geminiAssistant.stopSession()
+        }
+      }
+      aiGuideStatusMessage = "AI guide paused."
+      sopAuditStatusMessage = aiGuideStatusMessage
+      recordAiCommandDetected("pause_ai", transcript: normalized)
+      return
+    }
+
+    if isVoiceStepAdvanceIntent(normalized) {
+      guard shouldProcessAiCommand("advance_step", transcript: normalized) else { return }
+      recordAiCommandDetected("advance_step", transcript: normalized)
+      completeActiveStepByVoice(transcript: normalized)
+      return
+    }
+
+    if isGuidedStepCheckIntent(normalized) {
+      guard shouldProcessAiCommand("check_step", transcript: normalized) else { return }
+      recordAiCommandDetected("check_step", transcript: normalized)
+      requestGuidedStepValidation(trigger: "voice_check")
+      return
+    }
+
+    guard let checkRange = normalized.range(of: "check ") else { return }
+    let spokenItem = normalized[checkRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
     guard !spokenItem.isEmpty else { return }
 
-    if let matched = checklistItems.first(where: { $0.name.lowercased().contains(spokenItem) || spokenItem.contains($0.name.lowercased()) }) {
-      setChecklistItemChecked(itemID: matched.id, source: .voice)
+    if let active = activeSpotterRequestItems().first,
+      active.name.lowercased().contains(spokenItem) || spokenItem.contains(active.name.lowercased()) {
+      guard shouldProcessAiCommand("check_named_step", transcript: normalized) else { return }
+      recordAiCommandDetected("check_named_step", transcript: normalized)
+      requestGuidedStepValidation(trigger: "voice_check")
     }
+  }
+
+  private func isStopAiGuideIntent(_ transcript: String) -> Bool {
+    transcript.contains("stop ai") ||
+      transcript.contains("pause ai") ||
+      transcript.contains("stop guide") ||
+      transcript.contains("pause guide")
+  }
+
+  private func isVoiceStepAdvanceIntent(_ transcript: String) -> Bool {
+    transcript.contains("i'm done") ||
+      transcript.contains("im done") ||
+      transcript.contains("done with this") ||
+      transcript.contains("done with the step") ||
+      transcript.contains("next step") ||
+      transcript.contains("ready for next") ||
+      transcript.contains("move on")
+  }
+
+  private func isGuidedStepCheckIntent(_ transcript: String) -> Bool {
+    transcript.contains("check this step") ||
+      transcript.contains("check step") ||
+      transcript.contains("check again") ||
+      transcript.contains("validate this") ||
+      transcript.contains("validate step") ||
+      transcript.contains("what is missing") ||
+      transcript.contains("what am i missing") ||
+      transcript.contains("what's missing") ||
+      transcript.contains("did i do it right")
+  }
+
+  private func shouldProcessAiCommand(_ commandKey: String, transcript: String) -> Bool {
+    let now = Date()
+    if commandKey == lastAiCommandKey,
+       now.timeIntervalSince(lastAiCommandAt) < 3.0 {
+      return false
+    }
+    lastAiCommandKey = commandKey
+    lastAiCommandAt = now
+    return true
+  }
+
+  private func recordAiCommandDetected(_ commandKey: String, transcript: String) {
+    Task { [weak self] in
+      guard let self else { return }
+      await WorkerTelemetry.shared.record(
+        "ai_command_detected",
+        source: "gemini_live",
+        stage: commandKey,
+        sessionID: self.currentSopSessionId,
+        payload: [
+          "command": commandKey,
+          "transcript": transcript
+        ]
+      )
+      await self.postExecutionEvent(
+        type: "ai_command_detected",
+        payload: [
+          "command": commandKey,
+          "transcript": transcript
+        ]
+      )
+    }
+  }
+
+  private func isBackOfficeCallIntent(_ transcript: String) -> Bool {
+    let normalized = transcript.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard normalized.contains("back office") || normalized.contains("supervisor") || normalized.contains("support") else {
+      return false
+    }
+    return normalized.contains("call") ||
+      normalized.contains("dial") ||
+      normalized.contains("ring") ||
+      normalized.contains("request help") ||
+      normalized.contains("need help")
   }
 
   private func markFirstUncheckedAsVoice() {
@@ -3576,7 +4950,22 @@ class StreamSessionViewModel: ObservableObject {
     setChecklistItemChecked(itemID: firstUnchecked.id, source: .voice)
   }
 
-  private func setChecklistItemChecked(itemID: UUID, source: ChecklistCompletionSource) {
+  private func completeActiveStepByVoice(transcript: String) {
+    guard let firstUnchecked = checklistItems.first(where: { !$0.isChecked }) else {
+      sopAuditStatusMessage = "All checklist steps are complete."
+      aiGuideStatusMessage = sopAuditStatusMessage
+      return
+    }
+    setChecklistItemChecked(itemID: firstUnchecked.id, source: .voice, voiceTranscript: transcript)
+    sopAuditStatusMessage = "Step confirmed by voice. Moving to the next step."
+    aiGuideStatusMessage = sopAuditStatusMessage
+  }
+
+  private func setChecklistItemChecked(
+    itemID: UUID,
+    source: ChecklistCompletionSource,
+    voiceTranscript: String? = nil
+  ) {
     guard let index = checklistItems.firstIndex(where: { $0.id == itemID }) else { return }
     guard !checklistItems[index].isChecked else { return }
     checklistItems[index].isChecked = true
@@ -3584,6 +4973,7 @@ class StreamSessionViewModel: ObservableObject {
 
     let item = checklistItems[index]
     spotterEvidenceWindow.reset(stepID: item.itemID)
+    currentStepBecameActiveAt = Date()
     updateGuidancePolicy(.nextInstruction, reason: "Step completed by \(source.rawValue).")
     Task {
       await handleChecklistMutation(
@@ -3591,6 +4981,32 @@ class StreamSessionViewModel: ObservableObject {
         stepIndex: index,
         eventType: "step_complete"
       )
+      if source == .voice {
+        let nextIndex = nextIncompleteStepIndex()
+        await WorkerTelemetry.shared.record(
+          "voice_step_advanced",
+          source: "gemini_live",
+          stage: "advanced",
+          sessionID: currentSopSessionId,
+          payload: [
+            "step_index": index,
+            "step_id": item.itemID,
+            "step_name": item.name,
+            "next_step_index": nextIndex,
+            "transcript": voiceTranscript ?? NSNull()
+          ]
+        )
+        await postExecutionEvent(
+          type: "voice_step_advanced",
+          payload: [
+            "step_index": index,
+            "step_id": item.itemID,
+            "step_name": item.name,
+            "next_step_index": nextIndex,
+            "transcript": voiceTranscript ?? NSNull()
+          ]
+        )
+      }
     }
 
     if checklistItems.allSatisfy({ $0.isChecked }) {
@@ -3610,6 +5026,7 @@ class StreamSessionViewModel: ObservableObject {
     checklistItems[index].completionSource = .vision
     dossierSpotterHitCount += 1
     spotterEvidenceWindow.reset(stepID: itemID)
+    currentStepBecameActiveAt = Date()
     updateGuidancePolicy(.nextInstruction, reason: "Step completed after stable visual evidence.")
     updateDossierPipelineStatus("Live spotter hit #\(dossierSpotterHitCount)", kind: .active)
 
@@ -3624,6 +5041,57 @@ class StreamSessionViewModel: ObservableObject {
     }
 
     if checklistItems.allSatisfy({ $0.isChecked }) {
+      Task { await endAndShip(status: .allItemsChecked) }
+    }
+  }
+
+  private func reconcileChecklistAfterServerAdvance(
+    match: GeminiLiveSpotter.SpotterMatch,
+    evidence: [String: Any]
+  ) {
+    guard let serverStepIndex = match.advancedToStepIndex else { return }
+
+    let completedCount = match.completedSop
+      ? checklistItems.count
+      : min(max(serverStepIndex, 0), checklistItems.count)
+    guard completedCount > 0 || match.completedSop else { return }
+    let matchedWasAlreadyChecked =
+      checklistItems.first(where: { $0.itemID == match.id })?.isChecked == true
+
+    for index in checklistItems.indices {
+      guard index < completedCount else { continue }
+      if !checklistItems[index].isChecked {
+        checklistItems[index].isChecked = true
+        checklistItems[index].completionSource = .vision
+      }
+      spotterEvidenceWindow.reset(stepID: checklistItems[index].itemID)
+    }
+
+    if !matchedWasAlreadyChecked {
+      dossierSpotterHitCount += 1
+    }
+
+    updateGuidancePolicy(.nextInstruction, reason: "Step advanced by server-confirmed visual evidence.")
+    updateDossierPipelineStatus("Live spotter server advance", kind: .active)
+    currentStepBecameActiveAt = Date()
+
+    let nextIndex = nextIncompleteStepIndex()
+    Task {
+      await workerAdminSync?.updateCurrentStepIndex(nextIndex, sendImmediateHeartbeat: true)
+      await postExecutionEvent(
+        type: "phone_step_reconciled",
+        payload: [
+          "step_id": match.id,
+          "server_step_index": serverStepIndex,
+          "local_next_step_index": nextIndex,
+          "completed_sop": match.completedSop,
+          "evidence": evidence
+        ]
+      )
+      await syncGeminiSessionInstruction()
+    }
+
+    if checklistItems.allSatisfy({ $0.isChecked }) || match.completedSop {
       Task { await endAndShip(status: .allItemsChecked) }
     }
   }
@@ -3690,38 +5158,50 @@ class StreamSessionViewModel: ObservableObject {
     return json
   }
 
-  private func spotChecklistItemsIfThrottled(image: UIImage) {
+  func requestGuidedStepValidation(trigger: String = "tap") {
     guard isSopAuditRunning else { return }
-    guard !isSpotterInferenceInFlight else { return }
-
-    let now = Date()
-    guard now.timeIntervalSince(lastSpotterInferenceTime) >= 0.6 else { return } // ~1.6 FPS
-    lastSpotterInferenceTime = now
-    isSpotterInferenceInFlight = true
-
+    guard !isSpotterInferenceInFlight, !isStepValidationRunning else { return }
+    guard let image = currentVideoFrame else {
+      sopAuditStatusMessage = "Keep the current step visible so AI can check it."
+      aiGuideStatusMessage = sopAuditStatusMessage
+      return
+    }
     let pendingItems = activeSpotterRequestItems()
 
     guard !pendingItems.isEmpty else {
-      isSpotterInferenceInFlight = false
+      sopAuditStatusMessage = "All checklist steps are complete."
+      aiGuideStatusMessage = sopAuditStatusMessage
       return
     }
+
+    lastSpotterInferenceTime = Date()
+    isSpotterInferenceInFlight = true
+    isStepValidationRunning = true
+    sopAuditStatusMessage = "Checking the current step..."
+    aiGuideStatusMessage = sopAuditStatusMessage
+    updateDossierPipelineStatus("On-demand AI check running", kind: .active)
 
     Task { [weak self] in
       guard let self else { return }
       let matches: [GeminiLiveSpotter.SpotterMatch]
+      var spotterErrorMessage: String?
+      var spotterConflict = false
       let requestStartedAt = CACurrentMediaTime()
       do {
         matches = try await self.geminiLiveSpotter.detectVisibleItemMatches(
           image: image,
           items: pendingItems,
-          sessionID: self.currentSopSessionId
+          sessionID: self.currentSopSessionId,
+          elapsedActiveMs: self.elapsedActiveMsForCurrentStep()
         )
       } catch {
         matches = []
+        spotterErrorMessage = error.localizedDescription
+        spotterConflict = self.isStaleSpotterConflict(error)
         await WorkerTelemetry.shared.record(
-          "gemini_spotter_failed",
+          spotterConflict ? "gemini_spotter_conflict" : "gemini_spotter_failed",
           source: "gemini_spotter",
-          stage: "failed",
+          stage: spotterConflict ? "conflict" : "failed",
           sessionID: self.currentSopSessionId,
           payload: [
             "error": error.localizedDescription,
@@ -3730,81 +5210,117 @@ class StreamSessionViewModel: ObservableObject {
         )
       }
       let durationMs = (CACurrentMediaTime() - requestStartedAt) * 1000
-      let stableMatches = await MainActor.run {
-        matches.compactMap { match -> (GeminiLiveSpotter.SpotterMatch, SpotterEvidenceDecision)? in
-          guard let target = pendingItems.first(where: { $0.id == match.id }) else { return nil }
-          let decision = self.spotterEvidenceWindow.record(
-            stepID: match.id,
-            matched: match.matched,
-            autoComplete: match.autoComplete,
-            confidence: match.confidence,
-            threshold: match.threshold
-          )
-          if match.matched && !decision.shouldAutoComplete {
-            self.updateGuidancePolicy(
-              .confirm,
-              reason: "Visual evidence is accumulating for \(target.name)."
-            )
-          } else if !match.matched && decision.sampleCount >= self.spotterEvidenceWindow.maxSamples && target.skipRisk == "high" {
-            self.updateGuidancePolicy(
-              .helpPrompt,
-              reason: "High-risk step evidence is still unclear for \(target.name)."
-            )
-          }
-          return (match, decision)
-        }
-      }
-      let autoCompleteMatches = stableMatches.filter { $0.1.shouldAutoComplete }
       NSLog(
-        "[Spotter] Active-step review targets=%@ matched=%@ stableAutoComplete=%@ duration=%.1fms",
+        "[Spotter] Guided step check trigger=%@ targets=%@ matched=%@ autoComplete=%@ duration=%.1fms",
+        trigger,
         pendingItems.map(\.id).joined(separator: ","),
         matches.filter(\.matched).map(\.id).joined(separator: ","),
-        autoCompleteMatches.map { $0.0.id }.joined(separator: ","),
+        matches.filter(\.autoComplete).map(\.id).joined(separator: ","),
         durationMs
       )
-      if let first = stableMatches.first {
-        let firstMatch = first.0
-        let firstDecision = first.1
+      if let firstMatch = matches.first {
         await WorkerTelemetry.shared.record(
           "gemini_spotter_result",
           source: "gemini_spotter",
-          stage: firstDecision.shouldAutoComplete ? "auto_complete" : firstMatch.matched ? "stabilizing" : "not_matched",
+          stage: firstMatch.autoComplete ? "auto_complete" : firstMatch.matched ? "matched" : "not_matched",
           sessionID: self.currentSopSessionId,
           durationMs: durationMs,
           metricValue: firstMatch.confidence,
           metricUnit: "confidence",
           payload: [
             "step_id": firstMatch.id,
+            "trigger": trigger,
+            "on_demand": true,
             "matched": firstMatch.matched,
             "auto_complete": firstMatch.autoComplete,
-            "stable_auto_complete": firstDecision.shouldAutoComplete,
-            "window_samples": firstDecision.sampleCount,
-            "window_positive_samples": firstDecision.positiveCount,
-            "window_average_confidence": firstDecision.averagePositiveConfidence,
-            "threshold": firstDecision.threshold,
+            "threshold": firstMatch.threshold,
             "reason": firstMatch.reason
           ]
         )
       }
 
       await MainActor.run {
-        autoCompleteMatches.forEach { match, decision in
-          self.captureProofImageIfNeeded(for: match.id, from: image)
-          self.setChecklistItemCheckedBySpotterID(match.id, evidence: [
-            "ai_confidence": match.confidence,
-            "ai_reason": match.reason,
-            "evidence_timestamp": match.evidenceTimestamp,
-            "auto_complete": match.autoComplete,
-            "stable_auto_complete": decision.shouldAutoComplete,
-            "window_samples": decision.sampleCount,
-            "window_positive_samples": decision.positiveCount,
-            "window_average_confidence": decision.averagePositiveConfidence,
-            "threshold": decision.threshold
-          ])
+        if let spotterErrorMessage {
+          if spotterConflict {
+            self.sopAuditStatusMessage = "Checklist moved on in the backend. Refreshing the active step..."
+            self.aiGuideStatusMessage = self.sopAuditStatusMessage
+            self.updateGuidancePolicy(.helpPrompt, reason: self.sopAuditStatusMessage)
+            self.updateDossierPipelineStatus("AI check refreshed active step", kind: .info)
+            Task { await self.recoverFromStaleSpotterConflict(message: spotterErrorMessage) }
+            self.isStepValidationRunning = false
+            self.isSpotterInferenceInFlight = false
+            return
+          }
+          self.sopAuditStatusMessage = "AI check could not confirm the active step: \(spotterErrorMessage)"
+          self.aiGuideStatusMessage = self.sopAuditStatusMessage
+          self.updateGuidancePolicy(.helpPrompt, reason: self.sopAuditStatusMessage)
+          self.updateDossierPipelineStatus("AI check conflict", kind: .info)
+          Task { await self.syncGeminiSessionInstruction() }
+          self.isStepValidationRunning = false
+          self.isSpotterInferenceInFlight = false
+          return
         }
+
+        if let match = matches.first {
+          if match.autoComplete, match.advancedToStepIndex != nil {
+            self.captureProofImageIfNeeded(for: match.id, from: image)
+            self.reconcileChecklistAfterServerAdvance(match: match, evidence: [
+              "guided_trigger": trigger,
+              "on_demand": true,
+              "ai_confidence": match.confidence,
+              "ai_reason": match.reason,
+              "evidence_timestamp": match.evidenceTimestamp,
+              "auto_complete": match.autoComplete,
+              "advanced_to_step_index": match.advancedToStepIndex ?? NSNull(),
+              "completed_sop": match.completedSop,
+              "threshold": match.threshold
+            ])
+            self.sopAuditStatusMessage = "Step checked. Moving to the next step."
+            self.aiGuideStatusMessage = self.sopAuditStatusMessage
+          } else {
+            let reason = match.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = reason.isEmpty
+              ? (match.autoComplete
+                ? "The server has not advanced this step yet. Try again in a moment."
+                : "I still need clearer evidence before moving to the next step.")
+              : reason
+            self.sopAuditStatusMessage = "Step needs more evidence: \(message)"
+            self.aiGuideStatusMessage = self.sopAuditStatusMessage
+            self.updateGuidancePolicy(.helpPrompt, reason: self.sopAuditStatusMessage)
+            self.updateDossierPipelineStatus("AI check incomplete", kind: .info)
+          }
+        } else {
+          self.sopAuditStatusMessage = "AI check could not read the current step. Keep the work area visible and try again."
+          self.aiGuideStatusMessage = self.sopAuditStatusMessage
+          self.updateGuidancePolicy(.helpPrompt, reason: self.sopAuditStatusMessage)
+          self.updateDossierPipelineStatus("AI check unavailable", kind: .info)
+        }
+        self.isStepValidationRunning = false
         self.isSpotterInferenceInFlight = false
       }
     }
+  }
+
+  private func elapsedActiveMsForCurrentStep() -> Int? {
+    max(0, Int(Date().timeIntervalSince(currentStepBecameActiveAt) * 1000))
+  }
+
+  private func isStaleSpotterConflict(_ error: Error) -> Bool {
+    if case AdminIngestError.server(let statusCode, _, _) = error {
+      return statusCode == 409
+    }
+    return error.localizedDescription.contains("HTTP 409")
+  }
+
+  private func recoverFromStaleSpotterConflict(message: String) async {
+    await postExecutionEvent(
+      type: "phone_step_validation_conflict",
+      payload: [
+        "message": message,
+        "local_next_step_index": nextIncompleteStepIndex()
+      ]
+    )
+    await syncGeminiSessionInstruction()
   }
 
   private func startPreferredCamera() async {
@@ -3822,24 +5338,23 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: Bool) {
-    let nextMode: StreamingMode = hasActiveDevice ? .glasses : .iPhone
-    guard preferredCaptureMode != nextMode else { return }
-
-    preferredCaptureMode = nextMode
-
-    if hasActiveDevice {
-      if isSopAuditRunning && streamingMode == .iPhone {
-        sopAuditStatusMessage = "Meta camera connected. The next assignment will use glasses."
-      } else {
-        sopAuditStatusMessage = "Meta camera ready."
-      }
-    } else if streamingMode == .glasses {
+    if !hasActiveDevice, preferredCaptureMode == .glasses {
+      preferredCaptureMode = .iPhone
       sopAuditStatusMessage = "Meta camera disconnected."
+    } else if hasActiveDevice {
+      sopAuditStatusMessage = "Meta camera ready. Use the camera selector when you want glasses."
     }
 
     guard allowTransportSwitch, isStreaming, !isSopAuditRunning else { return }
     Task { @MainActor [weak self] in
       await self?.switchToPreferredCaptureModeIfNeeded()
+    }
+  }
+
+  private func captureModeEventValue(_ mode: StreamingMode) -> String {
+    switch mode {
+    case .glasses: return "glasses"
+    case .iPhone: return "iphone"
     }
   }
 
@@ -3896,10 +5411,19 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func hasBluetoothTalkbackRoute(_ route: AVAudioSessionRouteDescription) -> Bool {
+    route.inputs.contains {
+      $0.portType == .bluetoothHFP ||
+        $0.portType == .bluetoothLE
+    } ||
     route.outputs.contains {
-      $0.portType == .bluetoothA2DP
-        || $0.portType == .bluetoothHFP
+      $0.portType == .bluetoothHFP
         || $0.portType == .bluetoothLE
+    }
+  }
+
+  private func preferredBluetoothHFPInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
+    session.availableInputs?.first {
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
     }
   }
 
@@ -3908,45 +5432,30 @@ class StreamSessionViewModel: ObservableObject {
     for mode: StreamingMode,
     reason: WorkerAudioRouteReason
   ) throws -> String? {
-    let session = AVAudioSession.sharedInstance()
-    var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
-    let audioMode: AVAudioSession.Mode
-
-    switch mode {
-    case .iPhone:
-      audioMode = .voiceChat
-      options.formUnion([.defaultToSpeaker, .duckOthers])
-    case .glasses:
-      audioMode = .videoChat
+    if reason == .viewer, webrtcViewModel.isActive, webrtcViewModel.isSupportMode {
+      return webrtcViewModel.refreshSupportAudioRoute(captureMode: mode)
     }
 
-    try session.setCategory(.playAndRecord, mode: audioMode, options: options)
-    try session.setPreferredIOBufferDuration(0.02)
-    try session.setActive(true, options: .notifyOthersOnDeactivation)
-
-    switch mode {
-    case .iPhone:
-      try session.overrideOutputAudioPort(.speaker)
-      logWorkerAudioRoute(session: session, mode: mode, reason: reason)
-      return nil
-    case .glasses:
-      if hasBluetoothTalkbackRoute(session.currentRoute) {
-        try session.overrideOutputAudioPort(.none)
-        logWorkerAudioRoute(session: session, mode: mode, reason: reason)
-        return nil
-      }
-      try session.overrideOutputAudioPort(.speaker)
-      switch reason {
-      case .viewer:
-        let note = "Meta audio route unavailable. Using phone speaker until glasses/Bluetooth audio connects."
-        logWorkerAudioRoute(session: session, mode: mode, reason: reason, note: note)
-        return note
-      case .holdToTalk:
-        let note = "Meta mic route unavailable. Hold-to-talk is using the phone until glasses/Bluetooth audio connects."
-        logWorkerAudioRoute(session: session, mode: mode, reason: reason, note: note)
-        return note
-      }
+    let owner: WorkerAudioRouteOwner =
+      reason == .holdToTalk
+        ? .holdToTalk
+        : .viewer
+    let snapshot = try WorkerAudioRouteCoordinator.shared.acquire(
+      owner: owner,
+      mode: mode,
+      reason: reason == .holdToTalk ? "hold_to_talk" : "live_support",
+      forceSpeaker: SettingsManager.shared.speakerOutputEnabled,
+      preferredIOBufferDuration: 0.02
+    )
+    switch owner {
+    case .holdToTalk:
+      holdToTalkAudioLease = snapshot.lease
+    case .viewer:
+      viewerAudioRouteLease = snapshot.lease
+    case .aiGuide, .backOfficeWebRTC:
+      break
     }
+    return snapshot.fallbackMessage
   }
 
   private func liveRoomStatusMessage(localOnly: Bool, helpRequested: Bool, roomCode: String? = nil) -> String {
@@ -3959,7 +5468,7 @@ class StreamSessionViewModel: ObservableObject {
     if let roomCode, !roomCode.isEmpty {
       return helpRequested
         ? "Supervisor request sent. Room \(roomCode) is ready for manager join."
-        : "Live room active: \(roomCode)"
+        : "Admin video observation active: \(roomCode)"
     }
 
     return helpRequested
@@ -4113,8 +5622,7 @@ class StreamSessionViewModel: ObservableObject {
     }
 
     let orderedSteps = sop.steps.sorted { $0.order < $1.order }
-    let baseInstruction = GeminiConfig.systemInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
-    let resolvedBaseInstruction = baseInstruction.isEmpty ? GeminiConfig.defaultSystemInstruction : baseInstruction
+    let resolvedBaseInstruction = GeminiConfig.defaultSystemInstruction
 
     guard !orderedSteps.isEmpty else {
       geminiInstructionSyncStatus = "Gemini sync: \(sop.name) · no structured steps"
@@ -4208,18 +5716,84 @@ class StreamSessionViewModel: ObservableObject {
     guard let sessionID = currentSopSessionId else { return }
 
     let now = Date()
-    let uploadInterval = hasActiveHelpEscalation ? 1.0 : 2.0
+    let underLiveVideoPressure = webrtcViewModel.isUnderLiveVideoPressure
+    let uploadInterval: TimeInterval = underLiveVideoPressure
+      ? (hasActiveHelpEscalation ? 1.5 : 2.0)
+      : (hasActiveHelpEscalation ? 0.75 : 1.0)
     guard now.timeIntervalSince(lastLivePreviewSyncAt) >= uploadInterval else { return }
     lastLivePreviewSyncAt = now
 
-    let compressionQuality = hasActiveHelpEscalation ? 0.55 : 0.65
-    guard let jpegData = image.jpegData(compressionQuality: compressionQuality) else { return }
+    let compressionQuality = hasActiveHelpEscalation ? 0.5 : 0.45
+    let encodeStartedAt = CACurrentMediaTime()
+    guard let jpegData = await livePreviewFrameEncoder.encode(
+      image: image,
+      maxDimension: 640,
+      compressionQuality: compressionQuality
+    ) else { return }
+    await WorkerTelemetry.shared.record(
+      "live_preview_encode",
+      source: "ios_app",
+      stage: underLiveVideoPressure ? "pressure" : "normal",
+      sessionID: sessionID,
+      durationMs: (CACurrentMediaTime() - encodeStartedAt) * 1000,
+      payload: [
+        "bytes": jpegData.count,
+        "under_live_video_pressure": underLiveVideoPressure,
+        "upload_interval_seconds": uploadInterval
+      ]
+    )
 
     if streamingMode == .glasses, let fileURL = sopVideoRecorder?.outputURL {
       rememberPendingRecording(sessionID: sessionID, fileURL: fileURL)
     }
 
     await workerAdminSync?.enqueueFrameUpload(data: jpegData)
+  }
+
+  private func handleWorkerLiveHeartbeatResponse(_ response: WorkerLiveHeartbeatResponse) async {
+    guard response.sessionID == currentSopSessionId else { return }
+
+    let humanConnected =
+      response.shouldOpenLiveRoom ||
+      (response.supportMode == "back_office" && response.humanSupportStatus == "connected")
+    let humanEnded =
+      response.supportMode == "ai" && response.humanSupportStatus == "ended"
+    let humanRinging =
+      response.supportMode == "handoff_requested" || response.humanSupportStatus == "ringing"
+
+    if humanConnected {
+      hasActiveHelpEscalation = true
+      if !webrtcViewModel.isActive {
+        helpStatusMessage = "Back office answered. Opening live video and audio..."
+        await ensureLiveRoomSession()
+      } else if !webrtcViewModel.roomCode.isEmpty {
+        await syncLiveRoomState(roomCode: webrtcViewModel.roomCode)
+      }
+      return
+    }
+
+    if humanEnded {
+      if webrtcViewModel.isActive {
+        webrtcViewModel.stopSession()
+      }
+      hasActiveHelpEscalation = false
+      await workerAdminSync?.updateHelpRequested(false, sendImmediateHeartbeat: false)
+      helpStatusMessage = "Back office ended. AI support is available again."
+      await ensureObservationLiveRoomSession()
+
+      if shouldResumeAiSupportAfterBackOffice, isSopAuditRunning, !geminiAssistant.isGeminiActive {
+        shouldResumeAiSupportAfterBackOffice = false
+        await ensureAiGuideStarted(reason: "support_ended")
+      } else {
+        shouldResumeAiSupportAfterBackOffice = false
+      }
+      return
+    }
+
+    if humanRinging {
+      hasActiveHelpEscalation = true
+      helpStatusMessage = "Calling back office. Live video and audio will open after they answer."
+    }
   }
 
   private func requestSupervisorHelpFlow() async {
@@ -4231,12 +5805,18 @@ class StreamSessionViewModel: ObservableObject {
     isRequestingHelp = true
     defer { isRequestingHelp = false }
 
-    await ensureLiveRoomSession()
-
     let notes = helpRequestNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+    shouldResumeAiSupportAfterBackOffice = geminiAssistant.isGeminiActive
+    if geminiAssistant.isGeminiActive {
+      await geminiAssistant.stopSession()
+      aiGuideStatusMessage = "AI guide paused while back office support is requested."
+      sopAuditStatusMessage = aiGuideStatusMessage
+    }
 
     guard let sessionID = activeExecutionSession?.id else {
-      helpStatusMessage = liveRoomStatusMessage(localOnly: true, helpRequested: true, roomCode: webrtcViewModel.roomCode)
+      hasActiveHelpEscalation = true
+      await workerAdminSync?.updateHelpRequested(true)
+      helpStatusMessage = "Calling back office locally. Backend session sync is required before live media can open."
       return
     }
 
@@ -4252,18 +5832,24 @@ class StreamSessionViewModel: ObservableObject {
         type: "help_requested",
         payload: [
           "notes": notes,
-          "room_code": webrtcViewModel.roomCode
+          "room_code": NSNull()
         ]
       )
       await patchActiveExecutionSession(
         ExecutionSessionPatch(
-          helpRequested: true,
-          webrtcRoomCode: webrtcViewModel.roomCode.isEmpty ? nil : webrtcViewModel.roomCode
+          helpRequested: true
         )
       )
-      helpStatusMessage = liveRoomStatusMessage(localOnly: false, helpRequested: true, roomCode: webrtcViewModel.roomCode)
+      await workerAdminSync?.updateHelpRequested(true)
+      helpStatusMessage = "Calling back office. Live video and audio will open after they answer."
     } catch {
-      helpStatusMessage = "Live room is open locally, but the backend help request failed: \(error.localizedDescription)"
+      hasActiveHelpEscalation = false
+      let shouldResumeAI = shouldResumeAiSupportAfterBackOffice
+      shouldResumeAiSupportAfterBackOffice = false
+      if shouldResumeAI, isSopAuditRunning, !geminiAssistant.isGeminiActive {
+        await geminiAssistant.startSession(systemInstruction: buildGeminiSessionInstruction())
+      }
+      helpStatusMessage = "Back office call request failed: \(error.localizedDescription)"
     }
   }
 
@@ -4329,7 +5915,7 @@ class StreamSessionViewModel: ObservableObject {
       }
       helpStatusMessage = localOnly
         ? "Local live room connected. Admin join stays unavailable until backend sync succeeds."
-        : "Live viewer connected."
+        : (webrtcViewModel.isSupportMode ? "Back office audio connected." : "Admin video observer connected.")
     case .waitingForPeer:
       if !webrtcViewModel.roomCode.isEmpty {
         helpStatusMessage = liveRoomStatusMessage(
@@ -4341,7 +5927,7 @@ class StreamSessionViewModel: ObservableObject {
     case .connecting:
       helpStatusMessage = localOnly
         ? "Opening local live room..."
-        : "Opening live execution room..."
+        : (webrtcViewModel.isSupportMode ? "Opening back office audio room..." : "Opening admin video observation...")
     case .backgrounded:
       helpStatusMessage = "Live room paused in background. Returning will reconnect."
     case .error(let message):
@@ -4354,17 +5940,39 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func ensureLiveRoomSession() async {
-    do {
-      if let routeWarning = try configureWorkerAudioRoute(for: preferredCaptureMode, reason: .viewer) {
-        helpStatusMessage = routeWarning
+    // Heartbeats can arrive while Gemini is still yielding the audio route.
+    // Only one support-room handoff may perform that awaited stop/start path.
+    if webrtcViewModel.isActive && webrtcViewModel.isSupportMode {
+      switch webrtcViewModel.connectionState {
+      case .connected, .waitingForPeer, .connecting:
+        if !webrtcViewModel.roomCode.isEmpty {
+          await syncLiveRoomState(roomCode: webrtcViewModel.roomCode)
+        }
+        return
+      case .backgrounded, .error, .disconnected:
+        break
       }
-    } catch {
-      helpStatusMessage = "Audio route error: \(error.localizedDescription)"
+    }
+
+    guard !isLiveRoomHandoffInProgress else {
+      if !webrtcViewModel.roomCode.isEmpty {
+        await syncLiveRoomState(roomCode: webrtcViewModel.roomCode)
+      }
+      return
+    }
+    isLiveRoomHandoffInProgress = true
+    defer { isLiveRoomHandoffInProgress = false }
+
+    if geminiAssistant.isGeminiActive {
+      shouldResumeAiSupportAfterBackOffice = true
+      aiGuideStatusMessage = "AI guide paused while back office support connects."
+      sopAuditStatusMessage = aiGuideStatusMessage
+      await geminiAssistant.stopSession()
     }
 
     let hasRoomCode = !webrtcViewModel.roomCode.isEmpty
 
-    if webrtcViewModel.isActive {
+    if webrtcViewModel.isActive && webrtcViewModel.isSupportMode {
       switch webrtcViewModel.connectionState {
       case .connected, .waitingForPeer:
         if hasRoomCode {
@@ -4382,9 +5990,12 @@ class StreamSessionViewModel: ObservableObject {
 
       helpStatusMessage = "Restarting live room for this SOP..."
       webrtcViewModel.stopSession()
+    } else if webrtcViewModel.isActive {
+      helpStatusMessage = "Switching video observation into back office audio..."
+      webrtcViewModel.stopSession()
     }
 
-    await webrtcViewModel.startSession(captureMode: streamingMode)
+    await webrtcViewModel.startSession(captureMode: streamingMode, roomMode: .support)
     if let roomCode = await waitForRoomCode() {
       await syncLiveRoomState(roomCode: roomCode)
     } else if activeExecutionSession == nil {
@@ -4398,6 +6009,49 @@ class StreamSessionViewModel: ObservableObject {
       setOperationsSyncWarning(
         phase: "session_patch",
         message: "Live room did not publish a room code yet. Verify signal settings and session sync before expecting admin join."
+      )
+    }
+  }
+
+  private func ensureObservationLiveRoomSession() async {
+    guard isSopAuditRunning, !hasActiveHelpEscalation else { return }
+    guard WebRTCConfig.isConfigured else {
+      setOperationsSyncWarning(
+        phase: "live_room",
+        message: "Video observation room is unavailable because signal settings are not configured."
+      )
+      return
+    }
+
+    if webrtcViewModel.isActive {
+      if !webrtcViewModel.isSupportMode {
+        if !webrtcViewModel.roomCode.isEmpty {
+          await syncLiveRoomState(roomCode: webrtcViewModel.roomCode)
+        }
+        return
+      }
+      webrtcViewModel.stopSession()
+    }
+
+    helpStatusMessage = "Opening admin video observation..."
+    await webrtcViewModel.startSession(captureMode: streamingMode, roomMode: .observation)
+    if let roomCode = await waitForRoomCode(timeoutNanoseconds: 4_000_000_000) {
+      await syncLiveRoomState(roomCode: roomCode)
+      await WorkerTelemetry.shared.record(
+        "webrtc_observation_room_ready",
+        source: "webrtc",
+        stage: "observation",
+        sessionID: currentSopSessionId,
+        payload: [
+          "room_code_present": true,
+          "capture_mode": captureModeEventValue(streamingMode)
+        ]
+      )
+    } else {
+      helpStatusMessage = "Admin video observation is still syncing."
+      setOperationsSyncWarning(
+        phase: "live_room",
+        message: "Observation room did not publish a room code yet. Admin can still use frame fallback while signaling catches up."
       )
     }
   }
@@ -4526,5 +6180,23 @@ class StreamSessionViewModel: ObservableObject {
     dossierPipelineStatusMessage = message
     dossierPipelineStatusKind = kind
     dossierPipelineStatusTimestamp = Self.pipelineTimestampFormatter.string(from: Date())
+  }
+}
+
+private extension UIImage {
+  func resizedForLivePreview(maxDimension: CGFloat) -> UIImage {
+    let width = size.width
+    let height = size.height
+    guard width > 0, height > 0, maxDimension > 0 else { return self }
+
+    let longest = max(width, height)
+    guard longest > maxDimension else { return self }
+
+    let scale = maxDimension / longest
+    let targetSize = CGSize(width: width * scale, height: height * scale)
+    let renderer = UIGraphicsImageRenderer(size: targetSize)
+    return renderer.image { _ in
+      self.draw(in: CGRect(origin: .zero, size: targetSize))
+    }
   }
 }

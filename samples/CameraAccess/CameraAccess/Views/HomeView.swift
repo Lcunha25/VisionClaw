@@ -15,18 +15,27 @@ struct HomeView: View {
   @State private var activeSheet: WorkerHomeSheet?
 
   var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 14) {
-        header
-        statusStrip
-        assignmentPanel
-        cameraPanel
-        notices
+    GeometryReader { geometry in
+      ZStack {
+        cameraBackdrop
+
+        VStack(alignment: .leading, spacing: 0) {
+          header
+            .padding(.top, geometry.safeAreaInsets.top + 10)
+
+          Spacer(minLength: 16)
+
+          VStack(alignment: .leading, spacing: 12) {
+            sopQueuePanel(maxHeight: min(geometry.size.height * 0.46, 390))
+            notices
+          }
+          .padding(.bottom, geometry.safeAreaInsets.bottom + 12)
+        }
+        .padding(.horizontal, 16)
       }
-      .padding(16)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    .background(DesignSystem.colors.adminBackground.ignoresSafeArea())
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(DesignSystem.colors.deepNavy.ignoresSafeArea())
     .toolbar(.hidden, for: .navigationBar)
     .sheet(item: $activeSheet) { sheet in
       switch sheet {
@@ -57,8 +66,45 @@ struct HomeView: View {
     }
   }
 
+  @ViewBuilder
+  private var cameraBackdrop: some View {
+    ZStack {
+      if viewModel.streamingMode == .iPhone,
+         let previewSession = viewModel.iPhonePreviewSession {
+        IPhoneCameraPreviewSurface(session: previewSession)
+          .ignoresSafeArea()
+      } else if let frame = viewModel.currentVideoFrame {
+        Image(uiImage: frame)
+          .resizable()
+          .aspectRatio(contentMode: .fill)
+          .ignoresSafeArea()
+      } else {
+        VStack(spacing: 12) {
+          ProgressView()
+            .tint(DesignSystem.colors.vibrantTeal)
+          Text("OPENING CAMERA")
+            .font(DesignSystem.fonts.mono(size: 12, weight: .semibold))
+            .foregroundColor(DesignSystem.colors.blueGrey)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(DesignSystem.colors.deepNavy)
+      }
+
+      LinearGradient(
+        colors: [
+          .black.opacity(0.58),
+          .black.opacity(0.12),
+          .black.opacity(0.72)
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+    }
+  }
+
   private var header: some View {
-    HStack(alignment: .center, spacing: 12) {
+    HStack(alignment: .top, spacing: 12) {
       VStack(alignment: .leading, spacing: 6) {
         Text("EMBARCADERO")
           .font(DesignSystem.fonts.mono(size: 11, weight: .semibold))
@@ -70,13 +116,15 @@ struct HomeView: View {
 
         Text(viewModel.workerDisplayName)
           .font(DesignSystem.fonts.body(size: 28, weight: .semibold))
-          .foregroundColor(DesignSystem.colors.adminInk)
+          .foregroundColor(DesignSystem.colors.white)
           .lineLimit(1)
           .minimumScaleFactor(0.72)
 
-        Text(viewModel.workerRoleText)
+        Text("\(viewModel.activePackageTitle) · \(viewModel.currentPackageProgressText)")
           .font(DesignSystem.fonts.mono(size: 12, weight: .semibold))
-          .foregroundColor(DesignSystem.colors.adminMuted)
+          .foregroundColor(DesignSystem.colors.white.opacity(0.76))
+          .lineLimit(2)
+          .minimumScaleFactor(0.72)
       }
 
       Spacer(minLength: 12)
@@ -99,77 +147,48 @@ struct HomeView: View {
     }
   }
 
-  private var statusStrip: some View {
-    HStack(spacing: 8) {
-      statusPill(title: viewModel.pendingShiftLabel, color: DesignSystem.colors.adminMuted)
-      statusPill(title: viewModel.assignmentQueueSummary, color: DesignSystem.colors.brandOrange)
-    }
-  }
-
-  private var assignmentPanel: some View {
+  private func sopQueuePanel(maxHeight: CGFloat) -> some View {
     VStack(alignment: .leading, spacing: 14) {
       HStack(spacing: 8) {
-        Text("CURRENT ASSIGNMENT")
+        Text("PENDING SOPS")
           .font(DesignSystem.fonts.mono(size: 12, weight: .semibold))
           .foregroundColor(DesignSystem.colors.brandOrange)
         Spacer()
-        Text(viewModel.currentPackageProgressText)
-          .font(DesignSystem.fonts.mono(size: 11, weight: .semibold))
-          .foregroundColor(DesignSystem.colors.adminMuted)
-          .lineLimit(1)
-          .minimumScaleFactor(0.75)
+        statusPill(title: viewModel.assignmentQueueSummary, color: DesignSystem.colors.brandOrange)
       }
 
-      if let sop = viewModel.currentAssignedSOP {
-        VStack(alignment: .leading, spacing: 10) {
-          Text(sop.name)
-            .font(DesignSystem.fonts.body(size: 30, weight: .semibold))
-            .foregroundColor(DesignSystem.colors.adminInk)
-            .lineLimit(3)
-            .minimumScaleFactor(0.72)
+      HStack(spacing: 8) {
+        statusPill(title: viewModel.pendingShiftLabel, color: DesignSystem.colors.adminMuted)
+        statusPill(title: viewModel.selectedCaptureModeLabel, color: DesignSystem.colors.successGreen)
+      }
 
-          Text(viewModel.currentAssignmentSubtitle)
+      cameraSelector
+
+      if viewModel.pendingTaskSOPs.isEmpty {
+        VStack(alignment: .leading, spacing: 10) {
+          Text("No more SOPs pending")
+            .font(DesignSystem.fonts.body(size: 24, weight: .semibold))
+            .foregroundColor(DesignSystem.colors.adminInk)
+
+          Text("This package queue is complete. Refresh assignments when the next package is ready.")
             .font(DesignSystem.fonts.body(size: 15, weight: .medium))
             .foregroundColor(DesignSystem.colors.adminMuted)
-            .lineLimit(2)
-
-          HStack(spacing: 8) {
-            assignmentMetric("\(sop.steps.count)", "steps")
-            assignmentMetric(sop.validationSummary, "check")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 10)
+      } else {
+        ScrollView(showsIndicators: true) {
+          VStack(spacing: 8) {
+            ForEach(Array(viewModel.pendingTaskSOPs.enumerated()), id: \.element.id) { index, sop in
+              sopQueueRow(sop, isNext: index == 0)
+            }
           }
         }
-      } else {
-        VStack(alignment: .leading, spacing: 8) {
-          Text("No active SOP")
-            .font(DesignSystem.fonts.body(size: 28, weight: .semibold))
-            .foregroundColor(DesignSystem.colors.adminInk)
-
-          Text("Sync assignments or set the worker login in Settings.")
-            .font(DesignSystem.fonts.body(size: 15))
-            .foregroundColor(DesignSystem.colors.adminMuted)
-        }
+        .frame(maxHeight: maxHeight)
       }
-
-      Button {
-        viewModel.startCurrentAssignmentFromHome()
-      } label: {
-        HStack(spacing: 10) {
-          Image(systemName: "camera.fill")
-            .font(.system(size: 16, weight: .semibold))
-          Text(viewModel.currentAssignedSOP == nil ? "NO ASSIGNMENT" : "START CAMERA")
-            .font(DesignSystem.fonts.mono(size: 14, weight: .semibold))
-        }
-        .foregroundColor(DesignSystem.colors.white)
-        .frame(maxWidth: .infinity)
-        .frame(height: 54)
-        .background(viewModel.currentAssignedSOP == nil ? DesignSystem.colors.adminSubtle : DesignSystem.colors.adminInk)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-      }
-      .buttonStyle(.plain)
-      .disabled(viewModel.currentAssignedSOP == nil || viewModel.isSyncingOperations)
     }
     .padding(16)
-    .background(DesignSystem.colors.adminSurface)
+    .background(DesignSystem.colors.adminSurface.opacity(0.96))
     .overlay(
       RoundedRectangle(cornerRadius: 8)
         .stroke(DesignSystem.colors.adminStroke, lineWidth: 1)
@@ -178,65 +197,116 @@ struct HomeView: View {
     .shadow(color: .black.opacity(0.05), radius: 18, x: 0, y: 10)
   }
 
-  private var cameraPanel: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      HStack(spacing: 10) {
-        Image(systemName: viewModel.hasActiveDevice ? "eyeglasses" : "iphone")
-          .font(.system(size: 18, weight: .semibold))
-          .foregroundColor(viewModel.hasActiveDevice ? DesignSystem.colors.successGreen : DesignSystem.colors.brandOrange)
-          .frame(width: 34, height: 34)
-          .background(DesignSystem.colors.adminBackground)
-          .clipShape(RoundedRectangle(cornerRadius: 8))
-
-        VStack(alignment: .leading, spacing: 3) {
-          Text(viewModel.cameraReadinessLabel)
-            .font(DesignSystem.fonts.body(size: 16, weight: .semibold))
-            .foregroundColor(DesignSystem.colors.adminInk)
-          Text(viewModel.cameraReadinessDetail)
-            .font(DesignSystem.fonts.body(size: 13))
-            .foregroundColor(DesignSystem.colors.adminMuted)
-        }
-
-        Spacer()
-
-        Text("AUTO")
-          .font(DesignSystem.fonts.mono(size: 11, weight: .semibold))
-          .foregroundColor(DesignSystem.colors.brandOrange)
-          .padding(.horizontal, 8)
-          .padding(.vertical, 5)
-          .background(DesignSystem.colors.brandOrange.opacity(0.12))
-          .clipShape(RoundedRectangle(cornerRadius: 8))
-      }
-
-      if !viewModel.hasActiveDevice {
-        Button {
-          wearablesViewModel.connectGlasses()
-        } label: {
-          HStack(spacing: 8) {
-            Image(systemName: "eyeglasses")
-            Text(wearablesViewModel.registrationState == .registering ? "CONNECTING GLASSES" : "CONNECT GLASSES")
-          }
-          .font(DesignSystem.fonts.mono(size: 12, weight: .semibold))
-          .foregroundColor(DesignSystem.colors.adminInk)
-          .frame(maxWidth: .infinity)
-          .frame(height: 42)
-          .background(DesignSystem.colors.adminBackground)
-          .overlay(
-            RoundedRectangle(cornerRadius: 8)
-              .stroke(DesignSystem.colors.adminStroke, lineWidth: 1)
-          )
-        }
-        .buttonStyle(.plain)
-        .disabled(wearablesViewModel.registrationState == .registering)
-      }
+  private var cameraSelector: some View {
+    HStack(spacing: 8) {
+      cameraModeButton(
+        title: "iPhone Camera",
+        systemName: "iphone",
+        mode: .iPhone,
+        enabled: true
+      )
+      cameraModeButton(
+        title: viewModel.hasActiveDevice ? "Glasses Camera" : "Glasses Unavailable",
+        systemName: "eyeglasses",
+        mode: .glasses,
+        enabled: viewModel.hasActiveDevice
+      )
     }
-    .padding(14)
-    .background(DesignSystem.colors.adminSurface)
-    .overlay(
-      RoundedRectangle(cornerRadius: 8)
-        .stroke(DesignSystem.colors.adminStroke, lineWidth: 1)
-    )
-    .clipShape(RoundedRectangle(cornerRadius: 8))
+  }
+
+  private func cameraModeButton(
+    title: String,
+    systemName: String,
+    mode: StreamingMode,
+    enabled: Bool
+  ) -> some View {
+    let selected = viewModel.preferredCaptureMode == mode
+    return Button {
+      viewModel.selectCaptureModeFromUI(mode)
+    } label: {
+      HStack(spacing: 6) {
+        Image(systemName: systemName)
+          .font(.system(size: 11, weight: .semibold))
+        Text(title)
+          .font(DesignSystem.fonts.mono(size: 10, weight: .semibold))
+          .lineLimit(1)
+          .minimumScaleFactor(0.72)
+      }
+      .foregroundColor(selected ? DesignSystem.colors.white : DesignSystem.colors.adminInk)
+      .padding(.horizontal, 9)
+      .frame(maxWidth: .infinity)
+      .frame(height: 34)
+      .background(selected ? DesignSystem.colors.adminInk : DesignSystem.colors.adminBackground)
+      .overlay(
+        RoundedRectangle(cornerRadius: 8)
+          .stroke(selected ? DesignSystem.colors.successGreen : DesignSystem.colors.adminStroke, lineWidth: 1)
+      )
+      .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+    .buttonStyle(.plain)
+    .disabled(!enabled || !viewModel.canSwitchCaptureMode)
+    .opacity((enabled && viewModel.canSwitchCaptureMode) ? 1 : 0.5)
+  }
+
+  private func sopQueueRow(_ sop: SOPTemplate, isNext: Bool) -> some View {
+    Button {
+      viewModel.presentCapture(for: sop)
+    } label: {
+      HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 6) {
+          HStack(spacing: 8) {
+            if isNext {
+              Text("NEXT")
+                .font(DesignSystem.fonts.mono(size: 10, weight: .semibold))
+                .foregroundColor(DesignSystem.colors.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(DesignSystem.colors.successGreen)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+
+            Text(sop.packageTitle ?? viewModel.activePackageTitle)
+              .font(DesignSystem.fonts.mono(size: 10, weight: .semibold))
+              .foregroundColor(DesignSystem.colors.adminMuted)
+              .lineLimit(1)
+          }
+
+          Text(sop.name)
+            .font(DesignSystem.fonts.body(size: 17, weight: .semibold))
+            .foregroundColor(DesignSystem.colors.adminInk)
+            .lineLimit(2)
+            .minimumScaleFactor(0.78)
+
+          Text("\(sop.steps.count) steps · \(sop.validationSummary)")
+            .font(DesignSystem.fonts.body(size: 12, weight: .medium))
+            .foregroundColor(DesignSystem.colors.adminMuted)
+            .lineLimit(1)
+        }
+
+        Spacer(minLength: 8)
+
+        HStack(spacing: 6) {
+          Image(systemName: "play.fill")
+            .font(.system(size: 11, weight: .bold))
+          Text("START")
+            .font(DesignSystem.fonts.mono(size: 11, weight: .semibold))
+        }
+        .foregroundColor(DesignSystem.colors.white)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(DesignSystem.colors.adminInk)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+      }
+      .padding(12)
+      .background(isNext ? DesignSystem.colors.successGreen.opacity(0.08) : DesignSystem.colors.adminBackground)
+      .overlay(
+        RoundedRectangle(cornerRadius: 8)
+          .stroke(isNext ? DesignSystem.colors.successGreen.opacity(0.5) : DesignSystem.colors.adminStroke, lineWidth: 1)
+      )
+      .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+    .buttonStyle(.plain)
+    .disabled(viewModel.isSyncingOperations)
   }
 
   @ViewBuilder

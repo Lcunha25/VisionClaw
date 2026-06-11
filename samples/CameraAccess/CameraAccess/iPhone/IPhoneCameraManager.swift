@@ -1,17 +1,24 @@
 import AVFoundation
 import UIKit
 
+private struct SendablePixelBuffer: @unchecked Sendable {
+  let pixelBuffer: CVPixelBuffer
+}
+
 class IPhoneCameraManager: NSObject, @unchecked Sendable {
   private let captureSession = AVCaptureSession()
   private let videoOutput = AVCaptureVideoDataOutput()
   private let movieOutput = AVCaptureMovieFileOutput()
   private let sessionQueue = DispatchQueue(label: "iphone-camera-session")
+  private let analysisQueue = DispatchQueue(label: "iphone-camera-analysis", qos: .userInitiated)
   private let context = CIContext()
   private var isRunning = false
   private var isConfigured = false
+  private var isAudioInputConfigured = false
   private var recordingCompletion: ((URL?) -> Void)?
   private var currentRecordingURL: URL?
   private var lastAnalysisEmissionAt: CFTimeInterval = 0
+  private var isAnalysisConversionInFlight = false
   private var sampleFrameCount: Int64 = 0
   private var analysisFrameCount: Int64 = 0
   private var statsWindowStart = CACurrentMediaTime()
@@ -32,6 +39,7 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
       self?.analysisFrameCount = 0
       self?.statsWindowStart = CACurrentMediaTime()
       self?.lastAnalysisEmissionAt = 0
+      self?.isAnalysisConversionInFlight = false
       self?.hasDeliveredFirstPreviewFrame = false
       self?.configureSession()
       self?.captureSession.startRunning()
@@ -167,7 +175,9 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
        let audioInput = try? AVCaptureDeviceInput(device: microphone),
        captureSession.canAddInput(audioInput) {
       captureSession.addInput(audioInput)
+      isAudioInputConfigured = true
     } else {
+      isAudioInputConfigured = false
       NSLog("[iPhoneCamera] Microphone input unavailable for recording")
     }
 
@@ -203,6 +213,30 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
     captureSession.commitConfiguration()
     isConfigured = true
     NSLog("[iPhoneCamera] Session configured successfully")
+  }
+
+  func waitUntilRunningAndAudioConfigured(timeout: TimeInterval) async -> Bool {
+    let deadline = CACurrentMediaTime() + max(0, timeout)
+    while !Task.isCancelled {
+      let ready = await withCheckedContinuation { continuation in
+        sessionQueue.async { [weak self] in
+          guard let self else {
+            continuation.resume(returning: false)
+            return
+          }
+          continuation.resume(
+            returning: self.isConfigured &&
+              self.isRunning &&
+              self.captureSession.isRunning &&
+              self.isAudioInputConfigured
+          )
+        }
+      }
+      if ready { return true }
+      if CACurrentMediaTime() >= deadline { return false }
+      try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+    return false
   }
 
   static func requestPermission() async -> Bool {
@@ -243,11 +277,26 @@ extension IPhoneCameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     let now = CACurrentMediaTime()
     guard now - lastAnalysisEmissionAt >= analysisFrameInterval else { return }
+    guard !isAnalysisConversionInFlight else { return }
     lastAnalysisEmissionAt = now
+    isAnalysisConversionInFlight = true
 
-    guard let image = makeUIImage(from: sampleBuffer, maxDimension: analysisMaxDimension) else { return }
+    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+      isAnalysisConversionInFlight = false
+      return
+    }
     analysisFrameCount += 1
-    onFrameCaptured?(image)
+    let frameHandler = onFrameCaptured
+    let maxDimension = analysisMaxDimension
+    let analysisPixelBuffer = SendablePixelBuffer(pixelBuffer: pixelBuffer)
+    analysisQueue.async { [weak self] in
+      let image = self?.makeUIImage(from: analysisPixelBuffer.pixelBuffer, maxDimension: maxDimension)
+      self?.sessionQueue.async { [weak self] in
+        self?.isAnalysisConversionInFlight = false
+      }
+      guard let image else { return }
+      frameHandler?(image)
+    }
   }
 }
 
@@ -313,9 +362,7 @@ extension IPhoneCameraManager: AVCaptureFileOutputRecordingDelegate {
 }
 
 extension IPhoneCameraManager {
-  fileprivate func makeUIImage(from sampleBuffer: CMSampleBuffer, maxDimension: CGFloat? = nil) -> UIImage? {
-    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
-
+  fileprivate func makeUIImage(from pixelBuffer: CVPixelBuffer, maxDimension: CGFloat? = nil) -> UIImage? {
     var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
     let extent = ciImage.extent
 

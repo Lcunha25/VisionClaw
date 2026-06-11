@@ -25,6 +25,12 @@ final class GeminiLiveSpotter {
     let evidenceTimestamp: String
     let threshold: Double
     let autoComplete: Bool
+    let advancedToStepIndex: Int?
+    let completedSop: Bool
+    let evidenceWindowSatisfied: Bool?
+    let activeDurationSatisfied: Bool?
+    let stableObservations: Int?
+    let stableObservationsRequired: Int?
   }
 
   func configure(api: WorkerAdminAPI?) {
@@ -34,7 +40,8 @@ final class GeminiLiveSpotter {
   func detectVisibleItemMatches(
     image: UIImage,
     items: [SpotterRequestItem],
-    sessionID: String?
+    sessionID: String?,
+    elapsedActiveMs: Int? = nil
   ) async throws -> [SpotterMatch] {
     guard !items.isEmpty else { return [] }
     guard let api, let sessionID, !sessionID.isEmpty else { return [] }
@@ -59,7 +66,8 @@ final class GeminiLiveSpotter {
           imageMimeType: imagePayload.mimeType,
           capturedAt: capturedAt,
           critical: item.critical,
-          allowAIComplete: item.validation.lowercased() == "visual"
+          allowAIComplete: item.validation.lowercased() == "visual",
+          elapsedActiveMs: elapsedActiveMs
         )
       )
 
@@ -71,7 +79,13 @@ final class GeminiLiveSpotter {
           reason: response.reason,
           evidenceTimestamp: response.evidenceTimestamp,
           threshold: response.threshold ?? (item.critical ? 0.94 : ((item.evidenceRequired || item.skipRisk == "high") ? 0.9 : 0.88)),
-          autoComplete: response.autoComplete
+          autoComplete: response.autoComplete,
+          advancedToStepIndex: response.advancedToStepIndex,
+          completedSop: response.completedSop ?? false,
+          evidenceWindowSatisfied: response.evidenceWindowSatisfied,
+          activeDurationSatisfied: response.activeDurationSatisfied,
+          stableObservations: response.stableObservations,
+          stableObservationsRequired: response.stableObservationsRequired
         )
       )
     }

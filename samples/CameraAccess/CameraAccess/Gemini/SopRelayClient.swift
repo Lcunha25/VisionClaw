@@ -1324,7 +1324,7 @@ private extension String {
 }
 
 protocol WorkerAdminAPI: AnyObject {
-  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws
+  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws -> WorkerLiveHeartbeatResponse
   func requestWorkerMediaUploadTarget(
     sessionID: String,
     assetType: String,
@@ -1341,7 +1341,7 @@ protocol WorkerAdminAPI: AnyObject {
   ) async throws
   func sendWorkerTelemetryBatch(_ batch: WorkerTelemetryBatch) async throws
   func requestGeminiLiveToken(
-    model: String,
+    model: String?,
     sessionID: String?
   ) async throws -> GeminiLiveTokenResponse
   func requestGeminiSpotter(_ request: GeminiSpotterRequest) async throws -> GeminiSpotterResponse
@@ -1373,6 +1373,65 @@ struct WorkerLiveHeartbeatRequest: Equatable {
       payload["lastFramePath"] = lastFramePath
     }
     return payload
+  }
+}
+
+struct WorkerLiveHeartbeatResponse: Decodable, Equatable {
+  let sessionID: String
+  let updatedAt: String?
+  let isFreshLiveSession: Bool
+  let webrtcRoomCode: String?
+  let supportMode: String
+  let aiSessionStatus: String
+  let humanSupportStatus: String
+  let supportUpdatedAt: String?
+  let shouldOpenLiveRoom: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case sessionID = "sessionId"
+    case updatedAt
+    case isFreshLiveSession
+    case webrtcRoomCode
+    case supportMode
+    case aiSessionStatus
+    case humanSupportStatus
+    case supportUpdatedAt
+    case shouldOpenLiveRoom
+  }
+
+  init(
+    sessionID: String,
+    updatedAt: String? = nil,
+    isFreshLiveSession: Bool = false,
+    webrtcRoomCode: String? = nil,
+    supportMode: String = "ai",
+    aiSessionStatus: String = "active",
+    humanSupportStatus: String = "none",
+    supportUpdatedAt: String? = nil,
+    shouldOpenLiveRoom: Bool = false
+  ) {
+    self.sessionID = sessionID
+    self.updatedAt = updatedAt
+    self.isFreshLiveSession = isFreshLiveSession
+    self.webrtcRoomCode = webrtcRoomCode
+    self.supportMode = supportMode
+    self.aiSessionStatus = aiSessionStatus
+    self.humanSupportStatus = humanSupportStatus
+    self.supportUpdatedAt = supportUpdatedAt
+    self.shouldOpenLiveRoom = shouldOpenLiveRoom
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    sessionID = try container.decode(String.self, forKey: .sessionID)
+    updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
+    isFreshLiveSession = try container.decodeIfPresent(Bool.self, forKey: .isFreshLiveSession) ?? false
+    webrtcRoomCode = try container.decodeIfPresent(String.self, forKey: .webrtcRoomCode)
+    supportMode = try container.decodeIfPresent(String.self, forKey: .supportMode) ?? "ai"
+    aiSessionStatus = try container.decodeIfPresent(String.self, forKey: .aiSessionStatus) ?? "active"
+    humanSupportStatus = try container.decodeIfPresent(String.self, forKey: .humanSupportStatus) ?? "none"
+    supportUpdatedAt = try container.decodeIfPresent(String.self, forKey: .supportUpdatedAt)
+    shouldOpenLiveRoom = try container.decodeIfPresent(Bool.self, forKey: .shouldOpenLiveRoom) ?? false
   }
 }
 
@@ -1463,6 +1522,23 @@ struct GeminiLiveTokenResponse: Decodable, Equatable {
   let model: String
   let websocketBaseURL: String
   let queryParameterName: String
+  let systemInstruction: String?
+  let runtimeContext: GeminiRuntimeContextEnvelope?
+  let diagnosticsID: String?
+  let provider: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case token
+    case expiresAt
+    case newSessionExpiresAt
+    case model
+    case websocketBaseURL
+    case queryParameterName
+    case systemInstruction
+    case runtimeContext
+    case diagnosticsID = "diagnosticsId"
+    case provider
+  }
 
   var credential: GeminiLiveCredential {
     GeminiLiveCredential(
@@ -1471,6 +1547,19 @@ struct GeminiLiveTokenResponse: Decodable, Equatable {
       websocketBaseURL: websocketBaseURL.isEmpty ? GeminiConfig.ephemeralTokenWebsocketBaseURL : websocketBaseURL,
       model: model.isEmpty ? GeminiConfig.model : model
     )
+  }
+}
+
+struct GeminiRuntimeContextEnvelope: Decodable, Equatable {
+  let rawSummary: String
+
+  init(from decoder: Decoder) throws {
+    if let container = try? decoder.singleValueContainer(),
+       container.decodeNil() {
+      rawSummary = ""
+      return
+    }
+    rawSummary = "runtime-context"
   }
 }
 
@@ -1489,9 +1578,10 @@ struct GeminiSpotterRequest: Equatable {
   let capturedAt: String
   let critical: Bool
   let allowAIComplete: Bool
+  let elapsedActiveMs: Int?
 
   var payload: [String: Any] {
-    [
+    var payload: [String: Any] = [
       "sessionId": sessionID,
       "stepId": stepID,
       "stepTitle": stepTitle,
@@ -1507,6 +1597,10 @@ struct GeminiSpotterRequest: Equatable {
       "critical": critical,
       "allowAIComplete": allowAIComplete
     ]
+    if let elapsedActiveMs {
+      payload["elapsedActiveMs"] = elapsedActiveMs
+    }
+    return payload
   }
 }
 
@@ -1518,6 +1612,36 @@ struct GeminiSpotterResponse: Decodable, Equatable {
   let threshold: Double?
   let model: String?
   let autoComplete: Bool
+  let modelAutoComplete: Bool?
+  let evidenceWindowSatisfied: Bool?
+  let activeDurationSatisfied: Bool?
+  let elapsedActiveMs: Int?
+  let minActiveSeconds: Double?
+  let stableObservations: Int?
+  let stableObservationsRequired: Int?
+  let advancedToStepIndex: Int?
+  let completedSop: Bool?
+  let packageProgressWarning: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case matched
+    case confidence
+    case reason
+    case evidenceTimestamp
+    case threshold
+    case model
+    case autoComplete
+    case modelAutoComplete
+    case evidenceWindowSatisfied
+    case activeDurationSatisfied
+    case elapsedActiveMs
+    case minActiveSeconds
+    case stableObservations
+    case stableObservationsRequired
+    case advancedToStepIndex
+    case completedSop
+    case packageProgressWarning
+  }
 }
 
 struct BackendMemoryLink: Identifiable, Decodable, Equatable {
@@ -1649,7 +1773,7 @@ final class OpsAPIClient: WorkerAdminAPI {
       return liveToken
     }
 
-    let configuredToken = GeminiConfig.openClawBearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    let configuredToken = GeminiConfig.workerAPIBearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
     return configuredToken.isEmpty ? nil : configuredToken
   }
 
@@ -1866,12 +1990,20 @@ final class OpsAPIClient: WorkerAdminAPI {
     }
   }
 
-  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws {
-    _ = try await performWorkerRequest(
+  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws -> WorkerLiveHeartbeatResponse {
+    let data = try await performWorkerRequest(
       path: "/api/worker/live/heartbeat",
       method: "POST",
       payload: heartbeat.payload
     )
+
+    do {
+      return try decoder.decode(WorkerLiveHeartbeatResponse.self, from: data)
+    } catch {
+      let body = String(data: data, encoding: .utf8) ?? "<non-utf8 response>"
+      NSLog("[admin-ingest] Failed decoding /api/worker/live/heartbeat -> %@", body)
+      throw error
+    }
   }
 
   func requestWorkerMediaUploadTarget(
@@ -1924,13 +2056,16 @@ final class OpsAPIClient: WorkerAdminAPI {
   }
 
   func requestGeminiLiveToken(
-    model: String,
+    model: String? = nil,
     sessionID: String? = nil
   ) async throws -> GeminiLiveTokenResponse {
     var payload: [String: Any] = [
-      "model": model,
       "responseModalities": ["AUDIO"]
     ]
+    if let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !model.isEmpty {
+      payload["model"] = model
+    }
     if let sessionID, !sessionID.isEmpty {
       payload["sessionId"] = sessionID
     }
@@ -2135,69 +2270,5 @@ final class OpsAPIClient: WorkerAdminAPI {
     guard compact.count > 240 else { return compact }
     let endIndex = compact.index(compact.startIndex, offsetBy: 240)
     return "\(compact[..<endIndex])..."
-  }
-}
-
-// Backward-compatible shim for older Gemini/OpenClaw flows that still compile against the
-// legacy SOP relay surface. The worker execution flow now uses OpsAPIClient directly.
-final class SopRelayClient {
-  func postSopLog(
-    tailscaleIP: String,
-    sessionID: String,
-    stepName: String,
-    timestampISO8601: String,
-    imageBase64: String
-  ) {
-    NSLog("[legacy-sop-relay] SOP log ignored during ops-api migration")
-  }
-
-  func postHeartbeat(
-    tailscaleIP: String,
-    sessionID: String,
-    status: String
-  ) {
-    NSLog("[legacy-sop-relay] Heartbeat ignored during ops-api migration")
-  }
-
-  func postHeartbeatForReceipt(
-    tailscaleIP: String,
-    sessionID: String,
-    status: String
-  ) async -> String? {
-    "Legacy SOP relay disabled while ops-api migration is active."
-  }
-
-  func postHeartbeatForReceiptWithStatus(
-    tailscaleIP: String,
-    sessionID: String,
-    status: String
-  ) async -> (statusCode: Int?, message: String?) {
-    (200, "Legacy SOP relay disabled while ops-api migration is active.")
-  }
-
-  func postFinalPayloadForReceiptWithStatus(
-    tailscaleIP: String,
-    payload: [String: Any]
-  ) async -> (statusCode: Int?, message: String?) {
-    (200, "Legacy SOP relay disabled while ops-api migration is active.")
-  }
-
-  func postSopVideoForReceiptWithStatus(
-    tailscaleIP: String,
-    sessionID: String,
-    videoFileURL: URL
-  ) async -> (statusCode: Int?, message: String?) {
-    (200, "Video upload deferred until media upload flow is implemented.")
-  }
-
-  func postSopDossierForReceiptWithStatus(
-    tailscaleIP: String,
-    sessionID: String,
-    sopName: String,
-    metadataJSONString: String,
-    videoFileURL: URL,
-    proofImagesByTargetID: [String: Data]
-  ) async -> (statusCode: Int?, message: String?) {
-    (200, "Dossier upload deferred until media upload flow is implemented.")
   }
 }

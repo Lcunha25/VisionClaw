@@ -1,12 +1,23 @@
+import AVFoundation
 import Foundation
 import UIKit
 import WebRTC
+
+enum WebRTCRoomMode: String {
+  case observation
+  case support
+
+  var usesAudio: Bool {
+    self == .support
+  }
+}
 
 protocol WebRTCClientDelegate: AnyObject {
   func webRTCClient(_ client: WebRTCClient, didChangeConnectionState state: RTCIceConnectionState)
   func webRTCClient(_ client: WebRTCClient, didGenerateCandidate candidate: RTCIceCandidate)
   func webRTCClient(_ client: WebRTCClient, didReceiveRemoteVideoTrack track: RTCVideoTrack)
   func webRTCClient(_ client: WebRTCClient, didRemoveRemoteVideoTrack track: RTCVideoTrack)
+  func webRTCClient(_ client: WebRTCClient, didReceiveRemoteAudioTrack track: RTCAudioTrack)
   func webRTCClient(_ client: WebRTCClient, didUpdateSenderStats stats: WebRTCSenderStats)
 }
 
@@ -24,7 +35,11 @@ class WebRTCClient: NSObject {
   private var localAudioTrack: RTCAudioTrack?
   private var localVideoSender: RTCRtpSender?
   private(set) var remoteVideoTrack: RTCVideoTrack?
+  private(set) var remoteAudioTrack: RTCAudioTrack?
   private var receiveRemoteVideo = true
+  private var captureMode: StreamingMode = .glasses
+  private var roomMode: WebRTCRoomMode = .support
+  private var audioRouteLease: WorkerAudioRouteLease?
 
   override init() {
     RTCInitializeSSL()
@@ -40,10 +55,17 @@ class WebRTCClient: NSObject {
   func setup(
     iceServers: [RTCIceServer]? = nil,
     profile: WebRTCStreamProfile = WebRTCConfig.supportModeGlassesProfile,
-    receiveRemoteVideo: Bool = true
+    receiveRemoteVideo: Bool = true,
+    captureMode: StreamingMode = .glasses,
+    roomMode: WebRTCRoomMode = .support
   ) {
     streamProfile = profile
     self.receiveRemoteVideo = receiveRemoteVideo
+    self.captureMode = captureMode
+    self.roomMode = roomMode
+    if roomMode.usesAudio {
+      configureSupportAudioRoute(captureMode: captureMode)
+    }
     let config = RTCConfiguration()
     config.iceServers = iceServers ?? [RTCIceServer(urlStrings: WebRTCConfig.stunServers)]
     config.sdpSemantics = .unifiedPlan
@@ -82,6 +104,11 @@ class WebRTCClient: NSObject {
       applyVideoSenderParameters()
     }
 
+    guard roomMode.usesAudio else {
+      localAudioTrack = nil
+      return
+    }
+
     let audioConstraints = RTCMediaConstraints(
       mandatoryConstraints: nil,
       optionalConstraints: nil
@@ -91,6 +118,50 @@ class WebRTCClient: NSObject {
     localAudioTrack?.isEnabled = true
     if let localAudioTrack {
       peerConnection?.add(localAudioTrack, streamIds: ["stream0"])
+      Task {
+        await WorkerTelemetry.shared.record(
+          "webrtc_local_audio_track",
+          source: "webrtc",
+          stage: "sender",
+          payload: [
+            "enabled": localAudioTrack.isEnabled,
+            "track_id": localAudioTrack.trackId,
+            "room_mode": roomMode.rawValue
+          ]
+        )
+      }
+    }
+  }
+
+  @discardableResult
+  func configureSupportAudioRoute(captureMode: StreamingMode) -> String? {
+    guard roomMode.usesAudio else { return nil }
+    let previousLease = audioRouteLease
+    do {
+      let snapshot = try WorkerAudioRouteCoordinator.shared.acquire(
+        owner: .backOfficeWebRTC,
+        mode: captureMode,
+        reason: "webrtc_support_call",
+        forceSpeaker: SettingsManager.shared.speakerOutputEnabled,
+        preferredIOBufferDuration: 0.02
+      )
+      audioRouteLease = snapshot.lease
+      if let previousLease, previousLease != snapshot.lease {
+        Task {
+          await WorkerAudioRouteCoordinator.shared.release(lease: previousLease)
+        }
+      }
+      self.captureMode = captureMode
+
+      let rtcAudioSession = RTCAudioSession.sharedInstance()
+      rtcAudioSession.lockForConfiguration()
+      defer { rtcAudioSession.unlockForConfiguration() }
+      rtcAudioSession.useManualAudio = false
+      rtcAudioSession.isAudioEnabled = true
+      return snapshot.fallbackMessage
+    } catch {
+      NSLog("[WebRTC] Audio route setup failed: %@", error.localizedDescription)
+      return nil
     }
   }
 
@@ -145,9 +216,23 @@ class WebRTCClient: NSObject {
   // MARK: - SDP Negotiation
 
   func createOffer(completion: @escaping (RTCSessionDescription) -> Void) {
+    Task {
+      await WorkerTelemetry.shared.record(
+        "webrtc_offer_create",
+        source: "webrtc",
+        stage: "negotiation",
+        payload: [
+          "receive_audio": roomMode.usesAudio,
+          "receive_remote_video": receiveRemoteVideo,
+          "local_audio_enabled": localAudioTrack?.isEnabled ?? false,
+          "capture_mode": captureMode == .iPhone ? "iphone" : "glasses",
+          "room_mode": roomMode.rawValue
+        ]
+      )
+    }
     let constraints = RTCMediaConstraints(
       mandatoryConstraints: [
-        "OfferToReceiveAudio": "true",
+        "OfferToReceiveAudio": roomMode.usesAudio ? "true" : "false",
         "OfferToReceiveVideo": receiveRemoteVideo ? "true" : "false",
       ],
       optionalConstraints: nil
@@ -178,6 +263,17 @@ class WebRTCClient: NSObject {
   func muteAudio(_ mute: Bool) {
     localAudioTrack?.isEnabled = !mute
     NSLog("[WebRTC] Local mic %@", mute ? "muted" : "live")
+    Task {
+      await WorkerTelemetry.shared.record(
+        "webrtc_local_audio_mute",
+        source: "webrtc",
+        stage: mute ? "muted" : "live",
+        payload: [
+          "muted": mute,
+          "track_live": localAudioTrack != nil
+        ]
+      )
+    }
   }
 
   func close() {
@@ -185,8 +281,18 @@ class WebRTCClient: NSObject {
     localAudioTrack?.isEnabled = false
     localVideoSender = nil
     remoteVideoTrack = nil
+    remoteAudioTrack = nil
     peerConnection?.close()
     peerConnection = nil
+    let lease = audioRouteLease
+    audioRouteLease = nil
+    // Keep close() synchronous for the WebRTC state machine; the coordinator
+    // releases/deactivates the shared AVAudioSession off the caller thread.
+    if let lease {
+      Task {
+        await WorkerAudioRouteCoordinator.shared.release(lease: lease)
+      }
+    }
     NSLog("[WebRTC] Peer connection closed")
   }
 
@@ -244,6 +350,31 @@ extension WebRTCClient: RTCPeerConnectionDelegate {
     if let videoTrack = stream.videoTracks.first {
       remoteVideoTrack = videoTrack
       delegate?.webRTCClient(self, didReceiveRemoteVideoTrack: videoTrack)
+    }
+    if let audioTrack = stream.audioTracks.first {
+      audioTrack.isEnabled = true
+      remoteAudioTrack = audioTrack
+      delegate?.webRTCClient(self, didReceiveRemoteAudioTrack: audioTrack)
+    }
+  }
+
+  func peerConnection(
+    _ peerConnection: RTCPeerConnection,
+    didAdd receiver: RTCRtpReceiver,
+    streams: [RTCMediaStream]
+  ) {
+    guard let track = receiver.track else { return }
+    if let videoTrack = track as? RTCVideoTrack {
+      remoteVideoTrack = videoTrack
+      delegate?.webRTCClient(self, didReceiveRemoteVideoTrack: videoTrack)
+      NSLog("[WebRTC] Unified Plan remote video track received")
+      return
+    }
+    if let audioTrack = track as? RTCAudioTrack {
+      audioTrack.isEnabled = true
+      remoteAudioTrack = audioTrack
+      delegate?.webRTCClient(self, didReceiveRemoteAudioTrack: audioTrack)
+      NSLog("[WebRTC] Unified Plan remote audio track received")
     }
   }
 

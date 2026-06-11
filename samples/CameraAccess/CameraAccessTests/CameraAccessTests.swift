@@ -294,7 +294,7 @@ private struct WorkerAdminAPISnapshot {
   let uploadCalls: [(assetID: String, byteSize: Int, contentType: String)]
   let finalizeRequests: [WorkerMediaFinalizeRequest]
   let telemetryBatches: [WorkerTelemetryBatch]
-  let liveTokenRequests: [(model: String, sessionID: String?)]
+  let liveTokenRequests: [(model: String?, sessionID: String?)]
   let spotterRequests: [GeminiSpotterRequest]
 }
 
@@ -346,10 +346,10 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
   private var recordedUploadCalls: [(assetID: String, byteSize: Int, contentType: String)] = []
   private var recordedFinalizeRequests: [WorkerMediaFinalizeRequest] = []
   private var recordedTelemetryBatches: [WorkerTelemetryBatch] = []
-  private var recordedLiveTokenRequests: [(model: String, sessionID: String?)] = []
+  private var recordedLiveTokenRequests: [(model: String?, sessionID: String?)] = []
   private var recordedSpotterRequests: [GeminiSpotterRequest] = []
 
-  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws {
+  func sendWorkerLiveHeartbeat(_ heartbeat: WorkerLiveHeartbeatRequest) async throws -> WorkerLiveHeartbeatResponse {
     let queuedError = lock.withLock { () -> Error? in
       recordedHeartbeats.append(heartbeat)
       return heartbeatErrors.isEmpty ? nil : heartbeatErrors.removeFirst()
@@ -358,6 +358,17 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
     if let queuedError {
       throw queuedError
     }
+
+    return WorkerLiveHeartbeatResponse(
+      sessionID: heartbeat.sessionID,
+      updatedAt: "2026-05-30T18:31:00.000Z",
+      isFreshLiveSession: true,
+      webrtcRoomCode: heartbeat.webrtcRoomCode,
+      supportMode: heartbeat.helpRequested ? "handoff_requested" : "ai",
+      aiSessionStatus: heartbeat.helpRequested ? "paused" : "active",
+      humanSupportStatus: heartbeat.helpRequested ? "ringing" : "none",
+      shouldOpenLiveRoom: false
+    )
   }
 
   func requestWorkerMediaUploadTarget(
@@ -442,7 +453,7 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
   }
 
   func requestGeminiLiveToken(
-    model: String,
+    model: String?,
     sessionID: String?
   ) async throws -> GeminiLiveTokenResponse {
     let (queuedError, response) = lock.withLock { () -> (Error?, GeminiLiveTokenResponse) in
@@ -453,9 +464,13 @@ private final class WorkerAdminAPIMock: WorkerAdminAPI, @unchecked Sendable {
             token: "ephemeral-token",
             expiresAt: "2026-05-30T19:00:00.000Z",
             newSessionExpiresAt: "2026-05-30T18:31:00.000Z",
-            model: model,
+            model: model ?? GeminiConfig.model,
             websocketBaseURL: GeminiConfig.ephemeralTokenWebsocketBaseURL,
-            queryParameterName: "access_token"
+            queryParameterName: "access_token",
+            systemInstruction: "Server-built checklist instruction.",
+            runtimeContext: nil,
+            diagnosticsID: "test-diagnostics",
+            provider: "gemini"
           )
         : liveTokenResponses.removeFirst()
       return (queuedError, response)
@@ -939,7 +954,7 @@ final class AssignmentDrivenFlowTests: XCTestCase {
     try? Wearables.configure()
   }
 
-  func testHomeStartsFirstAssignedSopWithoutPicker() async throws {
+  func testExplicitHomeSelectionStartsFirstPendingSOP() async throws {
     let viewModel = StreamSessionViewModel(wearables: Wearables.shared)
     let secondAssignment = SOPTemplate(
       name: "Second assigned SOP",
@@ -963,7 +978,7 @@ final class AssignmentDrivenFlowTests: XCTestCase {
     XCTAssertEqual(viewModel.preferredCaptureMode, .iPhone)
   }
 
-  func testHomePrefersGlassesForNextAssignmentWhenAvailable() async throws {
+  func testExplicitHomeSelectionPrefersGlassesWhenAvailable() async throws {
     let viewModel = StreamSessionViewModel(wearables: Wearables.shared)
     viewModel.hasActiveDevice = true
     viewModel.availableSOPs = [
@@ -1043,15 +1058,15 @@ final class OpsAPIClientRoutingTests: XCTestCase {
     let settings = SettingsManager.shared
     let originalOpsBaseURL = settings.opsBaseURL
     let originalAdminBaseURL = settings.adminBaseURL
-    let originalBearerToken = settings.openClawBearerToken
+    let originalBearerToken = settings.workerAPIBearerToken
 
     settings.opsBaseURL = "https://ops.example.test"
     settings.adminBaseURL = "http://admin.example.test:3001"
-    settings.openClawBearerToken = "worker-bearer-token"
+    settings.workerAPIBearerToken = "worker-bearer-token"
     defer {
       settings.opsBaseURL = originalOpsBaseURL
       settings.adminBaseURL = originalAdminBaseURL
-      settings.openClawBearerToken = originalBearerToken
+      settings.workerAPIBearerToken = originalBearerToken
     }
 
     let lock = NSLock()
@@ -1066,7 +1081,10 @@ final class OpsAPIClientRoutingTests: XCTestCase {
       case "/health":
         body = Data(#"{"status":"ok","service":"ops"}"#.utf8)
       case "/api/worker/live/heartbeat":
-        body = Data("{}".utf8)
+        body = Data(
+          #"{"sessionId":"11111111-1111-1111-1111-111111111111","updatedAt":"2026-05-30T18:31:00.000Z","isFreshLiveSession":true,"webrtcRoomCode":"ROOM42","supportMode":"handoff_requested","aiSessionStatus":"paused","humanSupportStatus":"ringing","supportUpdatedAt":"2026-05-30T18:31:00.000Z","shouldOpenLiveRoom":false}"#
+            .utf8
+        )
       case "/api/worker/media/upload-target":
         body = Data(
           #"{"assetId":"video-asset-1","bucket":"execution-videos","path":"sessions/session-1/recording.mp4","uploadUrl":"https://upload.example/video-1"}"#
@@ -1143,7 +1161,8 @@ final class OpsAPIClientRoutingTests: XCTestCase {
         imageMimeType: "image/jpeg",
         capturedAt: "2026-05-30T18:31:00.000Z",
         critical: false,
-        allowAIComplete: true
+        allowAIComplete: true,
+        elapsedActiveMs: nil
       )
     )
 
@@ -1172,13 +1191,13 @@ final class OpsAPIClientRoutingTests: XCTestCase {
   func testWorkerRouteErrorsMentionAdminIngest() async throws {
     let settings = SettingsManager.shared
     let originalAdminBaseURL = settings.adminBaseURL
-    let originalBearerToken = settings.openClawBearerToken
+    let originalBearerToken = settings.workerAPIBearerToken
 
     settings.adminBaseURL = "http://admin.example.test:3001"
-    settings.openClawBearerToken = "worker-bearer-token"
+    settings.workerAPIBearerToken = "worker-bearer-token"
     defer {
       settings.adminBaseURL = originalAdminBaseURL
-      settings.openClawBearerToken = originalBearerToken
+      settings.workerAPIBearerToken = originalBearerToken
     }
 
     RequestCaptureURLProtocol.handler = { request in
@@ -1216,13 +1235,13 @@ final class OpsAPIClientRoutingTests: XCTestCase {
   func testTelemetryRouteUsesAdminBaseURL() async throws {
     let settings = SettingsManager.shared
     let originalAdminBaseURL = settings.adminBaseURL
-    let originalBearerToken = settings.openClawBearerToken
+    let originalBearerToken = settings.workerAPIBearerToken
 
     settings.adminBaseURL = "http://admin.example.test:3001"
-    settings.openClawBearerToken = "worker-bearer-token"
+    settings.workerAPIBearerToken = "worker-bearer-token"
     defer {
       settings.adminBaseURL = originalAdminBaseURL
-      settings.openClawBearerToken = originalBearerToken
+      settings.workerAPIBearerToken = originalBearerToken
     }
 
     let lock = NSLock()

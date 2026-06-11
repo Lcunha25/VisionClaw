@@ -1,37 +1,39 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 @MainActor
 class GeminiSessionViewModel: ObservableObject {
   @Published var isGeminiActive: Bool = false
+  @Published var isAudioReady: Bool = false
   @Published var connectionState: GeminiConnectionState = .disconnected
   @Published var isModelSpeaking: Bool = false
   @Published var errorMessage: String?
   @Published var userTranscript: String = ""
   @Published var aiTranscript: String = ""
-  @Published var toolCallStatus: ToolCallStatus = .idle
-  @Published var openClawConnectionState: OpenClawConnectionState = .notConfigured
+
+  private struct LiveSessionConfig {
+    let credential: GeminiLiveCredential
+    let systemInstruction: String
+    let diagnosticsID: String?
+    let provider: String?
+  }
 
   private let geminiService = GeminiLiveService()
-  private let sopRelayClient = SopRelayClient()
-  private let openClawBridge = OpenClawBridge()
-  private var toolCallRouter: ToolCallRouter?
   private let audioManager = AudioManager()
-  private let eventClient = OpenClawEventClient()
   private var lastVideoFrameTime: Date = .distantPast
   private var stateObservation: Task<Void, Never>?
-  private var heartbeatTask: Task<Void, Never>?
-  private var heartbeatTimeoutTask: Task<Void, Never>?
-  private var currentSopSessionId: String?
-  private var isSopSessionTerminated: Bool = true
-  private var isFinalizingSession: Bool = false
-  private var pendingSystemInstruction: String?
-  private var currentSessionInstruction: String?
   private weak var workerAdminAPI: WorkerAdminAPI?
   private var adminExecutionSessionID: String?
   private var currentLiveCredential: GeminiLiveCredential?
+  private var currentSessionInstruction: String?
+  private var lastDiagnosticsID: String?
+  private var isStoppingSession = false
 
   var streamingMode: StreamingMode = .glasses
+  var onInputCommand: ((String) -> Void)?
+  var onInputAudioChunk: ((Data) -> Void)?
+  var onOutputAudioChunk: ((Data) -> Void)?
 
   func configureWorkerAdminAPI(_ api: WorkerAdminAPI?, sessionID: String? = nil) {
     workerAdminAPI = api
@@ -39,76 +41,94 @@ class GeminiSessionViewModel: ObservableObject {
   }
 
   func startSession(systemInstruction: String? = nil) async {
-    pendingSystemInstruction = normalizedSystemInstruction(systemInstruction)
     guard !isGeminiActive else {
       await refreshSessionInstruction(systemInstruction)
       return
     }
+
     errorMessage = nil
     userTranscript = ""
     aiTranscript = ""
+    isStoppingSession = false
 
-    guard let credential = await resolveLiveCredential() else {
-      errorMessage = "Gemini Live token unavailable. Confirm the admin URL, worker bearer token, and server Gemini key."
+    guard let liveConfig = await resolveLiveSessionConfig(fallbackInstruction: systemInstruction) else {
+      errorMessage = "Gemini Live token unavailable. Check Admin AI Settings and the worker backend connection."
       return
     }
-    currentLiveCredential = credential
+    currentLiveCredential = liveConfig.credential
+    currentSessionInstruction = liveConfig.systemInstruction
+    lastDiagnosticsID = liveConfig.diagnosticsID
 
-    isGeminiActive = true
+    isAudioReady = false
     configureRealtimeCallbacks()
-
-    await openClawBridge.checkConnection()
-    openClawBridge.resetSession()
-    toolCallRouter = ToolCallRouter(bridge: openClawBridge)
     startStateObservation()
 
     do {
       try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
     } catch {
-      resetToIdle(receiptMessage: "Audio setup failed: \(error.localizedDescription)")
+      await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
       return
     }
 
-    let resolvedInstruction = resolvedSystemInstruction()
     let setupOk = await geminiService.connect(
-      systemInstruction: resolvedInstruction,
-      credential: credential
+      systemInstruction: liveConfig.systemInstruction,
+      credential: liveConfig.credential
     )
 
     if !setupOk {
-      let message: String
-      if case .error(let err) = geminiService.connectionState {
-        message = err
-      } else {
-        message = "Failed to connect to Gemini"
-      }
-      resetToIdle(receiptMessage: message)
+      let message = liveConnectionError(
+        fallback: "Failed to connect to Gemini",
+        diagnosticsID: liveConfig.diagnosticsID
+      )
+      await resetToIdle(message: message)
+      await recordTelemetry(
+        "gemini_live_connect_failed",
+        stage: "failed",
+        payload: [
+          "diagnostics_id": liveConfig.diagnosticsID ?? NSNull(),
+          "error": message
+        ]
+      )
       return
     }
 
     do {
       try audioManager.startCapture()
     } catch {
-      resetToIdle(receiptMessage: "Mic capture failed: \(error.localizedDescription)")
+      await resetToIdle(message: "Mic capture failed: \(error.localizedDescription)")
       return
     }
 
-    connectEventStreamIfNeeded()
-    currentSessionInstruction = resolvedInstruction
+    isGeminiActive = true
+    isAudioReady = true
+    await recordTelemetry(
+      "gemini_live_session_started",
+      stage: "ready",
+      payload: [
+        "model": liveConfig.credential.model,
+        "provider": liveConfig.provider ?? "gemini",
+        "diagnostics_id": liveConfig.diagnosticsID ?? NSNull()
+      ]
+    )
   }
 
-  func stopSession() {
-    finalizeSessionWithReceipt(status: "terminated")
+  func stopSession() async {
+    await resetToIdle(message: nil)
   }
 
   func refreshSessionInstruction(_ systemInstruction: String?) async {
-    pendingSystemInstruction = normalizedSystemInstruction(systemInstruction)
     guard isGeminiActive else { return }
+    guard let liveConfig = await resolveLiveSessionConfig(fallbackInstruction: systemInstruction) else {
+      await resetToIdle(message: "Gemini Live token refresh failed. Check Admin AI Settings and try again.")
+      return
+    }
 
-    let resolvedInstruction = resolvedSystemInstruction()
-    guard resolvedInstruction != currentSessionInstruction else { return }
+    guard liveConfig.systemInstruction != currentSessionInstruction ||
+      liveConfig.credential.model != currentLiveCredential?.model else {
+      return
+    }
 
-    await reconnectTransport(with: resolvedInstruction)
+    await reconnectTransport(with: liveConfig)
   }
 
   func sendVideoFrameIfThrottled(image: UIImage) {
@@ -120,189 +140,19 @@ class GeminiSessionViewModel: ObservableObject {
     geminiService.sendVideoFrame(image: image)
   }
 
-  private func handleSopLogToolCall(_ call: GeminiFunctionCall) {
-    let stepName = (call.args["step_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    guard !stepName.isEmpty else {
-      geminiService.sendToolResponse(buildToolResponse(
-        callId: call.id,
-        name: call.name,
-        result: .failure("Missing required argument: step_name")
-      ))
-      return
-    }
-
-    let sessionId: String
-    if let existing = currentSopSessionId {
-      sessionId = existing
-    } else {
-      let created = UUID().uuidString
-      currentSopSessionId = created
-      isSopSessionTerminated = false
-      sessionId = created
-    }
-
-    let imageBase64 = (call.args["frame_data"] as? String)?.isEmpty == false
-      ? (call.args["frame_data"] as? String ?? "")
-      : ((call.args["image_base64"] as? String)?.isEmpty == false
-      ? (call.args["image_base64"] as? String ?? "")
-      : (geminiService.lastVideoFrameBase64 ?? ""))
-
-    sopRelayClient.postSopLog(
-      tailscaleIP: GeminiConfig.openClawTailscaleIP,
-      sessionID: sessionId,
-      stepName: stepName,
-      timestampISO8601: ISO8601DateFormatter().string(from: Date()),
-      imageBase64: imageBase64
-    )
-
-    geminiService.sendToolResponse(buildToolResponse(
-      callId: call.id,
-      name: call.name,
-      result: .success("SOP step forwarded")
-    ))
-  }
-
-  private func connectEventStreamIfNeeded() {
-    eventClient.disconnect()
-    guard SettingsManager.shared.proactiveNotificationsEnabled else { return }
-
-    eventClient.onNotification = { [weak self] text in
-      guard let self else { return }
-      Task { @MainActor in
-        guard self.isGeminiActive, self.connectionState == .ready else { return }
-        self.geminiService.sendTextMessage(text)
-      }
-    }
-    eventClient.connect()
-  }
-
-  private func startSopHeartbeatSession() {
-    if currentSopSessionId != nil && !isSopSessionTerminated { return }
-
-    let sessionId = UUID().uuidString
-    currentSopSessionId = sessionId
-    isSopSessionTerminated = false
-
-    heartbeatTask?.cancel()
-    heartbeatTimeoutTask?.cancel()
-
-    heartbeatTask = Task { [weak self] in
-      guard let self else { return }
-
-      self.sopRelayClient.postHeartbeat(
-        tailscaleIP: GeminiConfig.openClawTailscaleIP,
-        sessionID: sessionId,
-        status: "active"
-      )
-
-      while !Task.isCancelled && !self.isSopSessionTerminated {
-        self.sopRelayClient.postHeartbeat(
-          tailscaleIP: GeminiConfig.openClawTailscaleIP,
-          sessionID: sessionId,
-          status: "active"
-        )
-        try? await Task.sleep(nanoseconds: 3_000_000_000)
-      }
-    }
-
-    heartbeatTimeoutTask = Task { [weak self] in
-      try? await Task.sleep(nanoseconds: 60_000_000_000)
-      await MainActor.run {
-        self?.finalizeSessionWithReceipt(status: "terminated")
-      }
-    }
-  }
-
-  private func finalizeSessionWithReceipt(status: String) {
-    if isFinalizingSession { return }
-
-    guard let sessionId = currentSopSessionId, !isSopSessionTerminated else {
-      resetToIdle(receiptMessage: nil)
-      return
-    }
-
-    isFinalizingSession = true
-    isSopSessionTerminated = true
-    heartbeatTask?.cancel()
-    heartbeatTask = nil
-    heartbeatTimeoutTask?.cancel()
-    heartbeatTimeoutTask = nil
-
-    Task { [weak self] in
-      guard let self else { return }
-
-      let receiptMessage = await self.sopRelayClient.postHeartbeatForReceipt(
-        tailscaleIP: GeminiConfig.openClawTailscaleIP,
-        sessionID: sessionId,
-        status: status
-      )
-
-      await MainActor.run {
-        self.resetToIdle(receiptMessage: receiptMessage)
-      }
-    }
-  }
-
-  private func resetToIdle(receiptMessage: String?) {
-    eventClient.disconnect()
-    geminiService.onDisconnected = nil
-    geminiService.onSocketClosed = nil
-    geminiService.onSocketOpened = nil
-
-    toolCallRouter?.cancelAll()
-    toolCallRouter = nil
-    audioManager.stopCapture()
-    geminiService.disconnect()
-    stateObservation?.cancel()
-    stateObservation = nil
-    heartbeatTask?.cancel()
-    heartbeatTask = nil
-    heartbeatTimeoutTask?.cancel()
-    heartbeatTimeoutTask = nil
-
-    isGeminiActive = false
-    connectionState = .disconnected
-    isModelSpeaking = false
-    userTranscript = ""
-    aiTranscript = ""
-    toolCallStatus = .idle
-    errorMessage = normalizedReceiptMessage(receiptMessage)
-    currentSessionInstruction = nil
-
-    currentSopSessionId = nil
-    isSopSessionTerminated = true
-    isFinalizingSession = false
-  }
-
-  private func normalizedSystemInstruction(_ instruction: String?) -> String? {
-    let trimmed = instruction?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return trimmed.isEmpty ? nil : trimmed
-  }
-
-  private func resolvedSystemInstruction() -> String {
-    if let pendingSystemInstruction {
-      return pendingSystemInstruction
-    }
-
-    let configured = GeminiConfig.systemInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !configured.isEmpty {
-      return configured
-    }
-
-    return GeminiConfig.defaultSystemInstruction
-  }
-
   private func configureRealtimeCallbacks() {
     audioManager.onAudioCaptured = { [weak self] data in
       guard let self else { return }
       Task { @MainActor in
         let speakerOnPhone = self.streamingMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
         if speakerOnPhone && self.geminiService.isModelSpeaking { return }
+        self.onInputAudioChunk?(data)
         self.geminiService.sendAudio(data: data)
       }
     }
 
     geminiService.onAudioReceived = { [weak self] data in
+      self?.onOutputAudioChunk?(data)
       self?.audioManager.playAudio(data: data)
     }
 
@@ -322,6 +172,7 @@ class GeminiSessionViewModel: ObservableObject {
       Task { @MainActor in
         self.userTranscript += text
         self.aiTranscript = ""
+        self.onInputCommand?(self.userTranscript)
       }
     }
 
@@ -335,46 +186,16 @@ class GeminiSessionViewModel: ObservableObject {
     geminiService.onDisconnected = { [weak self] reason in
       guard let self else { return }
       Task { @MainActor in
-        guard self.isGeminiActive, !self.isFinalizingSession else { return }
-        self.resetToIdle(receiptMessage: "Connection lost: \(reason ?? "Unknown error")")
+        guard self.isGeminiActive, !self.isStoppingSession else { return }
+        await self.resetToIdle(message: "Gemini connection lost: \(reason ?? "Unknown error")")
       }
     }
 
-    geminiService.onSocketOpened = { [weak self] in
+    geminiService.onSocketClosed = { [weak self] reason in
       guard let self else { return }
       Task { @MainActor in
-        self.startSopHeartbeatSession()
-      }
-    }
-
-    geminiService.onSocketClosed = { [weak self] _ in
-      guard let self else { return }
-      Task { @MainActor in
-        guard self.isGeminiActive, !self.isFinalizingSession else { return }
-        self.finalizeSessionWithReceipt(status: "terminated")
-      }
-    }
-
-    geminiService.onToolCall = { [weak self] toolCall in
-      guard let self else { return }
-      Task { @MainActor in
-        for call in toolCall.functionCalls {
-          if call.name == "log_sop_step" {
-            self.handleSopLogToolCall(call)
-            continue
-          }
-
-          self.toolCallRouter?.handleToolCall(call) { [weak self] response in
-            self?.geminiService.sendToolResponse(response)
-          }
-        }
-      }
-    }
-
-    geminiService.onToolCallCancellation = { [weak self] cancellation in
-      guard let self else { return }
-      Task { @MainActor in
-        self.toolCallRouter?.cancelToolCalls(ids: cancellation.ids)
+        guard self.isGeminiActive, !self.isStoppingSession else { return }
+        await self.resetToIdle(message: "Gemini socket closed: \(reason ?? "Unknown error")")
       }
     }
   }
@@ -388,138 +209,199 @@ class GeminiSessionViewModel: ObservableObject {
         guard !Task.isCancelled else { break }
         self.connectionState = self.geminiService.connectionState
         self.isModelSpeaking = self.geminiService.isModelSpeaking
-        self.toolCallStatus = self.openClawBridge.lastToolCallStatus
-        self.openClawConnectionState = self.openClawBridge.connectionState
       }
     }
   }
 
-  private func reconnectTransport(with systemInstruction: String) async {
-    eventClient.disconnect()
-    audioManager.stopCapture()
-    geminiService.onDisconnected = nil
-    geminiService.onSocketClosed = nil
-    geminiService.onSocketOpened = nil
-    geminiService.disconnect()
+  private func reconnectTransport(with liveConfig: LiveSessionConfig) async {
+    let wasActive = isGeminiActive
+    isGeminiActive = false
+    isAudioReady = false
+    isStoppingSession = true
+    await audioManager.stopCapture()
+    await Task.yield()
+    clearGeminiCallbacks()
+    await geminiService.disconnectAndWaitForClose(timeout: 1.0)
     stateObservation?.cancel()
     stateObservation = nil
+    isStoppingSession = false
+
+    guard wasActive else { return }
+
     errorMessage = nil
     userTranscript = ""
     aiTranscript = ""
+    currentLiveCredential = liveConfig.credential
+    currentSessionInstruction = liveConfig.systemInstruction
+    lastDiagnosticsID = liveConfig.diagnosticsID
 
-    await openClawBridge.checkConnection()
-    if toolCallRouter == nil {
-      toolCallRouter = ToolCallRouter(bridge: openClawBridge)
-    }
     configureRealtimeCallbacks()
     startStateObservation()
 
     do {
       try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
     } catch {
-      resetToIdle(receiptMessage: "Audio setup failed: \(error.localizedDescription)")
+      await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
       return
     }
-
-    guard let credential = await resolveLiveCredential() else {
-      resetToIdle(receiptMessage: "Gemini Live token unavailable. Confirm the admin URL, worker bearer token, and server Gemini key.")
-      return
-    }
-    currentLiveCredential = credential
 
     let setupOk = await geminiService.connect(
-      systemInstruction: systemInstruction,
-      credential: credential
+      systemInstruction: liveConfig.systemInstruction,
+      credential: liveConfig.credential
     )
-    if !setupOk {
-      let message: String
-      if case .error(let err) = geminiService.connectionState {
-        message = err
-      } else {
-        message = "Failed to reconnect to Gemini"
-      }
-      resetToIdle(receiptMessage: message)
+    guard setupOk else {
+      await resetToIdle(message: liveConnectionError(
+        fallback: "Failed to reconnect to Gemini",
+        diagnosticsID: liveConfig.diagnosticsID
+      ))
       return
     }
 
     do {
       try audioManager.startCapture()
     } catch {
-      resetToIdle(receiptMessage: "Mic capture failed: \(error.localizedDescription)")
+      await resetToIdle(message: "Mic capture failed: \(error.localizedDescription)")
       return
     }
 
-    connectEventStreamIfNeeded()
-    currentSessionInstruction = systemInstruction
+    isGeminiActive = true
+    isAudioReady = true
   }
 
-  private func resolveLiveCredential() async -> GeminiLiveCredential? {
-    if let workerAdminAPI, GeminiConfig.isAdminConfigured {
-      do {
-        let token = try await workerAdminAPI.requestGeminiLiveToken(
-          model: GeminiConfig.model,
-          sessionID: adminExecutionSessionID
-        )
-        await WorkerTelemetry.shared.record(
-          "gemini_live_token_received",
-          source: "gemini_live",
-          stage: "ready",
-          payload: [
-            "model": token.model,
-            "expires_at": token.expiresAt
-          ]
-        )
-        return token.credential
-      } catch {
-        await WorkerTelemetry.shared.record(
-          "gemini_live_token_failed",
-          source: "gemini_live",
-          stage: "fallback",
-          payload: [
-            "error": error.localizedDescription,
-            "api_key_fallback_available": GeminiConfig.isConfigured
-          ]
-        )
-      }
-    }
-
-    if let fallback = GeminiLiveCredential.apiKey() {
-      await WorkerTelemetry.shared.record(
-        "gemini_live_token_fallback",
-        source: "gemini_live",
-        stage: "api_key",
-        payload: ["model": fallback.model]
+  private func resolveLiveSessionConfig(fallbackInstruction: String?) async -> LiveSessionConfig? {
+    guard let workerAdminAPI, GeminiConfig.isAdminConfigured else {
+      await recordTelemetry(
+        "gemini_live_token_failed",
+        stage: "not_configured",
+        payload: ["reason": "admin_api_unavailable"]
       )
-      return fallback
-    }
-
-    return nil
-  }
-
-  private func normalizedReceiptMessage(_ receiptMessage: String?) -> String? {
-    let trimmed = receiptMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    guard !trimmed.isEmpty else { return nil }
-    if trimmed.localizedCaseInsensitiveContains("legacy sop relay disabled") {
       return nil
     }
-    return trimmed
+
+    do {
+      let token = try await workerAdminAPI.requestGeminiLiveToken(
+        model: nil,
+        sessionID: adminExecutionSessionID
+      )
+      let instruction = resolvedInstruction(
+        serverInstruction: token.systemInstruction,
+        fallbackInstruction: fallbackInstruction
+      )
+      await recordTelemetry(
+        "gemini_live_token_received",
+        stage: "ready",
+        payload: [
+          "model": token.credential.model,
+          "provider": token.provider ?? "gemini",
+          "expires_at": token.expiresAt,
+          "diagnostics_id": token.diagnosticsID ?? NSNull()
+        ]
+      )
+      return LiveSessionConfig(
+        credential: token.credential,
+        systemInstruction: instruction,
+        diagnosticsID: token.diagnosticsID,
+        provider: token.provider
+      )
+    } catch {
+      let message = error.localizedDescription
+      await recordTelemetry(
+        "gemini_live_token_failed",
+        stage: "failed",
+        payload: ["error": message]
+      )
+      errorMessage = "Gemini token request failed: \(message)"
+      return nil
+    }
   }
 
-  private func buildToolResponse(
-    callId: String,
-    name: String,
-    result: ToolResult
-  ) -> [String: Any] {
-    return [
-      "toolResponse": [
-        "functionResponses": [
-          [
-            "id": callId,
-            "name": name,
-            "response": result.responseValue
-          ]
-        ]
-      ]
-    ]
+  private func normalizedSystemInstruction(_ instruction: String?) -> String? {
+    let trimmed = instruction?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private func resolvedInstruction(
+    serverInstruction: String?,
+    fallbackInstruction: String?
+  ) -> String {
+    let server = normalizedSystemInstruction(serverInstruction)
+    let fallback = normalizedSystemInstruction(fallbackInstruction)
+
+    switch (server, fallback) {
+    case let (server?, fallback?) where !server.contains(fallback):
+      return """
+      \(server)
+
+      Local active-step context from the phone UI:
+      \(fallback)
+      """
+    case let (server?, _):
+      return server
+    case let (nil, fallback?):
+      return fallback
+    default:
+      return GeminiConfig.defaultSystemInstruction
+    }
+  }
+
+  private func liveConnectionError(fallback: String, diagnosticsID: String?) -> String {
+    let base: String
+    if case .error(let err) = geminiService.connectionState {
+      base = err
+    } else {
+      base = fallback
+    }
+    if let diagnosticsID, !diagnosticsID.isEmpty {
+      return "\(base). Diagnostics: \(diagnosticsID)."
+    }
+    return base
+  }
+
+  private func resetToIdle(message: String?) async {
+    isStoppingSession = true
+    stateObservation?.cancel()
+    stateObservation = nil
+    // This is the Gemini-to-WebRTC hardware barrier: the engine graph and
+    // accumulator finish before the socket is allowed to close.
+    await audioManager.stopCapture()
+    await Task.yield()
+    audioManager.stopPlayback()
+    clearGeminiCallbacks()
+    await geminiService.disconnectAndWaitForClose(timeout: 1.0)
+
+    isGeminiActive = false
+    isAudioReady = false
+    connectionState = .disconnected
+    isModelSpeaking = false
+    userTranscript = ""
+    aiTranscript = ""
+    currentSessionInstruction = nil
+    currentLiveCredential = nil
+    errorMessage = normalizedSystemInstruction(message)
+    isStoppingSession = false
+  }
+
+  private func clearGeminiCallbacks() {
+    geminiService.onDisconnected = nil
+    geminiService.onSocketClosed = nil
+    geminiService.onSocketOpened = nil
+    geminiService.onAudioReceived = nil
+    geminiService.onInterrupted = nil
+    geminiService.onTurnComplete = nil
+    geminiService.onInputTranscription = nil
+    geminiService.onOutputTranscription = nil
+  }
+
+  private func recordTelemetry(
+    _ name: String,
+    stage: String,
+    payload: [String: Any] = [:]
+  ) async {
+    await WorkerTelemetry.shared.record(
+      name,
+      source: "gemini_live",
+      stage: stage,
+      payload: payload
+    )
   }
 }

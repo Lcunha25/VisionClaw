@@ -21,10 +21,16 @@ enum WebRTCConfig {
   ]
 
   static let supportModeGlassesProfile = WebRTCStreamProfile(
-    maxBitrateBps: 1_200_000,
-    maxFramerate: 15,
-    maxWidth: 1280,
-    maxHeight: 720
+    maxBitrateBps: 850_000,
+    maxFramerate: 12,
+    maxWidth: 960,
+    maxHeight: 540
+  )
+  static let supportModeGlassesFallbackProfile = WebRTCStreamProfile(
+    maxBitrateBps: 550_000,
+    maxFramerate: 10,
+    maxWidth: 640,
+    maxHeight: 360
   )
   static let supportModePhoneProfile = WebRTCStreamProfile(
     maxBitrateBps: 900_000,

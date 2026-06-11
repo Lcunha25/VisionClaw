@@ -21,8 +21,6 @@ class GeminiLiveService: ObservableObject {
   var onDisconnected: ((String?) -> Void)?
   var onInputTranscription: ((String) -> Void)?
   var onOutputTranscription: ((String) -> Void)?
-  var onToolCall: ((GeminiToolCall) -> Void)?
-  var onToolCallCancellation: ((GeminiToolCallCancellation) -> Void)?
   var onSocketOpened: (() -> Void)?
   var onSocketClosed: ((String?) -> Void)?
 
@@ -33,11 +31,12 @@ class GeminiLiveService: ObservableObject {
   private var webSocketTask: URLSessionWebSocketTask?
   private var receiveTask: Task<Void, Never>?
   private var connectContinuation: CheckedContinuation<Bool, Never>?
+  private var closeWaitContinuation: CheckedContinuation<Void, Never>?
   private let delegate = WebSocketDelegate()
   private var urlSession: URLSession!
   private let sendQueue = DispatchQueue(label: "gemini.send", qos: .userInitiated)
   private var latestVideoFrameBase64: String?
-  private var setupSystemInstruction: String = GeminiConfig.systemInstruction
+  private var setupSystemInstruction: String = GeminiConfig.defaultSystemInstruction
   private var setupModel: String = GeminiConfig.model
   private var videoFrameSendCount: Int64 = 0
   private var videoFrameStatsWindowStart = CACurrentMediaTime()
@@ -102,6 +101,7 @@ class GeminiLiveService: ObservableObject {
           self.resolveConnect(success: false)
           self.connectionState = .disconnected
           self.isModelSpeaking = false
+          self.resolveCloseWait()
           self.onSocketClosed?("Connection closed (code \(code.rawValue): \(reasonStr))")
           self.onDisconnected?("Connection closed (code \(code.rawValue): \(reasonStr))")
         }
@@ -122,6 +122,7 @@ class GeminiLiveService: ObservableObject {
           self.resolveConnect(success: false)
           self.connectionState = .error(msg)
           self.isModelSpeaking = false
+          self.resolveCloseWait()
           self.onSocketClosed?(msg)
           self.onDisconnected?(msg)
         }
@@ -153,8 +154,43 @@ class GeminiLiveService: ObservableObject {
     delegate.onOpen = nil
     delegate.onClose = nil
     delegate.onError = nil
-    onToolCall = nil
-    onToolCallCancellation = nil
+    onSocketOpened = nil
+    onSocketClosed = nil
+    connectionState = .disconnected
+    isModelSpeaking = false
+    resolveConnect(success: false)
+    resolveCloseWait()
+  }
+
+  func disconnectAndWaitForClose(timeout: TimeInterval = 1.0) async {
+    receiveTask?.cancel()
+    receiveTask = nil
+
+    guard let task = webSocketTask, connectionState != .disconnected else {
+      disconnect()
+      return
+    }
+
+    resolveCloseWait()
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      closeWaitContinuation = continuation
+      let boundedTimeout = DispatchTimeInterval.milliseconds(Int(max(timeout, 0.05) * 1_000))
+      DispatchQueue.main.asyncAfter(deadline: .now() + boundedTimeout) { [weak self] in
+        Task { @MainActor in
+          guard let self else { return }
+          if self.closeWaitContinuation != nil {
+            NSLog("[Gemini] WebSocket close wait timed out")
+          }
+          self.resolveCloseWait()
+        }
+      }
+      task.cancel(with: .normalClosure, reason: nil)
+    }
+
+    webSocketTask = nil
+    delegate.onOpen = nil
+    delegate.onClose = nil
+    delegate.onError = nil
     onSocketOpened = nil
     onSocketClosed = nil
     connectionState = .disconnected
@@ -207,14 +243,6 @@ class GeminiLiveService: ObservableObject {
         )
         self.latestVideoFrameBase64 = base64
         self.sendJSON(json)
-      }
-    }
-  }
-
-  func sendToolResponse(_ response: [String: Any]) {
-    sendQueue.async { [weak self] in
-      Task { @MainActor [weak self] in
-        self?.sendJSON(response)
       }
     }
   }
@@ -281,15 +309,16 @@ class GeminiLiveService: ObservableObject {
     }
   }
 
+  private func resolveCloseWait() {
+    guard let cont = closeWaitContinuation else { return }
+    closeWaitContinuation = nil
+    cont.resume()
+  }
+
   private func resolvedSystemInstruction(_ override: String?) -> String {
     let candidate = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if !candidate.isEmpty {
       return candidate
-    }
-
-    let configured = GeminiConfig.systemInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !configured.isEmpty {
-      return configured
     }
 
     return GeminiConfig.defaultSystemInstruction
@@ -308,11 +337,6 @@ class GeminiLiveService: ObservableObject {
         "systemInstruction": [
           "parts": [
             ["text": setupSystemInstruction]
-          ]
-        ],
-        "tools": [
-          [
-            "functionDeclarations": ToolDeclarations.allDeclarations()
           ]
         ],
         "realtimeInputConfig": [
@@ -350,6 +374,7 @@ class GeminiLiveService: ObservableObject {
         self.resolveConnect(success: false)
         self.connectionState = .error("WebSocket send failed: \(error.localizedDescription)")
         self.isModelSpeaking = false
+        self.resolveCloseWait()
         self.onSocketClosed?(error.localizedDescription)
         self.onDisconnected?(error.localizedDescription)
       }
@@ -380,6 +405,7 @@ class GeminiLiveService: ObservableObject {
               self.resolveConnect(success: false)
               self.connectionState = .disconnected
               self.isModelSpeaking = false
+              self.resolveCloseWait()
               self.onDisconnected?(reason)
             }
           }
@@ -404,6 +430,7 @@ class GeminiLiveService: ObservableObject {
       connectionState = .error(full)
       isModelSpeaking = false
       resolveConnect(success: false)
+      resolveCloseWait()
       onSocketClosed?(full)
       onDisconnected?(full)
       return
@@ -430,22 +457,9 @@ class GeminiLiveService: ObservableObject {
       let seconds = timeLeft?["seconds"] as? Int ?? 0
       connectionState = .disconnected
       isModelSpeaking = false
+      resolveCloseWait()
       onSocketClosed?("Server closing (time left: \(seconds)s)")
       onDisconnected?("Server closing (time left: \(seconds)s)")
-      return
-    }
-
-    // Tool call from model (top-level message, not inside serverContent)
-    if let toolCall = GeminiToolCall(json: json) {
-      NSLog("[Gemini] Tool call received: %d function(s)", toolCall.functionCalls.count)
-      onToolCall?(toolCall)
-      return
-    }
-
-    // Tool call cancellation (user interrupted during tool execution)
-    if let cancellation = GeminiToolCallCancellation(json: json) {
-      NSLog("[Gemini] Tool call cancellation: %@", cancellation.ids.joined(separator: ", "))
-      onToolCallCancellation?(cancellation)
       return
     }
 

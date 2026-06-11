@@ -18,27 +18,32 @@ final class SettingsManager {
   private enum Key: String {
     case deviceID
     case workerLoginCode
+    case workerLoginCodeMigratedFromFastFoodDefault
     case workerEmail
-    case geminiAPIKey
+    case workerAPIBearerToken
     case opsBaseURL
     case adminBaseURL
     case signalBaseURL
-    case openClawHost
-    case openClawPort
-    case openClawBearerToken
-    case openClawHookToken
-    case openClawGatewayToken
-    case geminiSystemPrompt
     case webrtcSignalingURL
     case speakerOutputEnabled
     case videoStreamingEnabled
+    case videoStreamingDefaultMigratedToOnDemand
     case proactiveNotificationsEnabled
-    case openClawTailscaleIP
   }
 
-  private init() {}
+  private init() {
+    migrateOnDemandVideoDefaultIfNeeded()
+  }
 
-  // MARK: - Gemini
+  private func migrateOnDemandVideoDefaultIfNeeded() {
+    guard !defaults.bool(forKey: Key.videoStreamingDefaultMigratedToOnDemand.rawValue) else { return }
+    if defaults.object(forKey: Key.videoStreamingEnabled.rawValue) != nil {
+      defaults.set(false, forKey: Key.videoStreamingEnabled.rawValue)
+    }
+    defaults.set(true, forKey: Key.videoStreamingDefaultMigratedToOnDemand.rawValue)
+  }
+
+  // MARK: - Worker
 
   var deviceID: String {
     get {
@@ -59,7 +64,22 @@ final class SettingsManager {
   }
 
   var workerLoginCode: String {
-    get { defaults.string(forKey: Key.workerLoginCode.rawValue) ?? Secrets.workerLoginCode }
+    get {
+      if let stored = defaults.string(forKey: Key.workerLoginCode.rawValue) {
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.caseInsensitiveCompare("EMBC-0001") == .orderedSame,
+           Secrets.workerLoginCode.caseInsensitiveCompare("EMBC-0001") != .orderedSame,
+           defaults.bool(forKey: Key.workerLoginCodeMigratedFromFastFoodDefault.rawValue) == false {
+          defaults.set(Secrets.workerLoginCode, forKey: Key.workerLoginCode.rawValue)
+          defaults.set(true, forKey: Key.workerLoginCodeMigratedFromFastFoodDefault.rawValue)
+          return Secrets.workerLoginCode
+        }
+
+        return stored
+      }
+
+      return Secrets.workerLoginCode
+    }
     set { defaults.set(newValue, forKey: Key.workerLoginCode.rawValue) }
   }
 
@@ -68,9 +88,27 @@ final class SettingsManager {
     set { defaults.set(newValue, forKey: Key.workerEmail.rawValue) }
   }
 
-  var geminiAPIKey: String {
-    get { secureString(for: .geminiAPIKey, fallback: Secrets.geminiAPIKey) }
-    set { setSecureString(newValue, for: .geminiAPIKey) }
+  var workerAPIBearerToken: String {
+    get {
+      let current = secureString(for: .workerAPIBearerToken, fallback: Secrets.workerAPIBearerToken)
+      if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return current
+      }
+      if let legacy = keychain.string(for: "openClawBearerToken"),
+         !legacy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        keychain.set(legacy, for: Key.workerAPIBearerToken.rawValue)
+        keychain.removeValue(for: "openClawBearerToken")
+        return legacy
+      }
+      if let legacy = defaults.string(forKey: "openClawBearerToken"),
+         !legacy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        keychain.set(legacy, for: Key.workerAPIBearerToken.rawValue)
+        defaults.removeObject(forKey: "openClawBearerToken")
+        return legacy
+      }
+      return current
+    }
+    set { setSecureString(newValue, for: .workerAPIBearerToken) }
   }
 
   var opsBaseURL: String {
@@ -110,46 +148,6 @@ final class SettingsManager {
     set { defaults.set(newValue, forKey: Key.signalBaseURL.rawValue) }
   }
 
-  var geminiSystemPrompt: String {
-    get { defaults.string(forKey: Key.geminiSystemPrompt.rawValue) ?? GeminiConfig.defaultSystemInstruction }
-    set { defaults.set(newValue, forKey: Key.geminiSystemPrompt.rawValue) }
-  }
-
-  // MARK: - OpenClaw
-
-  var openClawHost: String {
-    get { defaults.string(forKey: Key.openClawHost.rawValue) ?? Secrets.openClawHost }
-    set { defaults.set(newValue, forKey: Key.openClawHost.rawValue) }
-  }
-
-  var openClawPort: Int {
-    get {
-      let stored = defaults.integer(forKey: Key.openClawPort.rawValue)
-      return stored != 0 ? stored : Secrets.openClawPort
-    }
-    set { defaults.set(newValue, forKey: Key.openClawPort.rawValue) }
-  }
-
-  var openClawHookToken: String {
-    get { secureString(for: .openClawHookToken, fallback: Secrets.openClawHookToken) }
-    set { setSecureString(newValue, for: .openClawHookToken) }
-  }
-
-  var openClawGatewayToken: String {
-    get { secureString(for: .openClawGatewayToken, fallback: Secrets.openClawGatewayToken) }
-    set { setSecureString(newValue, for: .openClawGatewayToken) }
-  }
-
-  var openClawTailscaleIP: String {
-    get { defaults.string(forKey: Key.openClawTailscaleIP.rawValue) ?? Secrets.openClawTailscaleIP }
-    set { defaults.set(newValue, forKey: Key.openClawTailscaleIP.rawValue) }
-  }
-
-  var openClawBearerToken: String {
-    get { secureString(for: .openClawBearerToken, fallback: Secrets.openClawBearerToken) }
-    set { setSecureString(newValue, for: .openClawBearerToken) }
-  }
-
   // MARK: - WebRTC
 
   var webrtcSignalingURL: String {
@@ -171,7 +169,7 @@ final class SettingsManager {
   // MARK: - Video
 
   var videoStreamingEnabled: Bool {
-    get { defaults.object(forKey: Key.videoStreamingEnabled.rawValue) as? Bool ?? true }
+    get { defaults.object(forKey: Key.videoStreamingEnabled.rawValue) as? Bool ?? false }
     set { defaults.set(newValue, forKey: Key.videoStreamingEnabled.rawValue) }
   }
 
@@ -185,15 +183,28 @@ final class SettingsManager {
   // MARK: - Reset
 
   func resetAll() {
-    for key in [Key.geminiSystemPrompt, .workerLoginCode, .workerEmail, .opsBaseURL, .adminBaseURL, .signalBaseURL,
-                .openClawHost, .openClawPort, .webrtcSignalingURL, .openClawTailscaleIP,
+    for key in [Key.workerLoginCode, .workerLoginCodeMigratedFromFastFoodDefault, .workerEmail, .opsBaseURL, .adminBaseURL, .signalBaseURL,
+                .webrtcSignalingURL,
                 .deviceID, .speakerOutputEnabled, .videoStreamingEnabled,
                 .proactiveNotificationsEnabled] {
       defaults.removeObject(forKey: key.rawValue)
     }
-    for key in [Key.geminiAPIKey, .openClawBearerToken, .openClawHookToken, .openClawGatewayToken] {
+    for key in [Key.workerAPIBearerToken] {
       defaults.removeObject(forKey: key.rawValue)
       keychain.removeValue(for: key.rawValue)
+    }
+    for legacy in [
+      "geminiAPIKey",
+      "openClawBearerToken",
+      "openClawHookToken",
+      "openClawGatewayToken",
+      "openClawHost",
+      "openClawPort",
+      "openClawTailscaleIP",
+      "geminiSystemPrompt"
+    ] {
+      defaults.removeObject(forKey: legacy)
+      keychain.removeValue(for: legacy)
     }
   }
 
