@@ -456,6 +456,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
   private let workerInputOutputURL: URL
   private let geminiOutputOutputURL: URL
   private let rawWorkerInputOutputURL: URL
+  private let timelineWorkerVoiceOutputURL: URL
   private let rawGeminiOutputOutputURL: URL
   private var chunks: [AudioChunk] = []
   private var inputAudioChunkCount = 0
@@ -481,6 +482,9 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     self.rawWorkerInputOutputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(outputPrefix)_worker_input_raw")
       .appendingPathExtension("wav")
+    self.timelineWorkerVoiceOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_worker_voice_timeline")
+      .appendingPathExtension("wav")
     self.rawGeminiOutputOutputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(outputPrefix)_gemini_output_raw")
       .appendingPathExtension("wav")
@@ -489,6 +493,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
       workerInputOutputURL,
       geminiOutputOutputURL,
       rawWorkerInputOutputURL,
+      timelineWorkerVoiceOutputURL,
       rawGeminiOutputOutputURL
     ] {
       try? FileManager.default.removeItem(at: outputURL)
@@ -503,7 +508,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     append(data, sampleRate: GeminiConfig.outputAudioSampleRate, source: .output)
   }
 
-  func finishAudioFiles() async -> [SopAudioSidecar] {
+  func finishAudioFiles(recordingFinishHostTime: CFTimeInterval? = nil) async -> [SopAudioSidecar] {
     await withCheckedContinuation { continuation in
       queue.async { [weak self] in
         guard let self else {
@@ -564,6 +569,20 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
             contentType: "audio/wav",
             outputURL: self.rawWorkerInputOutputURL,
             data: Self.rawPCM(chunks: chunks, sourceFilter: .input),
+            encoding: .wav(sampleRate: GeminiConfig.inputAudioSampleRate)
+          ),
+          AudioSidecarCandidate(
+            filename: "worker-voice-timeline.wav",
+            source: "worker-voice-timeline-raw-audio",
+            contentType: "audio/wav",
+            outputURL: self.timelineWorkerVoiceOutputURL,
+            data: Self.renderTimelinePCM(
+              chunks: chunks,
+              recordingStartHostTime: self.recordingStartHostTime,
+              recordingFinishHostTime: recordingFinishHostTime,
+              sourceFilter: .input,
+              targetSampleRate: GeminiConfig.inputAudioSampleRate
+            ),
             encoding: .wav(sampleRate: GeminiConfig.inputAudioSampleRate)
           ),
           AudioSidecarCandidate(
@@ -765,6 +784,81 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
       data.append(chunk.data)
     }
     return data
+  }
+
+  private static func renderTimelinePCM(
+    chunks: [AudioChunk],
+    recordingStartHostTime: CFTimeInterval,
+    recordingFinishHostTime: CFTimeInterval?,
+    sourceFilter: Source,
+    targetSampleRate: Double
+  ) -> Data {
+    let filteredChunks = chunks.filter { $0.source == sourceFilter }
+    guard !filteredChunks.isEmpty else { return Data() }
+
+    let maxFrameCount = Int(targetSampleRate * 60 * 60)
+    var totalFrameCount = 0
+    if let recordingFinishHostTime {
+      totalFrameCount = max(
+        0,
+        min(
+          maxFrameCount,
+          Int((recordingFinishHostTime - recordingStartHostTime) * targetSampleRate)
+        )
+      )
+    }
+
+    var renderedChunks: [(startFrame: Int, samples: [Int16])] = []
+    for chunk in filteredChunks {
+      let samples = int16Samples(
+        from: chunk.data,
+        sourceSampleRate: chunk.sampleRate,
+        targetSampleRate: targetSampleRate
+      )
+      guard !samples.isEmpty else { continue }
+
+      let startFrame = max(0, Int((chunk.hostTime - recordingStartHostTime) * targetSampleRate))
+      guard startFrame < maxFrameCount else { continue }
+      totalFrameCount = min(maxFrameCount, max(totalFrameCount, startFrame + samples.count))
+      renderedChunks.append((startFrame, samples))
+    }
+
+    guard totalFrameCount > 0 else { return Data() }
+
+    var timelineSamples = [Int16](repeating: 0, count: totalFrameCount)
+    for rendered in renderedChunks {
+      for (offset, sample) in rendered.samples.enumerated() {
+        let index = rendered.startFrame + offset
+        guard index < timelineSamples.count else { break }
+        timelineSamples[index] = sample
+      }
+    }
+
+    return timelineSamples.withUnsafeBufferPointer { Data(buffer: $0) }
+  }
+
+  private static func int16Samples(
+    from data: Data,
+    sourceSampleRate: Double,
+    targetSampleRate: Double
+  ) -> [Int16] {
+    let sourceFrameCount = data.count / MemoryLayout<Int16>.size
+    guard sourceFrameCount > 0 else { return [] }
+
+    if sourceSampleRate == targetSampleRate {
+      return data.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return [] }
+        return Array(UnsafeBufferPointer(start: baseAddress, count: sourceFrameCount))
+      }
+    }
+
+    return resampledFloatSamples(
+      from: data,
+      sourceSampleRate: sourceSampleRate,
+      targetSampleRate: targetSampleRate
+    ).map { sample in
+      Int16(max(-1.0, min(1.0, sample)) * Float(Int16.max))
+    }
   }
 
   private static func resampledFloatSamples(
@@ -1251,6 +1345,7 @@ private final class SopVideoRecorder: @unchecked Sendable {
           self.droppedAudioChunkCount,
           self.writer == nil ? "no" : "yes",
           self.outputURL?.path ?? "nil")
+        let recordingFinishHostTime = CACurrentMediaTime()
 
         guard let writer = self.writer,
               let writerInput = self.writerInput,
@@ -1283,7 +1378,9 @@ private final class SopVideoRecorder: @unchecked Sendable {
                 "writer_error": writerError ?? NSNull()
               ]
             )
-            let audioSidecars = await self.conversationAudioRecorder.finishAudioFiles()
+            let audioSidecars = await self.conversationAudioRecorder.finishAudioFiles(
+              recordingFinishHostTime: recordingFinishHostTime
+            )
             let audioFileSize = audioSidecars.reduce(0) { total, sidecar in
               guard let attributes = try? FileManager.default.attributesOfItem(atPath: sidecar.url.path),
                     let size = attributes[.size] as? Int else {
@@ -1316,7 +1413,9 @@ private final class SopVideoRecorder: @unchecked Sendable {
 
           Task {
             let finalURL = writerStatus == .completed ? videoURL : nil
-            let audioSidecars = await self.conversationAudioRecorder.finishAudioFiles()
+            let audioSidecars = await self.conversationAudioRecorder.finishAudioFiles(
+              recordingFinishHostTime: recordingFinishHostTime
+            )
 
             let fileSize = finalURL.flatMap { url -> Int? in
               guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
