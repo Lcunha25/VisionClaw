@@ -46,13 +46,6 @@ class GeminiSessionViewModel: ObservableObject {
   var onInputAudioChunk: ((Data) -> Void)?
   var onOutputAudioChunk: ((Data) -> Void)?
 
-  init() {
-    audioManager.setResetRestartAuthorization { [weak self] in
-      guard let self else { return false }
-      return self.sessionIntent == .active
-    }
-  }
-
   func configureWorkerAdminAPI(_ api: WorkerAdminAPI?, sessionID: String? = nil) {
     workerAdminAPI = api
     adminExecutionSessionID = sessionID
@@ -76,7 +69,6 @@ class GeminiSessionViewModel: ObservableObject {
 
     guard let liveConfig = await resolveLiveSessionConfig(fallbackInstruction: systemInstruction) else {
       sessionIntent = .idle
-      audioManager.invalidatePendingResetRestarts()
       errorMessage = "Gemini Live token unavailable. Check Admin AI Settings and the worker backend connection."
       return
     }
@@ -145,7 +137,6 @@ class GeminiSessionViewModel: ObservableObject {
     sessionGeneration += 1
     reconnectTask?.cancel()
     reconnectTask = nil
-    audioManager.invalidatePendingResetRestarts()
     await resetToIdle(message: nil)
   }
 
@@ -154,7 +145,6 @@ class GeminiSessionViewModel: ObservableObject {
     sessionGeneration += 1
     reconnectTask?.cancel()
     reconnectTask = nil
-    audioManager.invalidatePendingResetRestarts()
     await resetToIdle(message: nil)
   }
 
@@ -547,7 +537,6 @@ class GeminiSessionViewModel: ObservableObject {
   }
 
   private func resetToIdle(message: String?) async {
-    audioManager.invalidatePendingResetRestarts()
     isStoppingSession = true
     isGeminiActive = false
     isAudioReady = false

@@ -325,8 +325,6 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
   }
 }
 
-typealias AudioResetRestartAuthorization = @MainActor @Sendable () -> Bool
-
 final class AudioManager: @unchecked Sendable {
   var onAudioCaptured: ((Data) -> Void)?
 
@@ -346,9 +344,6 @@ final class AudioManager: @unchecked Sendable {
   private var useIPhoneMode = false
   private var audioRouteLease: WorkerAudioRouteLease?
   private var audioGraphGeneration: UInt64 = 0
-  private let resetRestartGateQueue = DispatchQueue(label: "gemini.audio.reset-restart-gate")
-  private var resetRestartEpoch: UInt64 = 0
-  private var resetRestartAuthorization: AudioResetRestartAuthorization?
 
   private let outputFormat: AVAudioFormat
 
@@ -372,34 +367,6 @@ final class AudioManager: @unchecked Sendable {
       interleaved: true
     )!
     audioLifecycleQueue.setSpecific(key: audioLifecycleQueueKey, value: ())
-  }
-
-  func setResetRestartAuthorization(_ authorization: AudioResetRestartAuthorization?) {
-    resetRestartAuthorization = authorization
-  }
-
-  func invalidatePendingResetRestarts() {
-    resetRestartGateQueue.sync {
-      resetRestartEpoch &+= 1
-    }
-  }
-
-  private func beginResetRestartAttempt() -> UInt64 {
-    resetRestartGateQueue.sync {
-      resetRestartEpoch &+= 1
-      return resetRestartEpoch
-    }
-  }
-
-  private func isResetRestartAttemptCurrent(_ epoch: UInt64) -> Bool {
-    resetRestartGateQueue.sync {
-      resetRestartEpoch == epoch
-    }
-  }
-
-  @MainActor
-  private func isResetRestartAuthorized() -> Bool {
-    resetRestartAuthorization?() ?? true
   }
 
   func setupAudioSession(useIPhoneMode: Bool = false) throws {
@@ -750,7 +717,6 @@ final class AudioManager: @unchecked Sendable {
 
   private func attemptAudioReset() {
     NSLog("[Audio] Attempting audio reset")
-    let resetEpoch = beginResetRestartAttempt()
     audioLifecycleQueue.async { [weak self] in
       guard let self else { return }
       let wasCapturing = self.isCapturing
@@ -758,17 +724,8 @@ final class AudioManager: @unchecked Sendable {
 
       self.tearDownEngineGraphOnAudioLifecycleQueue(flushPendingAudio: false) { [weak self] in
         guard let self, wasCapturing else { return }
-        Task { @MainActor [weak self] in
+        DispatchQueue.main.async { [weak self] in
           guard let self else { return }
-          guard self.isResetRestartAttemptCurrent(resetEpoch) else {
-            NSLog("[Audio] Audio reset restart skipped: stale reset epoch")
-            return
-          }
-          guard self.isResetRestartAuthorized() else {
-            self.invalidatePendingResetRestarts()
-            NSLog("[Audio] Audio reset restart skipped: session no longer owns Gemini audio")
-            return
-          }
           do {
             try self.setupAudioSession(useIPhoneMode: useIPhoneMode)
             try self.startCapture()
