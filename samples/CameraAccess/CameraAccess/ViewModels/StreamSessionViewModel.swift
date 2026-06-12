@@ -89,8 +89,14 @@ enum PostRecordingProcessingState: Equatable {
 
 private struct SopFinalizedRecording: Sendable {
   let url: URL?
-  let audioURL: URL?
+  let audioSidecars: [SopAudioSidecar]
   let failureMessage: String?
+}
+
+fileprivate struct SopAudioSidecar: Sendable {
+  let url: URL
+  let filename: String
+  let source: String
 }
 
 struct SOPTemplate: Identifiable, Hashable {
@@ -399,7 +405,7 @@ private enum SopSessionMediaFinalizer {
       NSLog("[SOPRecorder] iPhone recording finalized with native movie audio only")
       return SopFinalizedRecording(
         url: phoneVideoURL,
-        audioURL: nil,
+        audioSidecars: [],
         failureMessage: phoneVideoURL == nil
           ? "Phone recording file was not produced during finalize."
           : nil
@@ -409,7 +415,7 @@ private enum SopSessionMediaFinalizer {
     return await sopVideoRecorder?.finishRecording()
       ?? SopFinalizedRecording(
         url: nil,
-        audioURL: nil,
+        audioSidecars: [],
         failureMessage: "Session recorder was unavailable during finalize."
       )
   }
@@ -431,7 +437,9 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
   private let queue = DispatchQueue(label: "sop.conversation.audio.recorder", qos: .userInitiated)
   private let sessionID: String?
   private let recordingStartHostTime: CFTimeInterval
-  private let outputURL: URL
+  private let mixedOutputURL: URL
+  private let workerInputOutputURL: URL
+  private let geminiOutputOutputURL: URL
   private var chunks: [AudioChunk] = []
   private var inputAudioChunkCount = 0
   private var outputAudioChunkCount = 0
@@ -443,10 +451,19 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
   init(sessionID: String?, recordingStartHostTime: CFTimeInterval) {
     self.sessionID = sessionID
     self.recordingStartHostTime = recordingStartHostTime
-    self.outputURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("sop_\(sessionID ?? UUID().uuidString)_conversation")
+    let outputPrefix = "sop_\(sessionID ?? UUID().uuidString)"
+    self.mixedOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_conversation_mixed")
       .appendingPathExtension("m4a")
-    try? FileManager.default.removeItem(at: outputURL)
+    self.workerInputOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_worker_input")
+      .appendingPathExtension("m4a")
+    self.geminiOutputOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_gemini_output")
+      .appendingPathExtension("m4a")
+    for outputURL in [mixedOutputURL, workerInputOutputURL, geminiOutputOutputURL] {
+      try? FileManager.default.removeItem(at: outputURL)
+    }
   }
 
   func appendInputAudio(_ data: Data) {
@@ -457,11 +474,11 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     append(data, sampleRate: GeminiConfig.outputAudioSampleRate, source: .output)
   }
 
-  func finishAudioFile() async -> URL? {
+  func finishAudioFiles() async -> [SopAudioSidecar] {
     await withCheckedContinuation { continuation in
       queue.async { [weak self] in
         guard let self else {
-          continuation.resume(returning: nil)
+          continuation.resume(returning: [])
           return
         }
 
@@ -471,51 +488,106 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
         let outputCount = self.outputAudioChunkCount
         let duplicateCount = self.droppedDuplicateChunkCount
         guard !chunks.isEmpty else {
-          continuation.resume(returning: nil)
+          continuation.resume(returning: [])
           return
         }
 
-        let mixedPCM = Self.renderMixedPCM(
-          chunks: chunks,
-          recordingStartHostTime: self.recordingStartHostTime
-        )
-        guard !mixedPCM.isEmpty else {
-          continuation.resume(returning: nil)
-          return
-        }
-
-        Self.writeAACAudio(data: mixedPCM, outputURL: self.outputURL) { url in
-          let byteCount = url.flatMap { url -> Int? in
-            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-              return nil
-            }
-            return attributes[.size] as? Int
-          } ?? 0
-          NSLog(
-            "[SOPRecorder] Conversation audio finish completed (input=%d, output=%d, droppedDuplicates=%d, bytes=%d)",
-            inputCount,
-            outputCount,
-            duplicateCount,
-            byteCount
-          )
-          Task {
-            await WorkerTelemetry.shared.record(
-              "sop_conversation_audio_finish",
-              source: "media_upload",
-              stage: url == nil ? "failed" : "completed",
-              sessionID: self.sessionID,
-              metricValue: Double(byteCount),
-              metricUnit: "bytes",
-              payload: [
-                "input_audio_chunks": inputCount,
-                "output_audio_chunks": outputCount,
-                "dropped_duplicate_chunks": duplicateCount,
-                "bytes": byteCount
-              ]
+        let candidates = [
+          (
+            filename: "ai-conversation-mixed.m4a",
+            source: "ai-conversation-audio",
+            outputURL: self.mixedOutputURL,
+            data: Self.renderPCM(
+              chunks: chunks,
+              recordingStartHostTime: self.recordingStartHostTime,
+              sourceFilter: nil
             )
-          }
-          continuation.resume(returning: url)
+          ),
+          (
+            filename: "ai-worker-input.m4a",
+            source: "ai-worker-input-audio",
+            outputURL: self.workerInputOutputURL,
+            data: Self.renderPCM(
+              chunks: chunks,
+              recordingStartHostTime: self.recordingStartHostTime,
+              sourceFilter: .input
+            )
+          ),
+          (
+            filename: "ai-gemini-output.m4a",
+            source: "ai-gemini-output-audio",
+            outputURL: self.geminiOutputOutputURL,
+            data: Self.renderPCM(
+              chunks: chunks,
+              recordingStartHostTime: self.recordingStartHostTime,
+              sourceFilter: .output
+            )
+          )
+        ].filter { !$0.data.isEmpty }
+
+        guard !candidates.isEmpty else {
+          continuation.resume(returning: [])
+          return
         }
+
+        var sidecars: [SopAudioSidecar] = []
+        var totalByteCount = 0
+
+        func writeCandidate(at index: Int) {
+          guard index < candidates.count else {
+            NSLog(
+              "[SOPRecorder] Conversation audio finish completed (input=%d, output=%d, droppedDuplicates=%d, sidecars=%d, bytes=%d)",
+              inputCount,
+              outputCount,
+              duplicateCount,
+              sidecars.count,
+              totalByteCount
+            )
+            Task {
+              await WorkerTelemetry.shared.record(
+                "sop_conversation_audio_finish",
+                source: "media_upload",
+                stage: sidecars.isEmpty ? "failed" : "completed",
+                sessionID: self.sessionID,
+                metricValue: Double(totalByteCount),
+                metricUnit: "bytes",
+                payload: [
+                  "input_audio_chunks": inputCount,
+                  "output_audio_chunks": outputCount,
+                  "dropped_duplicate_chunks": duplicateCount,
+                  "sidecar_count": sidecars.count,
+                  "bytes": totalByteCount,
+                  "sidecar_sources": sidecars.map(\.source)
+                ]
+              )
+            }
+            continuation.resume(returning: sidecars)
+            return
+          }
+
+          let candidate = candidates[index]
+          Self.writeAACAudio(data: candidate.data, outputURL: candidate.outputURL) { url in
+            let byteCount = url.flatMap { url -> Int? in
+              guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                return nil
+              }
+              return attributes[.size] as? Int
+            } ?? 0
+            if let url {
+              totalByteCount += byteCount
+              sidecars.append(
+                SopAudioSidecar(
+                  url: url,
+                  filename: candidate.filename,
+                  source: candidate.source
+                )
+              )
+            }
+            writeCandidate(at: index + 1)
+          }
+        }
+
+        writeCandidate(at: 0)
       }
     }
   }
@@ -561,9 +633,10 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     return hasher.finalize()
   }
 
-  private static func renderMixedPCM(
+  private static func renderPCM(
     chunks: [AudioChunk],
-    recordingStartHostTime: CFTimeInterval
+    recordingStartHostTime: CFTimeInterval,
+    sourceFilter: Source?
   ) -> Data {
     let targetSampleRate = GeminiConfig.outputAudioSampleRate
     let maxFrameCount = Int(targetSampleRate * 60 * 60)
@@ -571,6 +644,9 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     var totalFrameCount = 0
 
     for chunk in chunks {
+      if let sourceFilter, chunk.source != sourceFilter {
+        continue
+      }
       var samples = resampledFloatSamples(
         from: chunk.data,
         sourceSampleRate: chunk.sampleRate,
@@ -1031,7 +1107,7 @@ private final class SopVideoRecorder: @unchecked Sendable {
         guard let self else {
           continuation.resume(returning: SopFinalizedRecording(
             url: nil,
-            audioURL: nil,
+            audioSidecars: [],
             failureMessage: "Session recorder was released before finalize."
           ))
           return
@@ -1077,23 +1153,24 @@ private final class SopVideoRecorder: @unchecked Sendable {
                 "writer_error": writerError ?? NSNull()
               ]
             )
-            let audioURL = await self.conversationAudioRecorder.finishAudioFile()
-            let audioFileSize = audioURL.flatMap { url -> Int? in
-              guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-                return nil
+            let audioSidecars = await self.conversationAudioRecorder.finishAudioFiles()
+            let audioFileSize = audioSidecars.reduce(0) { total, sidecar in
+              guard let attributes = try? FileManager.default.attributesOfItem(atPath: sidecar.url.path),
+                    let size = attributes[.size] as? Int else {
+                return total
               }
-              return attributes[.size] as? Int
+              return total + size
             }
-            if let audioURL {
+            if !audioSidecars.isEmpty {
               NSLog(
-                "[SOPRecorder] Returning audio-only sidecar after video writer was unavailable (audioURL=%@, bytes=%d)",
-                audioURL.path,
-                audioFileSize ?? 0
+                "[SOPRecorder] Returning audio-only sidecars after video writer was unavailable (sidecars=%d, bytes=%d)",
+                audioSidecars.count,
+                audioFileSize
               )
             }
             continuation.resume(returning: SopFinalizedRecording(
               url: nil,
-              audioURL: audioURL,
+              audioSidecars: audioSidecars,
               failureMessage: reason
             ))
           }
@@ -1109,7 +1186,7 @@ private final class SopVideoRecorder: @unchecked Sendable {
 
           Task {
             let finalURL = writerStatus == .completed ? videoURL : nil
-            let audioURL = await self.conversationAudioRecorder.finishAudioFile()
+            let audioSidecars = await self.conversationAudioRecorder.finishAudioFiles()
 
             let fileSize = finalURL.flatMap { url -> Int? in
               guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
@@ -1117,19 +1194,20 @@ private final class SopVideoRecorder: @unchecked Sendable {
               }
               return attributes[.size] as? Int
             }
-            let audioFileSize = audioURL.flatMap { url -> Int? in
-              guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-                return nil
+            let audioFileSize = audioSidecars.reduce(0) { total, sidecar in
+              guard let attributes = try? FileManager.default.attributesOfItem(atPath: sidecar.url.path),
+                    let size = attributes[.size] as? Int else {
+                return total
               }
-              return attributes[.size] as? Int
+              return total + size
             }
             NSLog(
-              "[SOPRecorder] finishWriting completed with split media (status=%d, videoURL=%@, videoBytes=%d, audioURL=%@, audioBytes=%d)",
+              "[SOPRecorder] finishWriting completed with split media (status=%d, videoURL=%@, videoBytes=%d, audioSidecars=%d, audioBytes=%d)",
               writerStatus.rawValue,
               finalURL?.path ?? "nil",
               fileSize ?? 0,
-              audioURL?.path ?? "nil",
-              audioFileSize ?? 0)
+              audioSidecars.count,
+              audioFileSize)
             await WorkerTelemetry.shared.record(
               "sop_recorder_finish",
               source: "media_upload",
@@ -1140,11 +1218,12 @@ private final class SopVideoRecorder: @unchecked Sendable {
               payload: [
                 "frame_count": self.appendedFrameCount,
                 "file_size": fileSize ?? 0,
-                "audio_file_size": audioFileSize ?? NSNull(),
+                "audio_file_size": audioFileSize,
                 "audio_input_chunks": self.inputAudioChunkCount,
                 "audio_output_chunks": self.outputAudioChunkCount,
                 "dropped_audio_chunks": self.droppedAudioChunkCount,
-                "split_conversation_audio": audioURL != nil,
+                "split_conversation_audio": audioSidecars.isEmpty == false,
+                "audio_sidecar_sources": audioSidecars.map(\.source),
                 "writer_status": writerStatus.rawValue,
                 "writer_error": writerErrorDescription ?? NSNull()
               ]
@@ -1157,7 +1236,7 @@ private final class SopVideoRecorder: @unchecked Sendable {
             }
             continuation.resume(returning: SopFinalizedRecording(
               url: writerStatus == .completed ? finalURL : nil,
-              audioURL: audioURL,
+              audioSidecars: audioSidecars,
               failureMessage: failureMessage
             ))
           }
@@ -1840,13 +1919,13 @@ actor WorkerAdminLiveSessionCoordinator {
     )
   }
 
-  func uploadConversationAudioRecording(from fileURL: URL?) async -> WorkerMediaUploadResult {
+  fileprivate func uploadConversationAudioRecording(from sidecar: SopAudioSidecar?) async -> WorkerMediaUploadResult {
     let byteSize: Int
     let data: Data?
     let missingDataError: String
 
-    if let fileURL {
-      data = await fileLoader(fileURL)
+    if let sidecar {
+      data = await fileLoader(sidecar.url)
       if let data {
         byteSize = data.count
         missingDataError = data.isEmpty
@@ -1864,12 +1943,12 @@ actor WorkerAdminLiveSessionCoordinator {
 
     return await uploadAsset(
       assetType: "audio",
-      filename: "ai-conversation.m4a",
+      filename: sidecar?.filename ?? "ai-conversation.m4a",
       contentType: "audio/mp4",
       data: data,
       byteSize: byteSize,
       missingDataError: missingDataError,
-      source: "ai-conversation-audio"
+      source: sidecar?.source ?? "ai-conversation-audio"
     )
   }
 
@@ -4535,7 +4614,7 @@ class StreamSessionViewModel: ObservableObject {
         iPhoneRecordingWasPreStopped: iPhoneRecordingWasPreStopped
       )
       let recordedVideoURL = finalizedRecording.url
-      let recordedAudioURL = finalizedRecording.audioURL
+      let recordedAudioSidecars = finalizedRecording.audioSidecars
 
       let result: WorkerMediaUploadResult
       if let workerAdminSync, let preparedUpload {
@@ -4558,11 +4637,17 @@ class StreamSessionViewModel: ObservableObject {
         )
       }
 
-      let audioResult: WorkerMediaUploadResult?
-      if let workerAdminSync, let recordedAudioURL {
-        audioResult = await workerAdminSync.uploadConversationAudioRecording(from: recordedAudioURL)
+      let audioResults: [WorkerMediaUploadResult]
+      if let workerAdminSync, !recordedAudioSidecars.isEmpty {
+        var uploadedAudioResults: [WorkerMediaUploadResult] = []
+        for sidecar in recordedAudioSidecars {
+          uploadedAudioResults.append(
+            await workerAdminSync.uploadConversationAudioRecording(from: sidecar)
+          )
+        }
+        audioResults = uploadedAudioResults
       } else {
-        audioResult = nil
+        audioResults = []
       }
 
       if result.succeeded {
@@ -4589,23 +4674,30 @@ class StreamSessionViewModel: ObservableObject {
         )
       }
 
-      if let audioResult {
-        if audioResult.succeeded, let recordedAudioURL {
-          try? FileManager.default.removeItem(at: recordedAudioURL)
+      if !audioResults.isEmpty {
+        for (index, audioResult) in audioResults.enumerated() {
+          let sidecar = recordedAudioSidecars.indices.contains(index)
+            ? recordedAudioSidecars[index]
+            : nil
+          if audioResult.succeeded, let sidecar {
+            try? FileManager.default.removeItem(at: sidecar.url)
+          }
+          WorkerLiveLogger.log(
+            "session_audio_background_finalize_completed",
+            sessionID: sessionID,
+            assetID: audioResult.assetID,
+            assetType: audioResult.assetType,
+            bucket: audioResult.bucket,
+            path: audioResult.path,
+            byteSize: audioResult.byteSize,
+            uploadState: audioResult.uploadState,
+            error: audioResult.errorMessage
+          )
         }
-        WorkerLiveLogger.log(
-          "session_audio_background_finalize_completed",
-          sessionID: sessionID,
-          assetID: audioResult.assetID,
-          assetType: audioResult.assetType,
-          bucket: audioResult.bucket,
-          path: audioResult.path,
-          byteSize: audioResult.byteSize,
-          uploadState: audioResult.uploadState,
-          error: audioResult.errorMessage
-        )
-      } else if let recordedAudioURL {
-        try? FileManager.default.removeItem(at: recordedAudioURL)
+      } else {
+        for sidecar in recordedAudioSidecars {
+          try? FileManager.default.removeItem(at: sidecar.url)
+        }
       }
 
       WorkerLiveLogger.log(
