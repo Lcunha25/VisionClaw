@@ -435,9 +435,23 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     let hostTime: CFTimeInterval
   }
 
+  private struct NativeAudioChunk {
+    let data: Data
+    let sampleRate: Double
+    let channelCount: UInt32
+    let bitsPerSample: UInt32
+    let wavFormat: UInt16
+    let hostTime: CFTimeInterval
+  }
+
   private enum AudioSidecarEncoding {
     case aac
-    case wav(sampleRate: Double)
+    case wav(
+      sampleRate: Double,
+      channelCount: UInt32 = GeminiConfig.audioChannels,
+      bitsPerSample: UInt32 = GeminiConfig.audioBitsPerSample,
+      wavFormat: UInt16 = 1
+    )
   }
 
   private struct AudioSidecarCandidate {
@@ -457,9 +471,13 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
   private let geminiOutputOutputURL: URL
   private let rawWorkerInputOutputURL: URL
   private let timelineWorkerVoiceOutputURL: URL
+  private let nativeInputTapOutputURL: URL
+  private let phoneAppIOTimelineOutputURL: URL
   private let rawGeminiOutputOutputURL: URL
   private var chunks: [AudioChunk] = []
+  private var nativeInputChunks: [NativeAudioChunk] = []
   private var inputAudioChunkCount = 0
+  private var nativeInputAudioChunkCount = 0
   private var outputAudioChunkCount = 0
   private var droppedDuplicateChunkCount = 0
   private var lastFingerprintBySource: [Source: Int] = [:]
@@ -485,6 +503,12 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     self.timelineWorkerVoiceOutputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(outputPrefix)_worker_voice_timeline")
       .appendingPathExtension("wav")
+    self.nativeInputTapOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_native_input_tap")
+      .appendingPathExtension("wav")
+    self.phoneAppIOTimelineOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_phone_app_io_timeline")
+      .appendingPathExtension("wav")
     self.rawGeminiOutputOutputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(outputPrefix)_gemini_output_raw")
       .appendingPathExtension("wav")
@@ -494,6 +518,8 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
       geminiOutputOutputURL,
       rawWorkerInputOutputURL,
       timelineWorkerVoiceOutputURL,
+      nativeInputTapOutputURL,
+      phoneAppIOTimelineOutputURL,
       rawGeminiOutputOutputURL
     ] {
       try? FileManager.default.removeItem(at: outputURL)
@@ -502,6 +528,25 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
 
   func appendInputAudio(_ data: Data) {
     append(data, sampleRate: GeminiConfig.inputAudioSampleRate, source: .input)
+  }
+
+  func appendNativeInputAudio(_ chunk: WorkerNativeAudioCaptureChunk) {
+    guard !chunk.data.isEmpty else { return }
+    let hostTime = CACurrentMediaTime()
+    queue.async { [weak self] in
+      guard let self, !self.isFinishing else { return }
+      self.nativeInputAudioChunkCount += 1
+      self.nativeInputChunks.append(
+        NativeAudioChunk(
+          data: chunk.data,
+          sampleRate: chunk.sampleRate,
+          channelCount: chunk.channelCount,
+          bitsPerSample: chunk.bitsPerSample,
+          wavFormat: chunk.wavFormat,
+          hostTime: hostTime
+        )
+      )
+    }
   }
 
   func appendOutputAudio(_ data: Data) {
@@ -518,10 +563,12 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
 
         self.isFinishing = true
         let chunks = self.chunks
+        let nativeInputChunks = self.nativeInputChunks
         let inputCount = self.inputAudioChunkCount
+        let nativeInputCount = self.nativeInputAudioChunkCount
         let outputCount = self.outputAudioChunkCount
         let duplicateCount = self.droppedDuplicateChunkCount
-        guard !chunks.isEmpty else {
+        guard !chunks.isEmpty || !nativeInputChunks.isEmpty else {
           continuation.resume(returning: [])
           return
         }
@@ -586,6 +633,33 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
             encoding: .wav(sampleRate: GeminiConfig.inputAudioSampleRate)
           ),
           AudioSidecarCandidate(
+            filename: "native-input-tap.wav",
+            source: "native-input-tap-raw-audio",
+            contentType: "audio/wav",
+            outputURL: self.nativeInputTapOutputURL,
+            data: Self.rawNativePCM(chunks: nativeInputChunks),
+            encoding: .wav(
+              sampleRate: nativeInputChunks.first?.sampleRate ?? GeminiConfig.inputAudioSampleRate,
+              channelCount: nativeInputChunks.first?.channelCount ?? GeminiConfig.audioChannels,
+              bitsPerSample: nativeInputChunks.first?.bitsPerSample ?? GeminiConfig.audioBitsPerSample,
+              wavFormat: nativeInputChunks.first?.wavFormat ?? 1
+            )
+          ),
+          AudioSidecarCandidate(
+            filename: "phone-app-io-timeline.wav",
+            source: "phone-app-io-timeline-audio",
+            contentType: "audio/wav",
+            outputURL: self.phoneAppIOTimelineOutputURL,
+            data: Self.renderPhoneIOTimelinePCM(
+              nativeInputChunks: nativeInputChunks,
+              outputChunks: chunks,
+              recordingStartHostTime: self.recordingStartHostTime,
+              recordingFinishHostTime: recordingFinishHostTime,
+              targetSampleRate: GeminiConfig.outputAudioSampleRate
+            ),
+            encoding: .wav(sampleRate: GeminiConfig.outputAudioSampleRate)
+          ),
+          AudioSidecarCandidate(
             filename: "ai-gemini-output-raw.wav",
             source: "ai-gemini-output-raw-audio",
             contentType: "audio/wav",
@@ -623,6 +697,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
                 metricUnit: "bytes",
                 payload: [
                   "input_audio_chunks": inputCount,
+                  "native_input_audio_chunks": nativeInputCount,
                   "output_audio_chunks": outputCount,
                   "dropped_duplicate_chunks": duplicateCount,
                   "sidecar_count": sidecars.count,
@@ -663,12 +738,15 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
             Self.writeAACAudio(data: candidate.data, outputURL: candidate.outputURL) { url in
               recordCandidateResult(url)
             }
-          case .wav(let sampleRate):
+          case .wav(let sampleRate, let channelCount, let bitsPerSample, let wavFormat):
             recordCandidateResult(
               Self.writeWAVAudio(
                 data: candidate.data,
                 sampleRate: sampleRate,
-                outputURL: candidate.outputURL
+                outputURL: candidate.outputURL,
+                channelCount: channelCount,
+                bitsPerSample: bitsPerSample,
+                wavFormat: wavFormat
               )
             )
           }
@@ -786,6 +864,22 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     return data
   }
 
+  private static func rawNativePCM(chunks: [NativeAudioChunk]) -> Data {
+    guard let firstChunk = chunks.first else { return Data() }
+    var data = Data()
+    for chunk in chunks where nativeAudioFormatMatches(chunk, firstChunk) {
+      data.append(chunk.data)
+    }
+    return data
+  }
+
+  private static func nativeAudioFormatMatches(_ left: NativeAudioChunk, _ right: NativeAudioChunk) -> Bool {
+    abs(left.sampleRate - right.sampleRate) < 0.5 &&
+      left.channelCount == right.channelCount &&
+      left.bitsPerSample == right.bitsPerSample &&
+      left.wavFormat == right.wavFormat
+  }
+
   private static func renderTimelinePCM(
     chunks: [AudioChunk],
     recordingStartHostTime: CFTimeInterval,
@@ -837,6 +931,118 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     return timelineSamples.withUnsafeBufferPointer { Data(buffer: $0) }
   }
 
+  private static func renderPhoneIOTimelinePCM(
+    nativeInputChunks: [NativeAudioChunk],
+    outputChunks: [AudioChunk],
+    recordingStartHostTime: CFTimeInterval,
+    recordingFinishHostTime: CFTimeInterval?,
+    targetSampleRate: Double
+  ) -> Data {
+    let maxFrameCount = Int(targetSampleRate * 60 * 60)
+    var totalFrameCount = 0
+    if let recordingFinishHostTime {
+      totalFrameCount = max(
+        0,
+        min(
+          maxFrameCount,
+          Int((recordingFinishHostTime - recordingStartHostTime) * targetSampleRate)
+        )
+      )
+    }
+
+    var renderedChunks: [(startFrame: Int, samples: [Float])] = []
+    for chunk in nativeInputChunks {
+      let monoSamples = nativeMonoFloatSamples(from: chunk)
+      guard !monoSamples.isEmpty else { continue }
+      let samples = resampledFloatSamples(
+        from: monoSamples,
+        sourceSampleRate: chunk.sampleRate,
+        targetSampleRate: targetSampleRate
+      )
+      let startFrame = max(0, Int((chunk.hostTime - recordingStartHostTime) * targetSampleRate))
+      guard startFrame < maxFrameCount else { continue }
+      totalFrameCount = min(maxFrameCount, max(totalFrameCount, startFrame + samples.count))
+      renderedChunks.append((startFrame, samples))
+    }
+
+    for chunk in outputChunks where chunk.source == .output {
+      let samples = resampledFloatSamples(
+        from: chunk.data,
+        sourceSampleRate: chunk.sampleRate,
+        targetSampleRate: targetSampleRate
+      )
+      guard !samples.isEmpty else { continue }
+      let startFrame = max(0, Int((chunk.hostTime - recordingStartHostTime) * targetSampleRate))
+      guard startFrame < maxFrameCount else { continue }
+      totalFrameCount = min(maxFrameCount, max(totalFrameCount, startFrame + samples.count))
+      renderedChunks.append((startFrame, samples))
+    }
+
+    guard totalFrameCount > 0 else { return Data() }
+
+    var mixed = [Float](repeating: 0, count: totalFrameCount)
+    var contributors = [UInt8](repeating: 0, count: totalFrameCount)
+    for rendered in renderedChunks {
+      for (offset, sample) in rendered.samples.enumerated() {
+        let index = rendered.startFrame + offset
+        guard index < mixed.count else { break }
+        mixed[index] += sample
+        if contributors[index] < UInt8.max {
+          contributors[index] += 1
+        }
+      }
+    }
+
+    var int16Samples = [Int16](repeating: 0, count: totalFrameCount)
+    for index in mixed.indices {
+      let contributorCount = max(1, Int(contributors[index]))
+      let normalized = contributorCount > 1 ? mixed[index] / Float(contributorCount) : mixed[index]
+      let clamped = max(-1.0, min(1.0, normalized))
+      int16Samples[index] = Int16(clamped * Float(Int16.max))
+    }
+
+    return int16Samples.withUnsafeBufferPointer { Data(buffer: $0) }
+  }
+
+  private static func nativeMonoFloatSamples(from chunk: NativeAudioChunk) -> [Float] {
+    let channelCount = Int(chunk.channelCount)
+    guard channelCount > 0 else { return [] }
+
+    if chunk.wavFormat == 3, chunk.bitsPerSample == 32 {
+      let totalSampleCount = chunk.data.count / MemoryLayout<Float>.size
+      let frameCount = totalSampleCount / channelCount
+      guard frameCount > 0 else { return [] }
+      return chunk.data.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.bindMemory(to: Float.self).baseAddress else { return [] }
+        return (0..<frameCount).map { frameIndex in
+          var sum: Float = 0
+          for channelIndex in 0..<channelCount {
+            sum += baseAddress[frameIndex * channelCount + channelIndex]
+          }
+          return sum / Float(channelCount)
+        }
+      }
+    }
+
+    if chunk.wavFormat == 1, chunk.bitsPerSample == 16 {
+      let totalSampleCount = chunk.data.count / MemoryLayout<Int16>.size
+      let frameCount = totalSampleCount / channelCount
+      guard frameCount > 0 else { return [] }
+      return chunk.data.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return [] }
+        return (0..<frameCount).map { frameIndex in
+          var sum: Float = 0
+          for channelIndex in 0..<channelCount {
+            sum += Float(baseAddress[frameIndex * channelCount + channelIndex]) / Float(Int16.max)
+          }
+          return sum / Float(channelCount)
+        }
+      }
+    }
+
+    return []
+  }
+
   private static func int16Samples(
     from data: Data,
     sourceSampleRate: Double,
@@ -874,6 +1080,21 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
       return (0..<sourceFrameCount).map { Float(baseAddress[$0]) / Float(Int16.max) }
     }
 
+    guard sourceSampleRate != targetSampleRate else { return sourceSamples }
+
+    return resampledFloatSamples(
+      from: sourceSamples,
+      sourceSampleRate: sourceSampleRate,
+      targetSampleRate: targetSampleRate
+    )
+  }
+
+  private static func resampledFloatSamples(
+    from sourceSamples: [Float],
+    sourceSampleRate: Double,
+    targetSampleRate: Double
+  ) -> [Float] {
+    guard !sourceSamples.isEmpty else { return [] }
     guard sourceSampleRate != targetSampleRate else { return sourceSamples }
 
     let outputFrameCount = max(
@@ -971,14 +1192,21 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
   private static func writeWAVAudio(
     data: Data,
     sampleRate: Double,
-    outputURL: URL
+    outputURL: URL,
+    channelCount: UInt32 = GeminiConfig.audioChannels,
+    bitsPerSample: UInt32 = GeminiConfig.audioBitsPerSample,
+    wavFormat: UInt16 = 1
   ) -> URL? {
     try? FileManager.default.removeItem(at: outputURL)
     guard !data.isEmpty, data.count <= Int(UInt32.max - 44) else { return nil }
 
-    let channels = UInt16(GeminiConfig.audioChannels)
-    let bitsPerSample = UInt16(GeminiConfig.audioBitsPerSample)
-    let blockAlign = UInt16((UInt32(channels) * UInt32(bitsPerSample)) / 8)
+    guard channelCount > 0, bitsPerSample > 0 else { return nil }
+
+    let channels = UInt16(channelCount)
+    let bitsPerSampleValue = UInt16(bitsPerSample)
+    let blockAlign = UInt16((UInt32(channels) * UInt32(bitsPerSampleValue)) / 8)
+    guard blockAlign > 0 else { return nil }
+
     let sampleRateValue = UInt32(sampleRate.rounded())
     let byteRate = sampleRateValue * UInt32(blockAlign)
     let dataSize = UInt32(data.count)
@@ -989,12 +1217,12 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     wav.append(contentsOf: "WAVE".utf8)
     wav.append(contentsOf: "fmt ".utf8)
     appendLittleEndian(UInt32(16), to: &wav)
-    appendLittleEndian(UInt16(1), to: &wav)
+    appendLittleEndian(wavFormat, to: &wav)
     appendLittleEndian(channels, to: &wav)
     appendLittleEndian(sampleRateValue, to: &wav)
     appendLittleEndian(byteRate, to: &wav)
     appendLittleEndian(blockAlign, to: &wav)
-    appendLittleEndian(bitsPerSample, to: &wav)
+    appendLittleEndian(bitsPerSampleValue, to: &wav)
     wav.append(contentsOf: "data".utf8)
     appendLittleEndian(dataSize, to: &wav)
     wav.append(data)
@@ -1314,6 +1542,11 @@ private final class SopVideoRecorder: @unchecked Sendable {
       guard let self, !self.isFinishing else { return }
       self.inputAudioChunkCount += 1
     }
+  }
+
+  func appendNativeInputAudio(_ chunk: WorkerNativeAudioCaptureChunk) {
+    guard !chunk.data.isEmpty else { return }
+    conversationAudioRecorder.appendNativeInputAudio(chunk)
   }
 
   func appendOutputAudio(_ data: Data) {
@@ -3541,6 +3774,9 @@ class StreamSessionViewModel: ObservableObject {
     }
     geminiAssistant.onInputAudioChunk = { [weak self] data in
       self?.sopVideoRecorder?.appendInputAudio(data)
+    }
+    geminiAssistant.onNativeInputAudioChunk = { [weak self] chunk in
+      self?.sopVideoRecorder?.appendNativeInputAudio(chunk)
     }
     geminiAssistant.onOutputAudioChunk = { [weak self] data in
       self?.sopVideoRecorder?.appendOutputAudio(data)

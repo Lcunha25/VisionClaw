@@ -44,6 +44,7 @@ class GeminiSessionViewModel: ObservableObject {
   var streamingMode: StreamingMode = .glasses
   var onInputCommand: ((String) -> Void)?
   var onInputAudioChunk: ((Data) -> Void)?
+  var onNativeInputAudioChunk: ((WorkerNativeAudioCaptureChunk) -> Void)?
   var onOutputAudioChunk: ((Data) -> Void)?
 
   init() {
@@ -198,6 +199,14 @@ class GeminiSessionViewModel: ObservableObject {
         if !modelSpeaking {
           self.onInputAudioChunk?(data)
         }
+      }
+    }
+
+    audioManager.onNativeInputAudioCaptured = { [weak self] chunk in
+      guard let self else { return }
+      Task { @MainActor in
+        guard self.isGeminiActive, !self.isStoppingSession else { return }
+        self.onNativeInputAudioChunk?(chunk)
       }
     }
 
