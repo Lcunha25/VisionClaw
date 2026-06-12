@@ -390,7 +390,7 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
   }
 
   func finishAudioFile() async -> URL? {
-    await withCheckedContinuation { continuation in
+    return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
       queue.async { [weak self] in
         guard let self else {
           continuation.resume(returning: nil)
@@ -800,32 +800,15 @@ private enum SopSessionMediaFinalizer {
   ) async -> URL? {
     if wasIPhoneRecording {
       let phoneVideoURL = await iPhoneCameraManager?.stopRecording()
-      let conversationAudioURL = await conversationAudioRecorder?.finishAudioFile()
       iPhoneCameraManager?.stop()
 
       guard let phoneVideoURL else {
         return nil
       }
 
-      guard let conversationAudioURL else {
-        return phoneVideoURL
+      if conversationAudioRecorder != nil {
+        NSLog("[SOPRecorder] iPhone recording finalized with native camera audio; skipping conversation audio mux")
       }
-
-      let mixedURL = phoneVideoURL
-        .deletingLastPathComponent()
-        .appendingPathComponent(phoneVideoURL.deletingPathExtension().lastPathComponent + "_mixed")
-        .appendingPathExtension("mp4")
-      if let muxedURL = await ConversationAudioMuxer.mux(
-        videoURL: phoneVideoURL,
-        audioURL: conversationAudioURL,
-        outputURL: mixedURL
-      ) {
-        try? FileManager.default.removeItem(at: phoneVideoURL)
-        try? FileManager.default.removeItem(at: conversationAudioURL)
-        return muxedURL
-      }
-
-      NSLog("[SOPRecorder] iPhone mixed audio mux failed; returning phone recording")
       return phoneVideoURL
     }
 
@@ -866,9 +849,11 @@ private final class SopVideoRecorder: @unchecked Sendable {
   private var pendingAudioChunks: [PendingAudioChunk] = []
   private let sourcePixelFormat = VideoFrameBufferFactory.pixelFormat
   private let maxPendingAudioChunks = 160
+  private let onFirstFrameRecorded: ((URL) -> Void)?
 
-  init(sessionID: String? = nil) {
+  init(sessionID: String? = nil, onFirstFrameRecorded: ((URL) -> Void)? = nil) {
     self.sessionID = sessionID
+    self.onFirstFrameRecorded = onFirstFrameRecorded
     let startHostTime = CACurrentMediaTime()
     self.recordingStartHostTime = startHostTime
     self.conversationRecorder = ConversationAudioRecorder(
@@ -939,7 +924,9 @@ private final class SopVideoRecorder: @unchecked Sendable {
   }
 
   func finishRecording() async -> URL? {
-    await withCheckedContinuation { continuation in
+    await waitForFirstFrameBeforeFinishing(timeoutNanoseconds: 1_500_000_000)
+
+    return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
       queue.async { [weak self] in
         guard let self else {
           continuation.resume(returning: nil)
@@ -1044,6 +1031,21 @@ private final class SopVideoRecorder: @unchecked Sendable {
     }
   }
 
+  private func waitForFirstFrameBeforeFinishing(timeoutNanoseconds: UInt64) async {
+    let deadline = CACurrentMediaTime() + Double(timeoutNanoseconds) / 1_000_000_000
+    while !Task.isCancelled {
+      let hasFrame = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        queue.async { [weak self] in
+          continuation.resume(returning: (self?.appendedFrameCount ?? 0) > 0)
+        }
+      }
+      if hasFrame || CACurrentMediaTime() >= deadline {
+        return
+      }
+      try? await Task.sleep(nanoseconds: 75_000_000)
+    }
+  }
+
   private func appendPixelBufferInternal(_ pixelBuffer: CVPixelBuffer) {
     guard let writer = writer,
           writer.status == .writing,
@@ -1069,6 +1071,9 @@ private final class SopVideoRecorder: @unchecked Sendable {
       appendedFrameCount += 1
       if appendedFrameCount == 1 {
         NSLog("[SOPRecorder] First frame appended successfully")
+        if let outputURL {
+          onFirstFrameRecorded?(outputURL)
+        }
         Task {
           await WorkerTelemetry.shared.record(
             "sop_recorder_first_frame",
@@ -3594,10 +3599,7 @@ class StreamSessionViewModel: ObservableObject {
       return
     }
 
-    await startGeminiAssistant(
-      startingMessage: "Loading checklist guide...",
-      listeningMessage: "AI guide listening. Say \"I'm done\" when you want me to check this step."
-    )
+    await ensureAiGuideStarted(reason: "manual_toggle")
   }
 
   @discardableResult
@@ -3647,7 +3649,10 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func waitForMediaReadyBeforeAiStart(reason: String) async -> Bool {
-    guard streamingMode == .iPhone else { return true }
+    if streamingMode == .glasses {
+      return await waitForGlassesMediaReadyBeforeAiStart(reason: reason)
+    }
+
     guard let camera = iPhoneCameraManager else {
       await recordAiGuideMediaReadyTimeout(reason: reason, cameraReady: false)
       return false
@@ -3677,30 +3682,71 @@ class StreamSessionViewModel: ObservableObject {
     return false
   }
 
-  private func recordAiGuideMediaReadyTimeout(reason: String, cameraReady: Bool) async {
-    let message = "Phone camera/mic still warming up. Tap Start AI to retry."
+  private func waitForGlassesMediaReadyBeforeAiStart(reason: String) async -> Bool {
+    aiGuideStatusMessage = "Waiting for glasses camera and mic..."
+    sopAuditStatusMessage = aiGuideStatusMessage
+
+    let timeout: CFTimeInterval = 4.0
+    let deadline = CACurrentMediaTime() + timeout
+    var cameraReady = false
+    var audioReady = false
+
+    while CACurrentMediaTime() < deadline {
+      guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+      cameraReady = streamingStatus == .streaming && hasReceivedFirstFrame
+      audioReady = isGlassesAudioRouteVisibleForAi()
+      if cameraReady && audioReady {
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        return true
+      }
+      try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+
+    await recordAiGuideMediaReadyTimeout(
+      reason: reason,
+      cameraReady: cameraReady,
+      audioReady: audioReady
+    )
+    return false
+  }
+
+  private func isGlassesAudioRouteVisibleForAi() -> Bool {
+    let session = AVAudioSession.sharedInstance()
+    return hasBluetoothTalkbackRoute(session.currentRoute) ||
+      preferredBluetoothHFPInput(session) != nil
+  }
+
+  private func recordAiGuideMediaReadyTimeout(
+    reason: String,
+    cameraReady: Bool,
+    audioReady: Bool? = nil
+  ) async {
+    let message = streamingMode == .glasses
+      ? "Glasses camera/mic still warming up. Retrying AI voice..."
+      : "Phone camera/mic still warming up. Retrying AI voice..."
     aiGuideStatusMessage = message
     sopAuditStatusMessage = message
+    var telemetryPayload: [String: Any] = [
+      "reason": reason,
+      "camera_ready": cameraReady,
+      "has_first_frame": hasReceivedFirstFrame,
+      "capture_mode": captureModeEventValue(streamingMode)
+    ]
+    if let audioReady {
+      telemetryPayload["audio_ready"] = audioReady
+    }
     await WorkerTelemetry.shared.record(
       "ai_guide_media_ready_timeout",
       source: "gemini_live",
       stage: "timeout",
       sessionID: currentSopSessionId,
-      payload: [
-        "reason": reason,
-        "camera_ready": cameraReady,
-        "has_first_frame": hasReceivedFirstFrame,
-        "capture_mode": captureModeEventValue(streamingMode)
-      ]
+      payload: telemetryPayload
     )
+    var eventPayload = telemetryPayload
+    eventPayload["capture_mode"] = captureModeEventValue(streamingMode)
     await postExecutionEvent(
       type: "ai_guide_media_ready_timeout",
-      payload: [
-        "reason": reason,
-        "camera_ready": cameraReady,
-        "has_first_frame": hasReceivedFirstFrame,
-        "capture_mode": captureModeEventValue(streamingMode)
-      ]
+      payload: eventPayload
     )
   }
 
@@ -3714,13 +3760,23 @@ class StreamSessionViewModel: ObservableObject {
       return true
     }
     guard !isAiGuideStarting else { return false }
-    guard await waitForMediaReadyBeforeAiStart(reason: reason) else { return false }
+
+    let effectiveMaxAttempts = streamingMode == .glasses
+      ? max(maxAttempts, 6)
+      : maxAttempts
 
     aiGuideStatusMessage = "Connecting AI voice..."
     sopAuditStatusMessage = aiGuideStatusMessage
 
-    for attempt in 1...maxAttempts {
+    for attempt in 1...effectiveMaxAttempts {
       guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+      let ready = await waitForMediaReadyBeforeAiStart(reason: "\(reason)_attempt_\(attempt)")
+      guard ready else {
+        guard attempt < effectiveMaxAttempts else { break }
+        try? await Task.sleep(nanoseconds: UInt64(attempt) * 850_000_000)
+        continue
+      }
+
       await WorkerTelemetry.shared.record(
         "ai_guide_autostart_attempt",
         source: "gemini_live",
@@ -3729,7 +3785,7 @@ class StreamSessionViewModel: ObservableObject {
         payload: [
           "reason": reason,
           "attempt": attempt,
-          "max_attempts": maxAttempts,
+          "max_attempts": effectiveMaxAttempts,
           "has_first_frame": hasReceivedFirstFrame,
           "capture_mode": captureModeEventValue(streamingMode)
         ]
@@ -3763,10 +3819,16 @@ class StreamSessionViewModel: ObservableObject {
         return true
       }
 
-      guard attempt < maxAttempts else { break }
+      guard attempt < effectiveMaxAttempts else { break }
       try? await Task.sleep(nanoseconds: UInt64(attempt) * 850_000_000)
     }
 
+    let failureMessage = geminiAssistant.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallbackMessage = streamingMode == .glasses
+      ? "AI guide could not confirm glasses camera and mic. Keep the glasses open and tap Resume AI."
+      : "AI guide could not confirm phone camera and mic. Tap Resume AI."
+    aiGuideStatusMessage = failureMessage?.isEmpty == false ? failureMessage! : fallbackMessage
+    sopAuditStatusMessage = aiGuideStatusMessage
     await WorkerTelemetry.shared.record(
       "ai_guide_autostart_failed",
       source: "gemini_live",
@@ -4368,12 +4430,16 @@ class StreamSessionViewModel: ObservableObject {
     lastWorkerLiveHeartbeatFailureWarningAt = .distantPast
     if streamingMode == .iPhone {
       sopVideoRecorder = nil
-      conversationAudioRecorder = ConversationAudioRecorder(sessionID: sessionId)
+      conversationAudioRecorder = nil
     } else {
       conversationAudioRecorder = nil
-      sopVideoRecorder = SopVideoRecorder(sessionID: sessionId)
-      if let fileURL = sopVideoRecorder?.outputURL {
-        rememberPendingRecording(sessionID: sessionId, fileURL: fileURL)
+      sopVideoRecorder = SopVideoRecorder(sessionID: sessionId) { [weak self] fileURL in
+        Task { @MainActor [weak self] in
+          guard let self,
+                self.currentSopSessionId == sessionId,
+                self.isSopAuditRunning else { return }
+          self.rememberPendingRecording(sessionID: sessionId, fileURL: fileURL)
+        }
       }
     }
     isDossierUploading = false
@@ -6184,10 +6250,6 @@ class StreamSessionViewModel: ObservableObject {
         "upload_interval_seconds": uploadInterval
       ]
     )
-
-    if streamingMode == .glasses, let fileURL = sopVideoRecorder?.outputURL {
-      rememberPendingRecording(sessionID: sessionID, fileURL: fileURL)
-    }
 
     await workerAdminSync?.enqueueFrameUpload(data: jpegData)
   }
