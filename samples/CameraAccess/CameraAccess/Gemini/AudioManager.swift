@@ -1,5 +1,4 @@
 import AVFoundation
-import Darwin
 import Foundation
 import UIKit
 
@@ -7,28 +6,10 @@ enum WorkerAudioRouteOwner: String, Sendable {
   case aiGuide = "ai_guide"
   case backOfficeWebRTC = "back_office_webrtc"
   case holdToTalk = "hold_to_talk"
-  case iPhoneRecording = "iphone_recording"
-  case handoff = "handoff"
   case viewer = "viewer"
 }
 
 struct WorkerAudioRouteLease: Equatable, Sendable {
-  let owner: WorkerAudioRouteOwner
-  let token: UUID
-  let generation: UInt64
-  let mode: StreamingMode
-
-  var payload: [String: Any] {
-    [
-      "owner": owner.rawValue,
-      "token": token.uuidString,
-      "generation": generation,
-      "mode": mode == .iPhone ? "iphone" : "glasses"
-    ]
-  }
-}
-
-struct WorkerAudioSessionProtectionLease: Equatable, Sendable {
   let owner: WorkerAudioRouteOwner
   let token: UUID
   let generation: UInt64
@@ -80,18 +61,12 @@ struct WorkerAudioRouteSnapshot {
 final class WorkerAudioRouteCoordinator: @unchecked Sendable {
   static let shared = WorkerAudioRouteCoordinator()
 
-  private struct AudioSessionProtection {
-    let lease: WorkerAudioSessionProtectionLease
-    let reason: String
-  }
-
   private let stateQueue = DispatchQueue(label: "worker.audio.route.state")
   private let deactivationQueue = DispatchQueue(
     label: "worker.audio.route.deactivation",
     qos: .userInitiated
   )
   private var activeLease: WorkerAudioRouteLease?
-  private var activeSessionProtections: [UUID: AudioSessionProtection] = [:]
   private var routeGeneration: UInt64 = 0
 
   @discardableResult
@@ -108,8 +83,7 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       let lease = WorkerAudioRouteLease(
         owner: owner,
         token: UUID(),
-        generation: routeGeneration,
-        mode: mode
+        generation: routeGeneration
       )
       activeLease = lease
       return lease
@@ -139,21 +113,10 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       try session.setActive(true, options: .notifyOthersOnDeactivation)
 
       var preferredInputName: String?
-      switch mode {
-      case .iPhone:
-        if let input = preferredBuiltInInput(session) {
-          try session.setPreferredInput(input)
-          preferredInputName = "\(input.portType.rawValue):\(input.portName)"
-          try session.setActive(true, options: .notifyOthersOnDeactivation)
-        } else {
-          try session.setPreferredInput(nil)
-        }
-      case .glasses:
-        if let input = preferredBluetoothHandsFreeInput(session) {
-          try session.setPreferredInput(input)
-          preferredInputName = "\(input.portType.rawValue):\(input.portName)"
-          try session.setActive(true, options: .notifyOthersOnDeactivation)
-        }
+      if let input = preferredBluetoothHandsFreeInput(session) {
+        try session.setPreferredInput(input)
+        preferredInputName = "\(input.portType.rawValue):\(input.portName)"
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
       }
 
       let routeBeforeOverride = session.currentRoute
@@ -208,107 +171,6 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     }
   }
 
-  func protectAudioSession(
-    owner: WorkerAudioRouteOwner,
-    reason: String
-  ) -> WorkerAudioSessionProtectionLease {
-    let lease = stateQueue.sync { () -> WorkerAudioSessionProtectionLease in
-      let lease = WorkerAudioSessionProtectionLease(
-        owner: owner,
-        token: UUID(),
-        generation: routeGeneration
-      )
-      activeSessionProtections[lease.token] = AudioSessionProtection(
-        lease: lease,
-        reason: reason
-      )
-      return lease
-    }
-
-    NSLog("[WorkerAudio] protected owner=%@ token=%@ reason=%@",
-          owner.rawValue, lease.token.uuidString, reason)
-    Task {
-      await WorkerTelemetry.shared.record(
-        "audio_session_protection_acquired",
-        source: "ios_audio",
-        stage: owner.rawValue,
-        payload: lease.payload.merging(["reason": reason]) { current, _ in current }
-      )
-    }
-    return lease
-  }
-
-  func releaseAudioSessionProtection(
-    lease: WorkerAudioSessionProtectionLease,
-    reason: String? = nil
-  ) async {
-    let state = stateQueue.sync {
-      let didRelease = activeSessionProtections.removeValue(forKey: lease.token) != nil
-      return (
-        didRelease: didRelease,
-        currentLease: activeLease,
-        currentGeneration: routeGeneration,
-        protectionCount: activeSessionProtections.count
-      )
-    }
-
-    guard state.didRelease else {
-      NSLog("[WorkerAudio] stale protection release ignored owner=%@ token=%@",
-            lease.owner.rawValue, lease.token.uuidString)
-      await WorkerTelemetry.shared.record(
-        "audio_session_protection_stale_release_ignored",
-        source: "ios_audio",
-        stage: lease.owner.rawValue,
-        payload: lease.payload
-      )
-      return
-    }
-
-    NSLog("[WorkerAudio] unprotected owner=%@ token=%@ reason=%@",
-          lease.owner.rawValue, lease.token.uuidString, reason ?? "none")
-    await WorkerTelemetry.shared.record(
-      "audio_session_protection_released",
-      source: "ios_audio",
-      stage: lease.owner.rawValue,
-      payload: lease.payload.merging(["reason": reason ?? NSNull()]) { current, _ in current }
-    )
-
-    guard state.currentLease == nil, state.protectionCount == 0 else {
-      return
-    }
-
-    let result = await deactivateSharedAudioSession(expectedGeneration: state.currentGeneration)
-    switch result {
-    case .success(true):
-      NSLog("[WorkerAudio] deactivated after protection release owner=%@ token=%@",
-            lease.owner.rawValue, lease.token.uuidString)
-      await WorkerTelemetry.shared.record(
-        "audio_route_deactivated",
-        source: "ios_audio",
-        stage: lease.owner.rawValue,
-        payload: lease.payload
-      )
-    case .success(false):
-      NSLog("[WorkerAudio] skip deactivate after protection release owner=%@ token=%@",
-            lease.owner.rawValue, lease.token.uuidString)
-      await WorkerTelemetry.shared.record(
-        "audio_route_deactivation_skipped",
-        source: "ios_audio",
-        stage: lease.owner.rawValue,
-        payload: lease.payload
-      )
-    case .failure(let error):
-      NSLog("[WorkerAudio] deactivate after protection release failed owner=%@ token=%@ error=%@",
-            lease.owner.rawValue, lease.token.uuidString, error.localizedDescription)
-      await WorkerTelemetry.shared.record(
-        "audio_route_deactivate_failed",
-        source: "ios_audio",
-        stage: lease.owner.rawValue,
-        payload: lease.payload.merging(["error": error.localizedDescription]) { current, _ in current }
-      )
-    }
-  }
-
   func release(
     lease: WorkerAudioRouteLease,
     afterAudioGraphStops: @escaping () async -> Void = {}
@@ -356,30 +218,19 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     await afterAudioGraphStops()
     await Task.yield()
 
-    let currentState = stateQueue.sync {
-      (
-        lease: activeLease,
-        generation: routeGeneration,
-        protectionCount: activeSessionProtections.count
-      )
+    let currentState = stateQueue.sync { () -> (lease: WorkerAudioRouteLease?, generation: UInt64) in
+      (activeLease, routeGeneration)
     }
     let currentLease = currentState.lease
     let currentGeneration = currentState.generation
-    let protectionCount = currentState.protectionCount
-    let keepsGlassesRouteActive = lease.mode == .glasses
-    let shouldDeactivate = !keepsGlassesRouteActive &&
-      currentLease == nil &&
-      protectionCount == 0 &&
-      currentGeneration == lease.generation
+    let shouldDeactivate = currentLease == nil && currentGeneration == lease.generation
 
     guard shouldDeactivate else {
       var payload: [String: Any] = [
         "owner": lease.owner.rawValue,
         "token": lease.token.uuidString,
         "release_generation": lease.generation,
-        "current_generation": currentGeneration,
-        "active_protections": protectionCount,
-        "keeps_glasses_route_active": keepsGlassesRouteActive
+        "current_generation": currentGeneration
       ]
       payload["current_owner"] = currentLease?.owner.rawValue ?? NSNull()
       payload["current_token"] = currentLease?.token.uuidString ?? NSNull()
@@ -400,21 +251,12 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       return
     }
 
-    let result = await deactivateSharedAudioSession(expectedGeneration: lease.generation)
+    let result = await deactivateSharedAudioSession()
     switch result {
-    case .success(true):
+    case .success:
       NSLog("[WorkerAudio] deactivated owner=%@ token=%@", lease.owner.rawValue, lease.token.uuidString)
       await WorkerTelemetry.shared.record(
         "audio_route_deactivated",
-        source: "ios_audio",
-        stage: lease.owner.rawValue,
-        payload: lease.payload
-      )
-    case .success(false):
-      NSLog("[WorkerAudio] skip deactivate after recheck owner=%@ token=%@",
-            lease.owner.rawValue, lease.token.uuidString)
-      await WorkerTelemetry.shared.record(
-        "audio_route_deactivation_skipped",
         source: "ios_audio",
         stage: lease.owner.rawValue,
         payload: lease.payload
@@ -436,25 +278,15 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     }
   }
 
-  private func deactivateSharedAudioSession(expectedGeneration: UInt64) async -> Result<Bool, Error> {
-    await withCheckedContinuation { (continuation: CheckedContinuation<Result<Bool, Error>, Never>) in
+  private func deactivateSharedAudioSession() async -> Result<Void, Error> {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Result<Void, Error>, Never>) in
       deactivationQueue.async {
-        let shouldDeactivate = self.stateQueue.sync {
-          self.activeLease == nil &&
-            self.activeSessionProtections.isEmpty &&
-            self.routeGeneration == expectedGeneration
-        }
-        guard shouldDeactivate else {
-          continuation.resume(returning: .success(false))
-          return
-        }
-
         do {
           try AVAudioSession.sharedInstance().setActive(
             false,
             options: .notifyOthersOnDeactivation
           )
-          continuation.resume(returning: .success(true))
+          continuation.resume(returning: .success(()))
         } catch {
           continuation.resume(returning: .failure(error))
         }
@@ -464,19 +296,15 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
 
   private func preferredBluetoothHandsFreeInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
     session.availableInputs?.first {
-      $0.portType == .bluetoothHFP
-    }
-  }
-
-  private func preferredBuiltInInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
-    session.availableInputs?.first {
-      $0.portType == .builtInMic
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
     }
   }
 
   private func hasBluetoothHandsFreeRoute(_ route: AVAudioSessionRouteDescription) -> Bool {
     route.inputs.contains {
-      $0.portType == .bluetoothHFP
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+    } || route.outputs.contains {
+      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
     }
   }
 
@@ -499,18 +327,8 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
 
 typealias AudioResetRestartAuthorization = @MainActor @Sendable () -> Bool
 
-struct WorkerNativeAudioCaptureChunk: Sendable {
-  let data: Data
-  let sampleRate: Double
-  let channelCount: UInt32
-  let bitsPerSample: UInt32
-  let wavFormat: UInt16
-  let frameCount: UInt32
-}
-
 final class AudioManager: @unchecked Sendable {
   var onAudioCaptured: ((Data) -> Void)?
-  var onNativeInputAudioCaptured: ((WorkerNativeAudioCaptureChunk) -> Void)?
 
   // Keep the engine container permanent for the process lifetime. Teardown only
   // stops and detaches child nodes; it never nils or replaces this engine.
@@ -676,9 +494,6 @@ final class AudioManager: @unchecked Sendable {
       let rmsValue = self.computeRMS(buffer)
       if currentTapCount % 15 == 0 {
         print("[Audio Monitor] App Mic Level: \(rmsValue)")
-      }
-      if let nativeChunk = self.frozenNativeAudioCaptureChunk(from: buffer) {
-        self.onNativeInputAudioCaptured?(nativeChunk)
       }
       let pcmData: Data
 
@@ -1065,137 +880,14 @@ final class AudioManager: @unchecked Sendable {
 
   private func float32BufferToInt16Data(_ buffer: AVAudioPCMBuffer) -> Data {
     let frameCount = Int(buffer.frameLength)
-    let samples = deepCopiedMonoFloat32Samples(from: buffer)
-    guard frameCount > 0, samples.count == frameCount else { return Data() }
+    guard frameCount > 0, let floatData = buffer.floatChannelData else { return Data() }
     var int16Array = [Int16](repeating: 0, count: frameCount)
     for i in 0..<frameCount {
-      let sample = max(-1.0, min(1.0, samples[i]))
+      let sample = max(-1.0, min(1.0, floatData[0][i]))
       int16Array[i] = Int16(sample * Float(Int16.max))
     }
     return int16Array.withUnsafeBufferPointer { ptr in
       Data(buffer: ptr)
-    }
-  }
-
-  private func deepCopiedMonoFloat32Samples(from buffer: AVAudioPCMBuffer) -> [Float] {
-    let frameCount = Int(buffer.frameLength)
-    guard frameCount > 0, let floatData = buffer.floatChannelData else { return [] }
-
-    var samples = [Float](repeating: 0, count: frameCount)
-    samples.withUnsafeMutableBufferPointer { destination in
-      guard let destinationBase = destination.baseAddress else { return }
-      if buffer.format.isInterleaved {
-        let channelCount = max(1, Int(buffer.format.channelCount))
-        if channelCount == 1 {
-          memcpy(
-            UnsafeMutableRawPointer(destinationBase),
-            UnsafeRawPointer(floatData[0]),
-            frameCount * MemoryLayout<Float>.stride
-          )
-        } else {
-          for frameIndex in 0..<frameCount {
-            destinationBase[frameIndex] = floatData[0][frameIndex * channelCount]
-          }
-        }
-      } else {
-        memcpy(
-          UnsafeMutableRawPointer(destinationBase),
-          UnsafeRawPointer(floatData[0]),
-          frameCount * MemoryLayout<Float>.stride
-        )
-      }
-    }
-    return samples
-  }
-
-  private func frozenNativeAudioCaptureChunk(from buffer: AVAudioPCMBuffer) -> WorkerNativeAudioCaptureChunk? {
-    let frameCount = Int(buffer.frameLength)
-    let channelCount = Int(buffer.format.channelCount)
-    guard frameCount > 0, channelCount > 0 else { return nil }
-
-    switch buffer.format.commonFormat {
-    case .pcmFormatFloat32:
-      guard let floatData = buffer.floatChannelData else { return nil }
-      if buffer.format.isInterleaved {
-        let totalSampleCount = frameCount * channelCount
-        let byteCount = totalSampleCount * MemoryLayout<Float>.stride
-        var data = Data(count: byteCount)
-        data.withUnsafeMutableBytes { destination in
-          guard let destinationBase = destination.baseAddress else { return }
-          memcpy(destinationBase, UnsafeRawPointer(floatData[0]), byteCount)
-        }
-        return WorkerNativeAudioCaptureChunk(
-          data: data,
-          sampleRate: buffer.format.sampleRate,
-          channelCount: UInt32(channelCount),
-          bitsPerSample: 32,
-          wavFormat: 3,
-          frameCount: UInt32(frameCount)
-        )
-      } else {
-        let totalSampleCount = frameCount * channelCount
-        var samples = [Float](repeating: 0, count: totalSampleCount)
-        samples.withUnsafeMutableBufferPointer { destination in
-          guard let destinationBase = destination.baseAddress else { return }
-          for frameIndex in 0..<frameCount {
-            for channelIndex in 0..<channelCount {
-              destinationBase[frameIndex * channelCount + channelIndex] = floatData[channelIndex][frameIndex]
-            }
-          }
-        }
-        let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
-        return WorkerNativeAudioCaptureChunk(
-          data: data,
-          sampleRate: buffer.format.sampleRate,
-          channelCount: UInt32(channelCount),
-          bitsPerSample: 32,
-          wavFormat: 3,
-          frameCount: UInt32(frameCount)
-        )
-      }
-
-    case .pcmFormatInt16:
-      guard let int16Data = buffer.int16ChannelData else { return nil }
-      if buffer.format.isInterleaved {
-        let totalSampleCount = frameCount * channelCount
-        let byteCount = totalSampleCount * MemoryLayout<Int16>.stride
-        var data = Data(count: byteCount)
-        data.withUnsafeMutableBytes { destination in
-          guard let destinationBase = destination.baseAddress else { return }
-          memcpy(destinationBase, UnsafeRawPointer(int16Data[0]), byteCount)
-        }
-        return WorkerNativeAudioCaptureChunk(
-          data: data,
-          sampleRate: buffer.format.sampleRate,
-          channelCount: UInt32(channelCount),
-          bitsPerSample: 16,
-          wavFormat: 1,
-          frameCount: UInt32(frameCount)
-        )
-      } else {
-        let totalSampleCount = frameCount * channelCount
-        var samples = [Int16](repeating: 0, count: totalSampleCount)
-        samples.withUnsafeMutableBufferPointer { destination in
-          guard let destinationBase = destination.baseAddress else { return }
-          for frameIndex in 0..<frameCount {
-            for channelIndex in 0..<channelCount {
-              destinationBase[frameIndex * channelCount + channelIndex] = int16Data[channelIndex][frameIndex]
-            }
-          }
-        }
-        let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
-        return WorkerNativeAudioCaptureChunk(
-          data: data,
-          sampleRate: buffer.format.sampleRate,
-          channelCount: UInt32(channelCount),
-          bitsPerSample: 16,
-          wavFormat: 1,
-          frameCount: UInt32(frameCount)
-        )
-      }
-
-    default:
-      return nil
     }
   }
 

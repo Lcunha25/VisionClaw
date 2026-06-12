@@ -12,7 +12,6 @@ struct SettingsView: View {
   @State private var signalBaseURL: String = ""
   @State private var webrtcSignalingURL: String = ""
   @State private var speakerOutputEnabled: Bool = false
-  @State private var phoneAudioForGlassesDemoEnabled: Bool = false
   @State private var videoStreamingEnabled: Bool = false
   @State private var proactiveNotificationsEnabled: Bool = true
   @State private var showAdvancedBackend = false
@@ -55,7 +54,6 @@ struct SettingsView: View {
 
         Section(header: Text("Audio"), footer: Text("Route audio output to the iPhone speaker instead of glasses. Useful for demos where others need to hear.")) {
           Toggle("Speaker Output", isOn: $speakerOutputEnabled)
-          Toggle("Phone Audio for Glasses Demo", isOn: $phoneAudioForGlassesDemoEnabled)
         }
 
         Section(header: Text("Video"), footer: Text("Continuous Gemini video frames are optional. Step checks still use the camera on demand when you say \"I'm done\" or tap Check Step.")) {
@@ -179,7 +177,6 @@ struct SettingsView: View {
     signalBaseURL = settings.signalBaseURL
     webrtcSignalingURL = settings.webrtcSignalingURL
     speakerOutputEnabled = settings.speakerOutputEnabled
-    phoneAudioForGlassesDemoEnabled = settings.phoneAudioForGlassesDemoEnabled
     videoStreamingEnabled = settings.videoStreamingEnabled
     proactiveNotificationsEnabled = settings.proactiveNotificationsEnabled
   }
@@ -193,7 +190,6 @@ struct SettingsView: View {
     settings.signalBaseURL = signalBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
     settings.webrtcSignalingURL = webrtcSignalingURL.trimmingCharacters(in: .whitespacesAndNewlines)
     settings.speakerOutputEnabled = speakerOutputEnabled
-    settings.phoneAudioForGlassesDemoEnabled = phoneAudioForGlassesDemoEnabled
     settings.videoStreamingEnabled = videoStreamingEnabled
     settings.proactiveNotificationsEnabled = proactiveNotificationsEnabled
   }

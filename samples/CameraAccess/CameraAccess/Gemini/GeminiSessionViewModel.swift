@@ -44,15 +44,7 @@ class GeminiSessionViewModel: ObservableObject {
   var streamingMode: StreamingMode = .glasses
   var onInputCommand: ((String) -> Void)?
   var onInputAudioChunk: ((Data) -> Void)?
-  var onNativeInputAudioChunk: ((WorkerNativeAudioCaptureChunk) -> Void)?
   var onOutputAudioChunk: ((Data) -> Void)?
-
-  private var effectiveAudioMode: StreamingMode {
-    if streamingMode == .glasses, SettingsManager.shared.phoneAudioForGlassesDemoEnabled {
-      return .iPhone
-    }
-    return streamingMode
-  }
 
   init() {
     audioManager.setResetRestartAuthorization { [weak self] in
@@ -97,7 +89,7 @@ class GeminiSessionViewModel: ObservableObject {
     startStateObservation()
 
     do {
-      try audioManager.setupAudioSession(useIPhoneMode: effectiveAudioMode == .iPhone)
+      try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
     } catch {
       sessionIntent = .idle
       await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
@@ -199,21 +191,10 @@ class GeminiSessionViewModel: ObservableObject {
       guard let self else { return }
       Task { @MainActor in
         guard self.isGeminiActive, !self.isStoppingSession else { return }
-        let modelSpeaking = self.geminiService.isModelSpeaking
-        let speakerOnPhone = self.effectiveAudioMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
-        if speakerOnPhone && modelSpeaking { return }
+        let speakerOnPhone = self.streamingMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
+        if speakerOnPhone && self.geminiService.isModelSpeaking { return }
+        self.onInputAudioChunk?(data)
         self.geminiService.sendAudio(data: data)
-        if !modelSpeaking {
-          self.onInputAudioChunk?(data)
-        }
-      }
-    }
-
-    audioManager.onNativeInputAudioCaptured = { [weak self] chunk in
-      guard let self else { return }
-      Task { @MainActor in
-        guard self.isGeminiActive, !self.isStoppingSession else { return }
-        self.onNativeInputAudioChunk?(chunk)
       }
     }
 
@@ -424,7 +405,7 @@ class GeminiSessionViewModel: ObservableObject {
     startStateObservation()
 
     do {
-      try audioManager.setupAudioSession(useIPhoneMode: effectiveAudioMode == .iPhone)
+      try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
     } catch {
       if resetOnFailure {
         await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")

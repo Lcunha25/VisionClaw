@@ -181,7 +181,6 @@ class WebRTCSessionViewModel: ObservableObject {
     incomingRemoteVideoEnabled = wantsIncomingRemoteVideo
     isUsingPhoneFallbackProfile = false
     stablePhoneSenderWindows = 0
-    let audioRouteMode = effectiveAudioRouteMode(for: captureMode)
     Task {
       await WorkerTelemetry.shared.record(
         "webrtc_session_start",
@@ -189,7 +188,6 @@ class WebRTCSessionViewModel: ObservableObject {
         stage: "connecting",
         payload: [
           "capture_mode": captureMode == .iPhone ? "iphone" : "glasses",
-          "audio_route_mode": audioRouteMode == .iPhone ? "iphone" : "glasses",
           "room_mode": roomMode.rawValue,
           "audio_enabled": roomMode.usesAudio
         ]
@@ -245,9 +243,7 @@ class WebRTCSessionViewModel: ObservableObject {
   func refreshSupportAudioRoute(captureMode: StreamingMode) -> String? {
     guard roomMode.usesAudio else { return nil }
     currentCaptureMode = captureMode
-    return webRTCClient?.configureSupportAudioRoute(
-      audioRouteMode: effectiveAudioRouteMode(for: captureMode)
-    )
+    return webRTCClient?.configureSupportAudioRoute(captureMode: captureMode)
   }
 
   /// Called by StreamSessionViewModel on each video frame.
@@ -267,7 +263,6 @@ class WebRTCSessionViewModel: ObservableObject {
     iceServers: [RTCIceServer]?,
     captureMode: StreamingMode
   ) {
-    let audioRouteMode = effectiveAudioRouteMode(for: captureMode)
     let client = WebRTCClient()
     let adapter = WebRTCDelegateAdapter(viewModel: self)
     delegateAdapter = adapter
@@ -288,7 +283,6 @@ class WebRTCSessionViewModel: ObservableObject {
       profile: profile,
       receiveRemoteVideo: wantsIncomingRemoteVideo,
       captureMode: captureMode,
-      audioRouteMode: audioRouteMode,
       roomMode: roomMode
     )
     webRTCClient = client
@@ -300,13 +294,6 @@ class WebRTCSessionViewModel: ObservableObject {
         client?.pushPixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
       }
     )
-  }
-
-  private func effectiveAudioRouteMode(for captureMode: StreamingMode) -> StreamingMode {
-    if captureMode == .glasses, SettingsManager.shared.phoneAudioForGlassesDemoEnabled {
-      return .iPhone
-    }
-    return captureMode
   }
 
   private func connectSignaling(rejoinCode: String?) {

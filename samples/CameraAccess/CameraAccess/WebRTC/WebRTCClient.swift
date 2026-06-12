@@ -38,7 +38,6 @@ class WebRTCClient: NSObject {
   private(set) var remoteAudioTrack: RTCAudioTrack?
   private var receiveRemoteVideo = true
   private var captureMode: StreamingMode = .glasses
-  private var audioRouteMode: StreamingMode = .glasses
   private var roomMode: WebRTCRoomMode = .support
   private var audioRouteLease: WorkerAudioRouteLease?
 
@@ -58,16 +57,14 @@ class WebRTCClient: NSObject {
     profile: WebRTCStreamProfile = WebRTCConfig.supportModeGlassesProfile,
     receiveRemoteVideo: Bool = true,
     captureMode: StreamingMode = .glasses,
-    audioRouteMode: StreamingMode? = nil,
     roomMode: WebRTCRoomMode = .support
   ) {
     streamProfile = profile
     self.receiveRemoteVideo = receiveRemoteVideo
     self.captureMode = captureMode
-    self.audioRouteMode = audioRouteMode ?? captureMode
     self.roomMode = roomMode
     if roomMode.usesAudio {
-      configureSupportAudioRoute(audioRouteMode: self.audioRouteMode)
+      configureSupportAudioRoute(captureMode: captureMode)
     }
     let config = RTCConfiguration()
     config.iceServers = iceServers ?? [RTCIceServer(urlStrings: WebRTCConfig.stunServers)]
@@ -138,17 +135,12 @@ class WebRTCClient: NSObject {
 
   @discardableResult
   func configureSupportAudioRoute(captureMode: StreamingMode) -> String? {
-    configureSupportAudioRoute(audioRouteMode: captureMode)
-  }
-
-  @discardableResult
-  func configureSupportAudioRoute(audioRouteMode: StreamingMode) -> String? {
     guard roomMode.usesAudio else { return nil }
     let previousLease = audioRouteLease
     do {
       let snapshot = try WorkerAudioRouteCoordinator.shared.acquire(
         owner: .backOfficeWebRTC,
-        mode: audioRouteMode,
+        mode: captureMode,
         reason: "webrtc_support_call",
         forceSpeaker: SettingsManager.shared.speakerOutputEnabled,
         preferredIOBufferDuration: 0.02
@@ -159,7 +151,7 @@ class WebRTCClient: NSObject {
           await WorkerAudioRouteCoordinator.shared.release(lease: previousLease)
         }
       }
-      self.audioRouteMode = audioRouteMode
+      self.captureMode = captureMode
 
       let rtcAudioSession = RTCAudioSession.sharedInstance()
       rtcAudioSession.lockForConfiguration()
