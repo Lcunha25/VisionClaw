@@ -97,6 +97,7 @@ fileprivate struct SopAudioSidecar: Sendable {
   let url: URL
   let filename: String
   let source: String
+  let contentType: String
 }
 
 struct SOPTemplate: Identifiable, Hashable {
@@ -434,12 +435,28 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     let hostTime: CFTimeInterval
   }
 
+  private enum AudioSidecarEncoding {
+    case aac
+    case wav(sampleRate: Double)
+  }
+
+  private struct AudioSidecarCandidate {
+    let filename: String
+    let source: String
+    let contentType: String
+    let outputURL: URL
+    let data: Data
+    let encoding: AudioSidecarEncoding
+  }
+
   private let queue = DispatchQueue(label: "sop.conversation.audio.recorder", qos: .userInitiated)
   private let sessionID: String?
   private let recordingStartHostTime: CFTimeInterval
   private let mixedOutputURL: URL
   private let workerInputOutputURL: URL
   private let geminiOutputOutputURL: URL
+  private let rawWorkerInputOutputURL: URL
+  private let rawGeminiOutputOutputURL: URL
   private var chunks: [AudioChunk] = []
   private var inputAudioChunkCount = 0
   private var outputAudioChunkCount = 0
@@ -461,7 +478,19 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     self.geminiOutputOutputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(outputPrefix)_gemini_output")
       .appendingPathExtension("m4a")
-    for outputURL in [mixedOutputURL, workerInputOutputURL, geminiOutputOutputURL] {
+    self.rawWorkerInputOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_worker_input_raw")
+      .appendingPathExtension("wav")
+    self.rawGeminiOutputOutputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(outputPrefix)_gemini_output_raw")
+      .appendingPathExtension("wav")
+    for outputURL in [
+      mixedOutputURL,
+      workerInputOutputURL,
+      geminiOutputOutputURL,
+      rawWorkerInputOutputURL,
+      rawGeminiOutputOutputURL
+    ] {
       try? FileManager.default.removeItem(at: outputURL)
     }
   }
@@ -492,36 +521,58 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
           return
         }
 
-        let candidates = [
-          (
+        let candidates: [AudioSidecarCandidate] = [
+          AudioSidecarCandidate(
             filename: "ai-conversation-mixed.m4a",
             source: "ai-conversation-audio",
+            contentType: "audio/mp4",
             outputURL: self.mixedOutputURL,
             data: Self.renderPCM(
               chunks: chunks,
               recordingStartHostTime: self.recordingStartHostTime,
               sourceFilter: nil
-            )
+            ),
+            encoding: .aac
           ),
-          (
+          AudioSidecarCandidate(
             filename: "ai-worker-input.m4a",
             source: "ai-worker-input-audio",
+            contentType: "audio/mp4",
             outputURL: self.workerInputOutputURL,
             data: Self.renderPCM(
               chunks: chunks,
               recordingStartHostTime: self.recordingStartHostTime,
               sourceFilter: .input
-            )
+            ),
+            encoding: .aac
           ),
-          (
+          AudioSidecarCandidate(
             filename: "ai-gemini-output.m4a",
             source: "ai-gemini-output-audio",
+            contentType: "audio/mp4",
             outputURL: self.geminiOutputOutputURL,
             data: Self.renderPCM(
               chunks: chunks,
               recordingStartHostTime: self.recordingStartHostTime,
               sourceFilter: .output
-            )
+            ),
+            encoding: .aac
+          ),
+          AudioSidecarCandidate(
+            filename: "ai-worker-input-raw.wav",
+            source: "ai-worker-input-raw-audio",
+            contentType: "audio/wav",
+            outputURL: self.rawWorkerInputOutputURL,
+            data: Self.rawPCM(chunks: chunks, sourceFilter: .input),
+            encoding: .wav(sampleRate: GeminiConfig.inputAudioSampleRate)
+          ),
+          AudioSidecarCandidate(
+            filename: "ai-gemini-output-raw.wav",
+            source: "ai-gemini-output-raw-audio",
+            contentType: "audio/wav",
+            outputURL: self.rawGeminiOutputOutputURL,
+            data: Self.rawPCM(chunks: chunks, sourceFilter: .output),
+            encoding: .wav(sampleRate: GeminiConfig.outputAudioSampleRate)
           )
         ].filter { !$0.data.isEmpty }
 
@@ -566,7 +617,8 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
           }
 
           let candidate = candidates[index]
-          Self.writeAACAudio(data: candidate.data, outputURL: candidate.outputURL) { url in
+
+          func recordCandidateResult(_ url: URL?) {
             let byteCount = url.flatMap { url -> Int? in
               guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
                 return nil
@@ -579,11 +631,27 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
                 SopAudioSidecar(
                   url: url,
                   filename: candidate.filename,
-                  source: candidate.source
+                  source: candidate.source,
+                  contentType: candidate.contentType
                 )
               )
             }
             writeCandidate(at: index + 1)
+          }
+
+          switch candidate.encoding {
+          case .aac:
+            Self.writeAACAudio(data: candidate.data, outputURL: candidate.outputURL) { url in
+              recordCandidateResult(url)
+            }
+          case .wav(let sampleRate):
+            recordCandidateResult(
+              Self.writeWAVAudio(
+                data: candidate.data,
+                sampleRate: sampleRate,
+                outputURL: candidate.outputURL
+              )
+            )
           }
         }
 
@@ -691,6 +759,14 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     return int16Samples.withUnsafeBufferPointer { Data(buffer: $0) }
   }
 
+  private static func rawPCM(chunks: [AudioChunk], sourceFilter: Source) -> Data {
+    var data = Data()
+    for chunk in chunks where chunk.source == sourceFilter {
+      data.append(chunk.data)
+    }
+    return data
+  }
+
   private static func resampledFloatSamples(
     from data: Data,
     sourceSampleRate: Double,
@@ -795,6 +871,60 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     audioInput.markAsFinished()
     writer.finishWriting {
       completion(!appendFailed && writer.status == .completed ? outputURL : nil)
+    }
+  }
+
+  private static func writeWAVAudio(
+    data: Data,
+    sampleRate: Double,
+    outputURL: URL
+  ) -> URL? {
+    try? FileManager.default.removeItem(at: outputURL)
+    guard !data.isEmpty, data.count <= Int(UInt32.max - 44) else { return nil }
+
+    let channels = UInt16(GeminiConfig.audioChannels)
+    let bitsPerSample = UInt16(GeminiConfig.audioBitsPerSample)
+    let blockAlign = UInt16((UInt32(channels) * UInt32(bitsPerSample)) / 8)
+    let sampleRateValue = UInt32(sampleRate.rounded())
+    let byteRate = sampleRateValue * UInt32(blockAlign)
+    let dataSize = UInt32(data.count)
+
+    var wav = Data()
+    wav.append(contentsOf: "RIFF".utf8)
+    appendLittleEndian(UInt32(36) + dataSize, to: &wav)
+    wav.append(contentsOf: "WAVE".utf8)
+    wav.append(contentsOf: "fmt ".utf8)
+    appendLittleEndian(UInt32(16), to: &wav)
+    appendLittleEndian(UInt16(1), to: &wav)
+    appendLittleEndian(channels, to: &wav)
+    appendLittleEndian(sampleRateValue, to: &wav)
+    appendLittleEndian(byteRate, to: &wav)
+    appendLittleEndian(blockAlign, to: &wav)
+    appendLittleEndian(bitsPerSample, to: &wav)
+    wav.append(contentsOf: "data".utf8)
+    appendLittleEndian(dataSize, to: &wav)
+    wav.append(data)
+
+    do {
+      try wav.write(to: outputURL, options: .atomic)
+      return outputURL
+    } catch {
+      NSLog("[SOPRecorder] Failed to write raw WAV sidecar: %@", error.localizedDescription)
+      return nil
+    }
+  }
+
+  private static func appendLittleEndian(_ value: UInt16, to data: inout Data) {
+    var littleEndianValue = value.littleEndian
+    withUnsafeBytes(of: &littleEndianValue) { bytes in
+      data.append(contentsOf: bytes)
+    }
+  }
+
+  private static func appendLittleEndian(_ value: UInt32, to data: inout Data) {
+    var littleEndianValue = value.littleEndian
+    withUnsafeBytes(of: &littleEndianValue) { bytes in
+      data.append(contentsOf: bytes)
     }
   }
 
@@ -1944,7 +2074,7 @@ actor WorkerAdminLiveSessionCoordinator {
     return await uploadAsset(
       assetType: "audio",
       filename: sidecar?.filename ?? "ai-conversation.m4a",
-      contentType: "audio/mp4",
+      contentType: sidecar?.contentType ?? "audio/mp4",
       data: data,
       byteSize: byteSize,
       missingDataError: missingDataError,
