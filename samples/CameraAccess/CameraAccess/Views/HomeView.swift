@@ -206,10 +206,10 @@ struct HomeView: View {
         enabled: true
       )
       cameraModeButton(
-        title: viewModel.hasActiveDevice ? "Glasses Camera" : "Glasses Unavailable",
+        title: "Glasses Camera",
         systemName: "eyeglasses",
         mode: .glasses,
-        enabled: viewModel.hasActiveDevice
+        enabled: true
       )
     }
   }

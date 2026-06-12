@@ -274,10 +274,10 @@ struct CaptureView: View {
         enabled: true
       )
       cameraModeButton(
-        title: viewModel.hasActiveDevice ? "Glasses" : "No Glasses",
+        title: "Glasses",
         systemName: "eyeglasses",
         mode: .glasses,
-        enabled: viewModel.hasActiveDevice
+        enabled: true
       )
     }
     .frame(maxWidth: 230)

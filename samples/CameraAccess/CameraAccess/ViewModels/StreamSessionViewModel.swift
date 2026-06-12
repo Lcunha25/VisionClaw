@@ -389,7 +389,11 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
     append(data, sampleRate: GeminiConfig.outputAudioSampleRate, source: .output)
   }
 
-  func finishAudioFile() async -> URL? {
+  func finishAudioFile(
+    includeInput: Bool = true,
+    includeOutput: Bool = true,
+    suffix: String? = nil
+  ) async -> URL? {
     return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
       queue.async { [weak self] in
         guard let self else {
@@ -398,7 +402,12 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
         }
 
         self.isFinishing = true
-        let chunks = self.chunks
+        let chunks = self.chunks.filter { chunk in
+          switch chunk.source {
+          case .input: return includeInput
+          case .output: return includeOutput
+          }
+        }
         let inputCount = self.inputAudioChunkCount
         let outputCount = self.outputAudioChunkCount
         guard !chunks.isEmpty else {
@@ -415,7 +424,9 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
           return
         }
 
-        Self.writeAACAudio(data: mixedPCM, outputURL: self.outputURL) { url in
+        let renderURL = self.outputURLForRender(suffix: suffix)
+        try? FileManager.default.removeItem(at: renderURL)
+        Self.writeAACAudio(data: mixedPCM, outputURL: renderURL) { url in
           let byteCount = url.flatMap { url -> Int? in
             guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
               return nil
@@ -433,7 +444,9 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
               payload: [
                 "bytes": byteCount,
                 "input_audio_chunks": inputCount,
-                "output_audio_chunks": outputCount
+                "output_audio_chunks": outputCount,
+                "include_input": includeInput,
+                "include_output": includeOutput
               ]
             )
           }
@@ -441,6 +454,14 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
         }
       }
     }
+  }
+
+  private func outputURLForRender(suffix: String?) -> URL {
+    guard let suffix, !suffix.isEmpty else { return outputURL }
+    return outputURL
+      .deletingLastPathComponent()
+      .appendingPathComponent(outputURL.deletingPathExtension().lastPathComponent + "_\(suffix)")
+      .appendingPathExtension("m4a")
   }
 
   private func append(_ data: Data, sampleRate: Double, source: Source) {
@@ -806,8 +827,27 @@ private enum SopSessionMediaFinalizer {
         return nil
       }
 
-      if conversationAudioRecorder != nil {
-        NSLog("[SOPRecorder] iPhone recording finalized with native camera audio; skipping conversation audio mux")
+      if let geminiOutputURL = await conversationAudioRecorder?.finishAudioFile(
+        includeInput: false,
+        includeOutput: true,
+        suffix: "gemini_output"
+      ) {
+        let mixedURL = phoneVideoURL
+          .deletingLastPathComponent()
+          .appendingPathComponent(phoneVideoURL.deletingPathExtension().lastPathComponent + "_gemini_output")
+          .appendingPathExtension("mp4")
+        if let muxedURL = await ConversationAudioMuxer.mux(
+          videoURL: phoneVideoURL,
+          audioURL: geminiOutputURL,
+          outputURL: mixedURL
+        ) {
+          try? FileManager.default.removeItem(at: phoneVideoURL)
+          try? FileManager.default.removeItem(at: geminiOutputURL)
+          NSLog("[SOPRecorder] iPhone recording finalized with native mic audio plus Gemini output audio")
+          return muxedURL
+        }
+        try? FileManager.default.removeItem(at: geminiOutputURL)
+        NSLog("[SOPRecorder] Gemini output mux failed; returning native iPhone recording")
       }
       return phoneVideoURL
     }
@@ -2010,6 +2050,9 @@ actor WorkerAdminLiveSessionCoordinator {
         telemetry: telemetry
       )
     } catch {
+      if Task.isCancelled || Self.isCancellation(error) {
+        return
+      }
       let message = error.localizedDescription
       WorkerLiveLogger.log(
         "heartbeat_result",
@@ -2023,6 +2066,14 @@ actor WorkerAdminLiveSessionCoordinator {
       )
       await onHeartbeatFailure?(sessionID, message)
     }
+  }
+
+  private static func isCancellation(_ error: Error) -> Bool {
+    if error is CancellationError {
+      return true
+    }
+    let message = error.localizedDescription
+    return message.localizedCaseInsensitiveContains("cancel")
   }
 
   private func drainQueuedFrames() async {
@@ -3078,7 +3129,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   var canToggleAiGuide: Bool {
-    isSopAuditRunning && !isAiGuideStarting && !hasActiveHelpEscalation
+    isSopAuditRunning && !isAiGuideStarting && !hasActiveHelpEscalation && !isRequestingHelp
   }
 
   var canSwitchCaptureMode: Bool {
@@ -3210,6 +3261,10 @@ class StreamSessionViewModel: ObservableObject {
   private let wearables: WearablesInterface
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
+  private var hasSelectorActiveDevice = false
+  private var hasWearablesDeviceSnapshot = false
+  private var hasRegisteredWearablesSnapshot = false
+  private var aiGuideStartGeneration = 0
   private var iPhoneCameraManager: IPhoneCameraManager?
   private var conversationAudioRecorder: ConversationAudioRecorder?
   private var holdToTalkAudioLease: WorkerAudioRouteLease?
@@ -3232,12 +3287,19 @@ class StreamSessionViewModel: ObservableObject {
       resolution: StreamingResolution.low,
       frameRate: 24)
     streamSession = StreamSession(streamSessionConfig: config, deviceSelector: deviceSelector)
+    updateActiveDeviceAvailability(
+      wearablesHasDevice: !wearables.devices.isEmpty,
+      wearablesRegistered: wearables.registrationState == .registered,
+      allowTransportSwitch: false
+    )
 
     // Monitor device availability
     deviceMonitorTask = Task { @MainActor in
       for await device in deviceSelector.activeDeviceStream() {
-        self.hasActiveDevice = device != nil
-        self.reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: true)
+        self.updateActiveDeviceAvailability(
+          selectorHasDevice: device != nil,
+          allowTransportSwitch: true
+        )
       }
     }
 
@@ -3483,7 +3545,36 @@ class StreamSessionViewModel: ObservableObject {
       }
       showError("Permission denied")
     } catch {
+      if await recoverWearablesRegistrationAfterPermissionFailure(error) {
+        return
+      }
       showError("Permission error: \(error.description)")
+    }
+  }
+
+  private func recoverWearablesRegistrationAfterPermissionFailure(_ error: Error) async -> Bool {
+    let description = String(describing: error)
+    let looksLikeMissingDevice =
+      description.localizedCaseInsensitiveContains("No wearable devices") ||
+      description.localizedCaseInsensitiveContains("discovered or registered")
+    let hasDiscoveredDevice = hasSelectorActiveDevice || hasWearablesDeviceSnapshot || !wearables.devices.isEmpty
+
+    guard looksLikeMissingDevice || !hasDiscoveredDevice else {
+      return false
+    }
+
+    guard wearables.registrationState != .registering else {
+      sopAuditStatusMessage = "Meta registration is already in progress."
+      return true
+    }
+
+    do {
+      sopAuditStatusMessage = "Opening Meta AI to reconnect glasses..."
+      try await wearables.startRegistration()
+      return true
+    } catch {
+      showError("Meta registration failed: \(error.description)")
+      return true
     }
   }
 
@@ -3566,6 +3657,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func stopSession() async {
+    aiGuideStartGeneration += 1
     await geminiAssistant.stopSession()
     isAiGuideStarting = false
     isStepValidationRunning = false
@@ -3602,12 +3694,17 @@ class StreamSessionViewModel: ObservableObject {
     await ensureAiGuideStarted(reason: "manual_toggle")
   }
 
+  private func cancelPendingAiGuideStartForSupport() {
+    aiGuideStartGeneration += 1
+    isAiGuideStarting = false
+  }
+
   @discardableResult
   private func startGeminiAssistant(
     startingMessage: String,
     listeningMessage: String
   ) async -> Bool {
-    guard isSopAuditRunning, !isAiGuideStarting, !hasActiveHelpEscalation else { return false }
+    guard isSopAuditRunning, !isAiGuideStarting, !hasActiveHelpEscalation, !isRequestingHelp else { return false }
     geminiAssistant.streamingMode = streamingMode
     geminiAssistant.configureWorkerAdminAPI(
       opsAPIClient,
@@ -3615,10 +3712,17 @@ class StreamSessionViewModel: ObservableObject {
     )
 
     isAiGuideStarting = true
+    let startGeneration = aiGuideStartGeneration
     aiGuideStatusMessage = startingMessage
     sopAuditStatusMessage = aiGuideStatusMessage
     await geminiAssistant.startSession(systemInstruction: buildGeminiSessionInstruction())
     isAiGuideStarting = false
+    guard startGeneration == aiGuideStartGeneration, !hasActiveHelpEscalation else {
+      if geminiAssistant.isGeminiActive {
+        await geminiAssistant.stopSessionForHumanSupportHandoff()
+      }
+      return false
+    }
     if let errorMessage = geminiAssistant.errorMessage, !errorMessage.isEmpty {
       sopAuditStatusMessage = errorMessage
       aiGuideStatusMessage = errorMessage
@@ -3649,10 +3753,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func waitForMediaReadyBeforeAiStart(reason: String) async -> Bool {
-    if streamingMode == .glasses {
-      return await waitForGlassesMediaReadyBeforeAiStart(reason: reason)
-    }
-
+    guard streamingMode == .iPhone else { return true }
     guard let camera = iPhoneCameraManager else {
       await recordAiGuideMediaReadyTimeout(reason: reason, cameraReady: false)
       return false
@@ -3666,7 +3767,7 @@ class StreamSessionViewModel: ObservableObject {
     var cameraReady = false
 
     while CACurrentMediaTime() < deadline {
-      guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+      guard isSopAuditRunning, !hasActiveHelpEscalation, !isRequestingHelp else { return false }
       let remaining = max(0, deadline - CACurrentMediaTime())
       cameraReady = await camera.waitUntilRunningAndAudioConfigured(
         timeout: min(0.25, remaining)
@@ -3680,40 +3781,6 @@ class StreamSessionViewModel: ObservableObject {
 
     await recordAiGuideMediaReadyTimeout(reason: reason, cameraReady: cameraReady)
     return false
-  }
-
-  private func waitForGlassesMediaReadyBeforeAiStart(reason: String) async -> Bool {
-    aiGuideStatusMessage = "Waiting for glasses camera and mic..."
-    sopAuditStatusMessage = aiGuideStatusMessage
-
-    let timeout: CFTimeInterval = 4.0
-    let deadline = CACurrentMediaTime() + timeout
-    var cameraReady = false
-    var audioReady = false
-
-    while CACurrentMediaTime() < deadline {
-      guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
-      cameraReady = streamingStatus == .streaming && hasReceivedFirstFrame
-      audioReady = isGlassesAudioRouteVisibleForAi()
-      if cameraReady && audioReady {
-        try? await Task.sleep(nanoseconds: 150_000_000)
-        return true
-      }
-      try? await Task.sleep(nanoseconds: 150_000_000)
-    }
-
-    await recordAiGuideMediaReadyTimeout(
-      reason: reason,
-      cameraReady: cameraReady,
-      audioReady: audioReady
-    )
-    return false
-  }
-
-  private func isGlassesAudioRouteVisibleForAi() -> Bool {
-    let session = AVAudioSession.sharedInstance()
-    return hasBluetoothTalkbackRoute(session.currentRoute) ||
-      preferredBluetoothHFPInput(session) != nil
   }
 
   private func recordAiGuideMediaReadyTimeout(
@@ -3755,25 +3822,26 @@ class StreamSessionViewModel: ObservableObject {
     reason: String,
     maxAttempts: Int = 3
   ) async -> Bool {
-    guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+    guard isSopAuditRunning, !hasActiveHelpEscalation, !isRequestingHelp else { return false }
     if geminiAssistant.isGeminiActive {
       return true
     }
     guard !isAiGuideStarting else { return false }
 
-    let effectiveMaxAttempts = streamingMode == .glasses
-      ? max(maxAttempts, 6)
-      : maxAttempts
+    let effectiveMaxAttempts = maxAttempts
 
     aiGuideStatusMessage = "Connecting AI voice..."
     sopAuditStatusMessage = aiGuideStatusMessage
 
     for attempt in 1...effectiveMaxAttempts {
-      guard isSopAuditRunning, !hasActiveHelpEscalation else { return false }
+      guard isSopAuditRunning, !hasActiveHelpEscalation, !isRequestingHelp else { return false }
+      let startGeneration = aiGuideStartGeneration
       let ready = await waitForMediaReadyBeforeAiStart(reason: "\(reason)_attempt_\(attempt)")
+      guard startGeneration == aiGuideStartGeneration else { return false }
       guard ready else {
         guard attempt < effectiveMaxAttempts else { break }
         try? await Task.sleep(nanoseconds: UInt64(attempt) * 850_000_000)
+        guard startGeneration == aiGuideStartGeneration else { return false }
         continue
       }
 
@@ -3804,6 +3872,12 @@ class StreamSessionViewModel: ObservableObject {
         startingMessage: attempt == 1 ? "Connecting AI voice..." : "Retrying AI voice...",
         listeningMessage: "AI guide listening. Say \"I'm done\" or \"next step\" when you finish a step."
       )
+      guard startGeneration == aiGuideStartGeneration else {
+        if geminiAssistant.isGeminiActive {
+          await geminiAssistant.stopSessionForHumanSupportHandoff()
+        }
+        return false
+      }
       if started {
         await WorkerTelemetry.shared.record(
           "ai_guide_autostart_ready",
@@ -3871,10 +3945,6 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func selectCaptureMode(_ mode: StreamingMode) {
-    guard mode != .glasses || hasActiveDevice else {
-      sopAuditStatusMessage = "Meta camera not connected."
-      return
-    }
     preferredCaptureMode = mode
     if webrtcViewModel.isActive && webrtcViewModel.isSupportMode {
       do {
@@ -3946,11 +4016,6 @@ class StreamSessionViewModel: ObservableObject {
 
   func switchToPreferredCaptureModeIfNeeded() async {
     guard canSwitchCaptureMode else { return }
-
-    if preferredCaptureMode == .glasses, !hasActiveDevice {
-      sopAuditStatusMessage = "Meta camera not connected."
-      return
-    }
 
     if isStreaming && streamingMode == preferredCaptureMode {
       return
@@ -4430,7 +4495,7 @@ class StreamSessionViewModel: ObservableObject {
     lastWorkerLiveHeartbeatFailureWarningAt = .distantPast
     if streamingMode == .iPhone {
       sopVideoRecorder = nil
-      conversationAudioRecorder = nil
+      conversationAudioRecorder = ConversationAudioRecorder(sessionID: sessionId)
     } else {
       conversationAudioRecorder = nil
       sopVideoRecorder = SopVideoRecorder(sessionID: sessionId) { [weak self] fileURL in
@@ -4477,11 +4542,11 @@ class StreamSessionViewModel: ObservableObject {
       rememberPendingRecording(sessionID: sessionId, fileURL: expectedIPhoneRecordingURL(for: sessionId))
     }
 
+    await ensureObservationLiveRoomSession()
+
     if isSopAuditRunning && !geminiAssistant.isGeminiActive {
       await ensureAiGuideStarted(reason: "sop_started")
     }
-
-    await ensureObservationLiveRoomSession()
 
     // No countdown/auto-timeout for long SOP runs.
     sopCountdownTask?.cancel()
@@ -4928,12 +4993,11 @@ class StreamSessionViewModel: ObservableObject {
     }
 
     switch preferredCaptureMode {
-    case .glasses where hasActiveDevice:
+    case .glasses:
       await handleStartStreaming()
-    default:
+    case .iPhone:
       let granted = await IPhoneCameraManager.requestPermission()
       if granted {
-        preferredCaptureMode = .iPhone
         startIPhoneSession()
       } else if !showError {
         showError("Camera permission denied. Please grant access in Settings.")
@@ -5837,18 +5901,60 @@ class StreamSessionViewModel: ObservableObject {
     case .iPhone:
       await handleStartIPhone()
     case .glasses:
-      guard hasActiveDevice else {
-        showError("Meta camera unavailable. Connect glasses or switch to iPhone.")
-        return
-      }
       await handleStartStreaming()
     }
   }
 
+  func updateKnownWearablesDevices(_ devices: [DeviceIdentifier]) {
+    updateActiveDeviceAvailability(
+      wearablesHasDevice: !devices.isEmpty,
+      allowTransportSwitch: true
+    )
+  }
+
+  func updateKnownWearablesState(
+    devices: [DeviceIdentifier],
+    registrationState: RegistrationState
+  ) {
+    updateActiveDeviceAvailability(
+      wearablesHasDevice: !devices.isEmpty,
+      wearablesRegistered: registrationState == .registered,
+      allowTransportSwitch: true
+    )
+  }
+
+  func updateKnownWearablesRegistrationState(_ registrationState: RegistrationState) {
+    updateActiveDeviceAvailability(
+      wearablesRegistered: registrationState == .registered,
+      allowTransportSwitch: true
+    )
+  }
+
+  private func updateActiveDeviceAvailability(
+    selectorHasDevice: Bool? = nil,
+    wearablesHasDevice: Bool? = nil,
+    wearablesRegistered: Bool? = nil,
+    allowTransportSwitch: Bool
+  ) {
+    if let selectorHasDevice {
+      hasSelectorActiveDevice = selectorHasDevice
+    }
+    if let wearablesHasDevice {
+      hasWearablesDeviceSnapshot = wearablesHasDevice
+    }
+    if let wearablesRegistered {
+      hasRegisteredWearablesSnapshot = wearablesRegistered
+    }
+
+    hasActiveDevice = hasSelectorActiveDevice || hasWearablesDeviceSnapshot
+    reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: allowTransportSwitch)
+  }
+
   private func reconcileCaptureModeWithDeviceAvailability(allowTransportSwitch: Bool) {
     if !hasActiveDevice, preferredCaptureMode == .glasses {
-      preferredCaptureMode = .iPhone
-      sopAuditStatusMessage = "Meta camera disconnected."
+      sopAuditStatusMessage = hasRegisteredWearablesSnapshot
+        ? "Meta camera registered. Tap glasses to reconnect."
+        : "Meta camera not registered. Tap glasses to connect."
     } else if hasActiveDevice {
       sopAuditStatusMessage = "Meta camera ready. Use the camera selector when you want glasses."
     }
@@ -6397,8 +6503,10 @@ class StreamSessionViewModel: ObservableObject {
     defer { isRequestingHelp = false }
 
     let notes = helpRequestNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-    shouldResumeAiSupportAfterBackOffice = geminiAssistant.isGeminiActive
-    if geminiAssistant.isGeminiActive {
+    let shouldPauseAiGuide = geminiAssistant.isGeminiActive || isAiGuideStarting
+    shouldResumeAiSupportAfterBackOffice = shouldPauseAiGuide
+    if shouldPauseAiGuide {
+      cancelPendingAiGuideStartForSupport()
       await geminiAssistant.stopSessionForHumanSupportHandoff()
       aiGuideStatusMessage = "AI guide paused while back office support is requested."
       sopAuditStatusMessage = aiGuideStatusMessage
@@ -6598,10 +6706,12 @@ class StreamSessionViewModel: ObservableObject {
     isLiveRoomHandoffInProgress = true
     defer { isLiveRoomHandoffInProgress = false }
 
-    if geminiAssistant.isGeminiActive {
+    let shouldPauseAiGuide = geminiAssistant.isGeminiActive || isAiGuideStarting
+    if shouldPauseAiGuide {
       shouldResumeAiSupportAfterBackOffice = true
       aiGuideStatusMessage = "AI guide paused while back office support connects."
       sopAuditStatusMessage = aiGuideStatusMessage
+      cancelPendingAiGuideStartForSupport()
       await geminiAssistant.stopSessionForHumanSupportHandoff()
     }
 

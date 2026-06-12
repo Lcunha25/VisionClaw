@@ -47,9 +47,19 @@ struct StreamSessionView: View {
     .animation(.easeInOut(duration: 0.2), value: viewModel.showShipSuccessToast)
     .onAppear {
       UIApplication.shared.isIdleTimerDisabled = true
+      viewModel.updateKnownWearablesState(
+        devices: wearablesViewModel.devices,
+        registrationState: wearablesViewModel.registrationState
+      )
     }
     .onDisappear {
       UIApplication.shared.isIdleTimerDisabled = false
+    }
+    .onReceive(wearablesViewModel.$devices) { devices in
+      viewModel.updateKnownWearablesDevices(devices)
+    }
+    .onReceive(wearablesViewModel.$registrationState) { registrationState in
+      viewModel.updateKnownWearablesRegistrationState(registrationState)
     }
     .alert("Error", isPresented: $viewModel.showError) {
       Button("OK") {

@@ -117,7 +117,7 @@ struct NonStreamView: View {
         CustomButton(
           title: "Start streaming",
           style: .primary,
-          isDisabled: !viewModel.hasActiveDevice
+          isDisabled: false
         ) {
           Task {
             await viewModel.handleStartStreaming()
