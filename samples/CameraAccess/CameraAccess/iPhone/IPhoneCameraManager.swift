@@ -17,6 +17,7 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
   private var isAudioInputConfigured = false
   private var recordingCompletion: ((URL?) -> Void)?
   private var currentRecordingURL: URL?
+  private var recordingAudioProtection: WorkerAudioSessionProtectionLease?
   private var lastAnalysisEmissionAt: CFTimeInterval = 0
   private var isAnalysisConversionInFlight = false
   private var sampleFrameCount: Int64 = 0
@@ -60,8 +61,16 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
   }
 
   func startRecording(sessionID: String) {
+    let audioProtection = WorkerAudioRouteCoordinator.shared.protectAudioSession(
+      owner: .iPhoneRecording,
+      reason: "iphone_movie_recording"
+    )
+
     sessionQueue.async { [weak self] in
-      guard let self else { return }
+      guard let self else {
+        Self.releaseAudioProtection(audioProtection, reason: "iphone_camera_released_before_recording_start")
+        return
+      }
       self.configureSession()
 
       NSLog(
@@ -77,12 +86,17 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
 
       guard self.captureSession.isRunning else {
         NSLog("[iPhoneCamera] Cannot start recording because capture session is not running")
+        Self.releaseAudioProtection(audioProtection, reason: "iphone_capture_session_not_running")
         return
       }
       guard !self.movieOutput.isRecording else {
         NSLog("[iPhoneCamera] Ignoring startRecording because movie output is already recording")
+        Self.releaseAudioProtection(audioProtection, reason: "iphone_movie_already_recording")
         return
       }
+
+      self.releaseRecordingAudioProtection(reason: "iphone_recording_replaced")
+      self.recordingAudioProtection = audioProtection
 
       let fileURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("sop_\(sessionID)")
@@ -122,6 +136,7 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
 
         guard self.movieOutput.isRecording else {
           NSLog("[iPhoneCamera] stopRecording returning currentRecordingURL immediately because movieOutput.isRecording=false")
+          self.releaseRecordingAudioProtection(reason: "iphone_recording_not_active")
           continuation.resume(returning: self.currentRecordingURL)
           return
         }
@@ -139,9 +154,15 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
   func stop() {
     guard isRunning else { return }
     sessionQueue.async { [weak self] in
+      guard let self else { return }
       NSLog("[iPhoneCamera] stop() requested")
-      self?.captureSession.stopRunning()
-      self?.isRunning = false
+      if self.movieOutput.isRecording {
+        self.movieOutput.stopRecording()
+      } else {
+        self.releaseRecordingAudioProtection(reason: "iphone_camera_stopped")
+      }
+      self.captureSession.stopRunning()
+      self.isRunning = false
       Task {
         await WorkerTelemetry.shared.record(
           "iphone_camera_stop",
@@ -151,6 +172,24 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
       }
       NSLog("[iPhoneCamera] captureSession.stopRunning() complete")
     }
+  }
+
+  private static func releaseAudioProtection(
+    _ lease: WorkerAudioSessionProtectionLease,
+    reason: String
+  ) {
+    Task {
+      await WorkerAudioRouteCoordinator.shared.releaseAudioSessionProtection(
+        lease: lease,
+        reason: reason
+      )
+    }
+  }
+
+  private func releaseRecordingAudioProtection(reason: String) {
+    guard let protection = recordingAudioProtection else { return }
+    recordingAudioProtection = nil
+    Self.releaseAudioProtection(protection, reason: reason)
   }
 
   private func configureSession() {
@@ -240,12 +279,23 @@ class IPhoneCameraManager: NSObject, @unchecked Sendable {
   }
 
   static func requestPermission() async -> Bool {
-    let status = AVCaptureDevice.authorizationStatus(for: .video)
+    let videoGranted = await requestAccess(for: .video)
+    guard videoGranted else { return false }
+
+    let audioGranted = await requestAccess(for: .audio)
+    if !audioGranted {
+      NSLog("[iPhoneCamera] Microphone permission denied for recording")
+    }
+    return audioGranted
+  }
+
+  private static func requestAccess(for mediaType: AVMediaType) async -> Bool {
+    let status = AVCaptureDevice.authorizationStatus(for: mediaType)
     switch status {
     case .authorized:
       return true
     case .notDetermined:
-      return await AVCaptureDevice.requestAccess(for: .video)
+      return await AVCaptureDevice.requestAccess(for: mediaType)
     default:
       return false
     }
@@ -357,6 +407,7 @@ extension IPhoneCameraManager: AVCaptureFileOutputRecordingDelegate {
     let completion = recordingCompletion
     recordingCompletion = nil
     currentRecordingURL = outputFileURL
+    releaseRecordingAudioProtection(reason: error == nil ? "iphone_recording_finished" : "iphone_recording_failed")
     completion?(error == nil ? outputFileURL : nil)
   }
 }

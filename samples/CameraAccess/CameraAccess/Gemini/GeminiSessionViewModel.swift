@@ -191,10 +191,13 @@ class GeminiSessionViewModel: ObservableObject {
       guard let self else { return }
       Task { @MainActor in
         guard self.isGeminiActive, !self.isStoppingSession else { return }
+        let modelSpeaking = self.geminiService.isModelSpeaking
         let speakerOnPhone = self.streamingMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
-        if speakerOnPhone && self.geminiService.isModelSpeaking { return }
-        self.onInputAudioChunk?(data)
+        if speakerOnPhone && modelSpeaking { return }
         self.geminiService.sendAudio(data: data)
+        if !modelSpeaking {
+          self.onInputAudioChunk?(data)
+        }
       }
     }
 

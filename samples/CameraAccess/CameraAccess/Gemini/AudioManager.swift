@@ -6,10 +6,28 @@ enum WorkerAudioRouteOwner: String, Sendable {
   case aiGuide = "ai_guide"
   case backOfficeWebRTC = "back_office_webrtc"
   case holdToTalk = "hold_to_talk"
+  case iPhoneRecording = "iphone_recording"
+  case handoff = "handoff"
   case viewer = "viewer"
 }
 
 struct WorkerAudioRouteLease: Equatable, Sendable {
+  let owner: WorkerAudioRouteOwner
+  let token: UUID
+  let generation: UInt64
+  let mode: StreamingMode
+
+  var payload: [String: Any] {
+    [
+      "owner": owner.rawValue,
+      "token": token.uuidString,
+      "generation": generation,
+      "mode": mode == .iPhone ? "iphone" : "glasses"
+    ]
+  }
+}
+
+struct WorkerAudioSessionProtectionLease: Equatable, Sendable {
   let owner: WorkerAudioRouteOwner
   let token: UUID
   let generation: UInt64
@@ -61,12 +79,18 @@ struct WorkerAudioRouteSnapshot {
 final class WorkerAudioRouteCoordinator: @unchecked Sendable {
   static let shared = WorkerAudioRouteCoordinator()
 
+  private struct AudioSessionProtection {
+    let lease: WorkerAudioSessionProtectionLease
+    let reason: String
+  }
+
   private let stateQueue = DispatchQueue(label: "worker.audio.route.state")
   private let deactivationQueue = DispatchQueue(
     label: "worker.audio.route.deactivation",
     qos: .userInitiated
   )
   private var activeLease: WorkerAudioRouteLease?
+  private var activeSessionProtections: [UUID: AudioSessionProtection] = [:]
   private var routeGeneration: UInt64 = 0
 
   @discardableResult
@@ -83,7 +107,8 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       let lease = WorkerAudioRouteLease(
         owner: owner,
         token: UUID(),
-        generation: routeGeneration
+        generation: routeGeneration,
+        mode: mode
       )
       activeLease = lease
       return lease
@@ -171,6 +196,107 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     }
   }
 
+  func protectAudioSession(
+    owner: WorkerAudioRouteOwner,
+    reason: String
+  ) -> WorkerAudioSessionProtectionLease {
+    let lease = stateQueue.sync { () -> WorkerAudioSessionProtectionLease in
+      let lease = WorkerAudioSessionProtectionLease(
+        owner: owner,
+        token: UUID(),
+        generation: routeGeneration
+      )
+      activeSessionProtections[lease.token] = AudioSessionProtection(
+        lease: lease,
+        reason: reason
+      )
+      return lease
+    }
+
+    NSLog("[WorkerAudio] protected owner=%@ token=%@ reason=%@",
+          owner.rawValue, lease.token.uuidString, reason)
+    Task {
+      await WorkerTelemetry.shared.record(
+        "audio_session_protection_acquired",
+        source: "ios_audio",
+        stage: owner.rawValue,
+        payload: lease.payload.merging(["reason": reason]) { current, _ in current }
+      )
+    }
+    return lease
+  }
+
+  func releaseAudioSessionProtection(
+    lease: WorkerAudioSessionProtectionLease,
+    reason: String? = nil
+  ) async {
+    let state = stateQueue.sync {
+      let didRelease = activeSessionProtections.removeValue(forKey: lease.token) != nil
+      return (
+        didRelease: didRelease,
+        currentLease: activeLease,
+        currentGeneration: routeGeneration,
+        protectionCount: activeSessionProtections.count
+      )
+    }
+
+    guard state.didRelease else {
+      NSLog("[WorkerAudio] stale protection release ignored owner=%@ token=%@",
+            lease.owner.rawValue, lease.token.uuidString)
+      await WorkerTelemetry.shared.record(
+        "audio_session_protection_stale_release_ignored",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: lease.payload
+      )
+      return
+    }
+
+    NSLog("[WorkerAudio] unprotected owner=%@ token=%@ reason=%@",
+          lease.owner.rawValue, lease.token.uuidString, reason ?? "none")
+    await WorkerTelemetry.shared.record(
+      "audio_session_protection_released",
+      source: "ios_audio",
+      stage: lease.owner.rawValue,
+      payload: lease.payload.merging(["reason": reason ?? NSNull()]) { current, _ in current }
+    )
+
+    guard state.currentLease == nil, state.protectionCount == 0 else {
+      return
+    }
+
+    let result = await deactivateSharedAudioSession(expectedGeneration: state.currentGeneration)
+    switch result {
+    case .success(true):
+      NSLog("[WorkerAudio] deactivated after protection release owner=%@ token=%@",
+            lease.owner.rawValue, lease.token.uuidString)
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivated",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: lease.payload
+      )
+    case .success(false):
+      NSLog("[WorkerAudio] skip deactivate after protection release owner=%@ token=%@",
+            lease.owner.rawValue, lease.token.uuidString)
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivation_skipped",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: lease.payload
+      )
+    case .failure(let error):
+      NSLog("[WorkerAudio] deactivate after protection release failed owner=%@ token=%@ error=%@",
+            lease.owner.rawValue, lease.token.uuidString, error.localizedDescription)
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivate_failed",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: lease.payload.merging(["error": error.localizedDescription]) { current, _ in current }
+      )
+    }
+  }
+
   func release(
     lease: WorkerAudioRouteLease,
     afterAudioGraphStops: @escaping () async -> Void = {}
@@ -218,19 +344,30 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     await afterAudioGraphStops()
     await Task.yield()
 
-    let currentState = stateQueue.sync { () -> (lease: WorkerAudioRouteLease?, generation: UInt64) in
-      (activeLease, routeGeneration)
+    let currentState = stateQueue.sync {
+      (
+        lease: activeLease,
+        generation: routeGeneration,
+        protectionCount: activeSessionProtections.count
+      )
     }
     let currentLease = currentState.lease
     let currentGeneration = currentState.generation
-    let shouldDeactivate = currentLease == nil && currentGeneration == lease.generation
+    let protectionCount = currentState.protectionCount
+    let keepsGlassesRouteActive = lease.mode == .glasses
+    let shouldDeactivate = !keepsGlassesRouteActive &&
+      currentLease == nil &&
+      protectionCount == 0 &&
+      currentGeneration == lease.generation
 
     guard shouldDeactivate else {
       var payload: [String: Any] = [
         "owner": lease.owner.rawValue,
         "token": lease.token.uuidString,
         "release_generation": lease.generation,
-        "current_generation": currentGeneration
+        "current_generation": currentGeneration,
+        "active_protections": protectionCount,
+        "keeps_glasses_route_active": keepsGlassesRouteActive
       ]
       payload["current_owner"] = currentLease?.owner.rawValue ?? NSNull()
       payload["current_token"] = currentLease?.token.uuidString ?? NSNull()
@@ -251,12 +388,21 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       return
     }
 
-    let result = await deactivateSharedAudioSession()
+    let result = await deactivateSharedAudioSession(expectedGeneration: lease.generation)
     switch result {
-    case .success:
+    case .success(true):
       NSLog("[WorkerAudio] deactivated owner=%@ token=%@", lease.owner.rawValue, lease.token.uuidString)
       await WorkerTelemetry.shared.record(
         "audio_route_deactivated",
+        source: "ios_audio",
+        stage: lease.owner.rawValue,
+        payload: lease.payload
+      )
+    case .success(false):
+      NSLog("[WorkerAudio] skip deactivate after recheck owner=%@ token=%@",
+            lease.owner.rawValue, lease.token.uuidString)
+      await WorkerTelemetry.shared.record(
+        "audio_route_deactivation_skipped",
         source: "ios_audio",
         stage: lease.owner.rawValue,
         payload: lease.payload
@@ -278,15 +424,25 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     }
   }
 
-  private func deactivateSharedAudioSession() async -> Result<Void, Error> {
-    await withCheckedContinuation { (continuation: CheckedContinuation<Result<Void, Error>, Never>) in
+  private func deactivateSharedAudioSession(expectedGeneration: UInt64) async -> Result<Bool, Error> {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Result<Bool, Error>, Never>) in
       deactivationQueue.async {
+        let shouldDeactivate = self.stateQueue.sync {
+          self.activeLease == nil &&
+            self.activeSessionProtections.isEmpty &&
+            self.routeGeneration == expectedGeneration
+        }
+        guard shouldDeactivate else {
+          continuation.resume(returning: .success(false))
+          return
+        }
+
         do {
           try AVAudioSession.sharedInstance().setActive(
             false,
             options: .notifyOthersOnDeactivation
           )
-          continuation.resume(returning: .success(()))
+          continuation.resume(returning: .success(true))
         } catch {
           continuation.resume(returning: .failure(error))
         }
@@ -296,15 +452,13 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
 
   private func preferredBluetoothHandsFreeInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
     session.availableInputs?.first {
-      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+      $0.portType == .bluetoothHFP
     }
   }
 
   private func hasBluetoothHandsFreeRoute(_ route: AVAudioSessionRouteDescription) -> Bool {
     route.inputs.contains {
-      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
-    } || route.outputs.contains {
-      $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+      $0.portType == .bluetoothHFP
     }
   }
 

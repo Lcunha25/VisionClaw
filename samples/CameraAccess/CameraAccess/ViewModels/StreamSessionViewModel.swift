@@ -80,6 +80,19 @@ enum DossierPipelineStatusKind {
   case error
 }
 
+enum PostRecordingProcessingState: Equatable {
+  case idle
+  case processing
+  case completed
+  case failed
+}
+
+private struct SopFinalizedRecording: Sendable {
+  let url: URL?
+  let audioURL: URL?
+  let failureMessage: String?
+}
+
 struct SOPTemplate: Identifiable, Hashable {
   let id: UUID
   let remoteID: String?
@@ -350,8 +363,60 @@ private struct RemoteSOPItem: Decodable {
   }
 }
 
-private final class ConversationAudioRecorder: @unchecked Sendable {
-  private enum Source: String {
+private enum SopMediaBackgroundTask {
+  static func begin(name: String) async -> UIBackgroundTaskIdentifier {
+    await MainActor.run {
+      UIApplication.shared.beginBackgroundTask(withName: name) {
+        NSLog("[SOPRecorder] Background media finalize task expired")
+      }
+    }
+  }
+
+  static func end(_ identifier: UIBackgroundTaskIdentifier) async {
+    guard identifier != .invalid else { return }
+    await MainActor.run {
+      UIApplication.shared.endBackgroundTask(identifier)
+    }
+  }
+}
+
+private enum SopSessionMediaFinalizer {
+  static func finishRecording(
+    wasIPhoneRecording: Bool,
+    iPhoneCameraManager: IPhoneCameraManager?,
+    sopVideoRecorder: SopVideoRecorder?,
+    preFinalizedIPhoneRecordingURL: URL? = nil,
+    iPhoneRecordingWasPreStopped: Bool = false
+  ) async -> SopFinalizedRecording {
+    if wasIPhoneRecording {
+      let phoneVideoURL: URL?
+      if iPhoneRecordingWasPreStopped {
+        phoneVideoURL = preFinalizedIPhoneRecordingURL
+      } else {
+        phoneVideoURL = await iPhoneCameraManager?.stopRecording()
+        iPhoneCameraManager?.stop()
+      }
+      NSLog("[SOPRecorder] iPhone recording finalized with native movie audio only")
+      return SopFinalizedRecording(
+        url: phoneVideoURL,
+        audioURL: nil,
+        failureMessage: phoneVideoURL == nil
+          ? "Phone recording file was not produced during finalize."
+          : nil
+      )
+    }
+
+    return await sopVideoRecorder?.finishRecording()
+      ?? SopFinalizedRecording(
+        url: nil,
+        audioURL: nil,
+        failureMessage: "Session recorder was unavailable during finalize."
+      )
+  }
+}
+
+private final class SopConversationAudioRecorder: @unchecked Sendable {
+  private enum Source: String, Hashable {
     case input = "worker_input"
     case output = "gemini_output"
   }
@@ -368,11 +433,14 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
   private let recordingStartHostTime: CFTimeInterval
   private let outputURL: URL
   private var chunks: [AudioChunk] = []
-  private var isFinishing = false
   private var inputAudioChunkCount = 0
   private var outputAudioChunkCount = 0
+  private var droppedDuplicateChunkCount = 0
+  private var lastFingerprintBySource: [Source: Int] = [:]
+  private var lastHostTimeBySource: [Source: CFTimeInterval] = [:]
+  private var isFinishing = false
 
-  init(sessionID: String?, recordingStartHostTime: CFTimeInterval = CACurrentMediaTime()) {
+  init(sessionID: String?, recordingStartHostTime: CFTimeInterval) {
     self.sessionID = sessionID
     self.recordingStartHostTime = recordingStartHostTime
     self.outputURL = FileManager.default.temporaryDirectory
@@ -401,6 +469,7 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
         let chunks = self.chunks
         let inputCount = self.inputAudioChunkCount
         let outputCount = self.outputAudioChunkCount
+        let duplicateCount = self.droppedDuplicateChunkCount
         guard !chunks.isEmpty else {
           continuation.resume(returning: nil)
           return
@@ -422,18 +491,26 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
             }
             return attributes[.size] as? Int
           } ?? 0
+          NSLog(
+            "[SOPRecorder] Conversation audio finish completed (input=%d, output=%d, droppedDuplicates=%d, bytes=%d)",
+            inputCount,
+            outputCount,
+            duplicateCount,
+            byteCount
+          )
           Task {
             await WorkerTelemetry.shared.record(
-              "conversation_audio_finish",
+              "sop_conversation_audio_finish",
               source: "media_upload",
               stage: url == nil ? "failed" : "completed",
               sessionID: self.sessionID,
               metricValue: Double(byteCount),
               metricUnit: "bytes",
               payload: [
-                "bytes": byteCount,
                 "input_audio_chunks": inputCount,
-                "output_audio_chunks": outputCount
+                "output_audio_chunks": outputCount,
+                "dropped_duplicate_chunks": duplicateCount,
+                "bytes": byteCount
               ]
             )
           }
@@ -448,6 +525,17 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
     let hostTime = CACurrentMediaTime()
     queue.async { [weak self] in
       guard let self, !self.isFinishing else { return }
+
+      let fingerprint = Self.fingerprint(data)
+      if self.lastFingerprintBySource[source] == fingerprint,
+         let lastHostTime = self.lastHostTimeBySource[source],
+         hostTime - lastHostTime < 0.2 {
+        self.droppedDuplicateChunkCount += 1
+        return
+      }
+      self.lastFingerprintBySource[source] = fingerprint
+      self.lastHostTimeBySource[source] = hostTime
+
       switch source {
       case .input:
         self.inputAudioChunkCount += 1
@@ -465,23 +553,39 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
     }
   }
 
+  private static func fingerprint(_ data: Data) -> Int {
+    var hasher = Hasher()
+    hasher.combine(data.count)
+    hasher.combine(data.prefix(64))
+    hasher.combine(data.suffix(64))
+    return hasher.finalize()
+  }
+
   private static func renderMixedPCM(
     chunks: [AudioChunk],
     recordingStartHostTime: CFTimeInterval
   ) -> Data {
     let targetSampleRate = GeminiConfig.outputAudioSampleRate
+    let maxFrameCount = Int(targetSampleRate * 60 * 60)
     var renderedChunks: [(startFrame: Int, samples: [Float])] = []
     var totalFrameCount = 0
 
     for chunk in chunks {
-      let samples = resampledFloatSamples(
+      var samples = resampledFloatSamples(
         from: chunk.data,
         sourceSampleRate: chunk.sampleRate,
         targetSampleRate: targetSampleRate
       )
       guard !samples.isEmpty else { continue }
+
+      let gain: Float = chunk.source == .input ? 0.55 : 0.85
+      for index in samples.indices {
+        samples[index] *= gain
+      }
+
       let startFrame = max(0, Int((chunk.hostTime - recordingStartHostTime) * targetSampleRate))
-      totalFrameCount = max(totalFrameCount, startFrame + samples.count)
+      guard startFrame < maxFrameCount else { continue }
+      totalFrameCount = min(maxFrameCount, max(totalFrameCount, startFrame + samples.count))
       renderedChunks.append((startFrame, samples))
     }
 
@@ -502,8 +606,8 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
 
     var int16Samples = [Int16](repeating: 0, count: totalFrameCount)
     for index in mixed.indices {
-      let count = contributors[index]
-      let normalized = count > 1 ? mixed[index] / Float(count) : mixed[index]
+      let contributorCount = max(1, Int(contributors[index]))
+      let normalized = contributorCount > 1 ? mixed[index] / Float(contributorCount) : mixed[index]
       let clamped = max(-1.0, min(1.0, normalized))
       int16Samples[index] = Int16(clamped * Float(Int16.max))
     }
@@ -708,59 +812,110 @@ private final class ConversationAudioRecorder: @unchecked Sendable {
   }
 }
 
-private enum ConversationAudioMuxer {
+private enum SopRecordingMuxer {
   static func mux(videoURL: URL, audioURL: URL, outputURL: URL) async -> URL? {
+    let videoAsset = AVURLAsset(url: videoURL)
+    let audioAsset = AVURLAsset(url: audioURL)
+    let composition = AVMutableComposition()
+
+    guard
+      let videoTrack = videoAsset.tracks(withMediaType: .video).first,
+      let compositionVideoTrack = composition.addMutableTrack(
+        withMediaType: .video,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    else {
+      NSLog("[SOPRecorder] Conversation mux skipped because video track is unavailable")
+      return nil
+    }
+
+    guard
+      let audioTrack = audioAsset.tracks(withMediaType: .audio).first,
+      let compositionAudioTrack = composition.addMutableTrack(
+        withMediaType: .audio,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    else {
+      NSLog("[SOPRecorder] Conversation mux skipped because audio track is unavailable")
+      return nil
+    }
+
+    let audioDuration = CMTimeMinimum(videoAsset.duration, audioAsset.duration)
+    guard CMTimeCompare(videoAsset.duration, .zero) > 0,
+          CMTimeCompare(audioDuration, .zero) > 0 else {
+      NSLog(
+        "[SOPRecorder] Conversation mux skipped because duration is empty (video=%.3f audio=%.3f)",
+        CMTimeGetSeconds(videoAsset.duration),
+        CMTimeGetSeconds(audioAsset.duration)
+      )
+      return nil
+    }
+
+    do {
+      try compositionVideoTrack.insertTimeRange(
+        CMTimeRange(start: .zero, duration: videoAsset.duration),
+        of: videoTrack,
+        at: .zero
+      )
+      compositionVideoTrack.preferredTransform = videoTrack.preferredTransform
+      try compositionAudioTrack.insertTimeRange(
+        CMTimeRange(start: .zero, duration: audioDuration),
+        of: audioTrack,
+        at: .zero
+      )
+    } catch {
+      NSLog("[SOPRecorder] Failed to build conversation replay composition: %@", error.localizedDescription)
+      return nil
+    }
+
+    if let passthroughURL = await export(
+      composition,
+      outputURL: outputURL,
+      presetName: AVAssetExportPresetPassthrough
+    ) {
+      if containsAudioTrack(passthroughURL) {
+        return passthroughURL
+      }
+      NSLog("[SOPRecorder] Passthrough conversation mux completed without audio; retrying encoded export")
+      try? FileManager.default.removeItem(at: passthroughURL)
+    }
+
+    let encodedURL = outputURL
+      .deletingLastPathComponent()
+      .appendingPathComponent(outputURL.deletingPathExtension().lastPathComponent + "_encoded")
+      .appendingPathExtension("mp4")
+    if let encodedURL = await export(
+      composition,
+      outputURL: encodedURL,
+      presetName: AVAssetExportPresetHighestQuality
+    ) {
+      if containsAudioTrack(encodedURL) {
+        return encodedURL
+      }
+      NSLog("[SOPRecorder] Encoded conversation mux completed without audio")
+      try? FileManager.default.removeItem(at: encodedURL)
+    }
+
+    return nil
+  }
+
+  private static func export(
+    _ composition: AVComposition,
+    outputURL: URL,
+    presetName: String
+  ) async -> URL? {
     await withCheckedContinuation { continuation in
-      let videoAsset = AVURLAsset(url: videoURL)
-      let audioAsset = AVURLAsset(url: audioURL)
-      let composition = AVMutableComposition()
-
-      guard
-        let videoTrack = videoAsset.tracks(withMediaType: .video).first,
-        let compositionVideoTrack = composition.addMutableTrack(
-          withMediaType: .video,
-          preferredTrackID: kCMPersistentTrackID_Invalid
-        )
-      else {
-        continuation.resume(returning: nil)
-        return
-      }
-
-      do {
-        try compositionVideoTrack.insertTimeRange(
-          CMTimeRange(start: .zero, duration: videoAsset.duration),
-          of: videoTrack,
-          at: .zero
-        )
-        compositionVideoTrack.preferredTransform = videoTrack.preferredTransform
-
-        if let audioTrack = audioAsset.tracks(withMediaType: .audio).first,
-           let compositionAudioTrack = composition.addMutableTrack(
-            withMediaType: .audio,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-           ) {
-          let audioDuration = CMTimeCompare(audioAsset.duration, videoAsset.duration) > 0
-            ? videoAsset.duration
-            : audioAsset.duration
-          if CMTimeCompare(audioDuration, .zero) > 0 {
-            try compositionAudioTrack.insertTimeRange(
-              CMTimeRange(start: .zero, duration: audioDuration),
-              of: audioTrack,
-              at: .zero
-            )
-          }
-        }
-      } catch {
-        NSLog("[SOPRecorder] Failed to build mixed replay composition: %@", error.localizedDescription)
-        continuation.resume(returning: nil)
-        return
-      }
-
       try? FileManager.default.removeItem(at: outputURL)
       guard let exporter = AVAssetExportSession(
         asset: composition,
-        presetName: AVAssetExportPresetPassthrough
+        presetName: presetName
       ) else {
+        NSLog("[SOPRecorder] Conversation mux exporter unavailable for preset %@", presetName)
+        continuation.resume(returning: nil)
+        return
+      }
+      guard exporter.supportedFileTypes.contains(.mp4) else {
+        NSLog("[SOPRecorder] Conversation mux exporter preset %@ does not support mp4", presetName)
         continuation.resume(returning: nil)
         return
       }
@@ -768,110 +923,45 @@ private enum ConversationAudioMuxer {
       exporter.outputFileType = .mp4
       exporter.shouldOptimizeForNetworkUse = true
       exporter.exportAsynchronously {
+        if exporter.status != .completed {
+          NSLog(
+            "[SOPRecorder] Conversation mux export failed (preset=%@ status=%d error=%@)",
+            presetName,
+            exporter.status.rawValue,
+            exporter.error?.localizedDescription ?? "none"
+          )
+        }
         continuation.resume(returning: exporter.status == .completed ? outputURL : nil)
       }
     }
   }
-}
 
-private enum SopMediaBackgroundTask {
-  static func begin(name: String) async -> UIBackgroundTaskIdentifier {
-    await MainActor.run {
-      UIApplication.shared.beginBackgroundTask(withName: name) {
-        NSLog("[SOPRecorder] Background media finalize task expired")
-      }
-    }
-  }
-
-  static func end(_ identifier: UIBackgroundTaskIdentifier) async {
-    guard identifier != .invalid else { return }
-    await MainActor.run {
-      UIApplication.shared.endBackgroundTask(identifier)
-    }
-  }
-}
-
-private enum SopSessionMediaFinalizer {
-  static func finishRecording(
-    wasIPhoneRecording: Bool,
-    iPhoneCameraManager: IPhoneCameraManager?,
-    conversationAudioRecorder: ConversationAudioRecorder?,
-    sopVideoRecorder: SopVideoRecorder?
-  ) async -> URL? {
-    if wasIPhoneRecording {
-      let phoneVideoURL = await iPhoneCameraManager?.stopRecording()
-      let conversationAudioURL = await conversationAudioRecorder?.finishAudioFile()
-      iPhoneCameraManager?.stop()
-
-      guard let phoneVideoURL else {
-        return nil
-      }
-
-      guard let conversationAudioURL else {
-        return phoneVideoURL
-      }
-
-      let mixedURL = phoneVideoURL
-        .deletingLastPathComponent()
-        .appendingPathComponent(phoneVideoURL.deletingPathExtension().lastPathComponent + "_mixed")
-        .appendingPathExtension("mp4")
-      if let muxedURL = await ConversationAudioMuxer.mux(
-        videoURL: phoneVideoURL,
-        audioURL: conversationAudioURL,
-        outputURL: mixedURL
-      ) {
-        try? FileManager.default.removeItem(at: phoneVideoURL)
-        try? FileManager.default.removeItem(at: conversationAudioURL)
-        return muxedURL
-      }
-
-      NSLog("[SOPRecorder] iPhone mixed audio mux failed; returning phone recording")
-      return phoneVideoURL
-    }
-
-    return await sopVideoRecorder?.finishRecording()
+  private static func containsAudioTrack(_ url: URL) -> Bool {
+    AVURLAsset(url: url).tracks(withMediaType: .audio).isEmpty == false
   }
 }
 
 private final class SopVideoRecorder: @unchecked Sendable {
-  private enum AudioTrackKind: String {
-    case input = "worker_input"
-    case output = "gemini_output"
-  }
-
-  private struct PendingAudioChunk {
-    let data: Data
-    let sampleRate: Double
-    let source: AudioTrackKind
-    let hostTime: CFTimeInterval
-  }
-
   private let queue = DispatchQueue(label: "sop.video.recorder", qos: .userInitiated)
   private let sessionID: String?
   private var writer: AVAssetWriter?
   private var writerInput: AVAssetWriterInput?
-  private var inputAudioInput: AVAssetWriterInput?
-  private var outputAudioInput: AVAssetWriterInput?
-  private var inputAudioFormatDescription: CMAudioFormatDescription?
-  private var outputAudioFormatDescription: CMAudioFormatDescription?
   private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
   private let recordingStartHostTime: CFTimeInterval
-  private let conversationRecorder: ConversationAudioRecorder
+  private let conversationAudioRecorder: SopConversationAudioRecorder
   private(set) var outputURL: URL?
   private var isFinishing = false
   private var appendedFrameCount = 0
   private var inputAudioChunkCount = 0
   private var outputAudioChunkCount = 0
   private var droppedAudioChunkCount = 0
-  private var pendingAudioChunks: [PendingAudioChunk] = []
   private let sourcePixelFormat = VideoFrameBufferFactory.pixelFormat
-  private let maxPendingAudioChunks = 160
 
   init(sessionID: String? = nil) {
     self.sessionID = sessionID
     let startHostTime = CACurrentMediaTime()
     self.recordingStartHostTime = startHostTime
-    self.conversationRecorder = ConversationAudioRecorder(
+    self.conversationAudioRecorder = SopConversationAudioRecorder(
       sessionID: sessionID,
       recordingStartHostTime: startHostTime
     )
@@ -911,38 +1001,39 @@ private final class SopVideoRecorder: @unchecked Sendable {
     }
   }
 
-  func appendPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
+  func stopAcceptingFrames() {
     queue.async { [weak self] in
-      guard let self, !self.isFinishing else { return }
-      self.configureWriterIfNeeded(
-        width: CVPixelBufferGetWidth(pixelBuffer),
-        height: CVPixelBufferGetHeight(pixelBuffer)
-      )
-      self.appendPixelBufferInternal(pixelBuffer)
+      self?.isFinishing = true
     }
   }
 
   func appendInputAudio(_ data: Data) {
     guard !data.isEmpty else { return }
-    conversationRecorder.appendInputAudio(data)
+    conversationAudioRecorder.appendInputAudio(data)
     queue.async { [weak self] in
-      self?.inputAudioChunkCount += 1
+      guard let self, !self.isFinishing else { return }
+      self.inputAudioChunkCount += 1
     }
   }
 
   func appendOutputAudio(_ data: Data) {
     guard !data.isEmpty else { return }
-    conversationRecorder.appendOutputAudio(data)
+    conversationAudioRecorder.appendOutputAudio(data)
     queue.async { [weak self] in
-      self?.outputAudioChunkCount += 1
+      guard let self, !self.isFinishing else { return }
+      self.outputAudioChunkCount += 1
     }
   }
 
-  func finishRecording() async -> URL? {
+  func finishRecording() async -> SopFinalizedRecording {
     await withCheckedContinuation { continuation in
       queue.async { [weak self] in
         guard let self else {
-          continuation.resume(returning: nil)
+          continuation.resume(returning: SopFinalizedRecording(
+            url: nil,
+            audioURL: nil,
+            failureMessage: "Session recorder was released before finalize."
+          ))
           return
         }
 
@@ -958,54 +1049,67 @@ private final class SopVideoRecorder: @unchecked Sendable {
         guard let writer = self.writer,
               let writerInput = self.writerInput,
               writer.status == .writing else {
+          let writerStatus = self.writer?.status.rawValue
+          let writerError = self.writer?.error?.localizedDescription
+          let reason: String
           if let writer = self.writer {
             NSLog("[SOPRecorder] finishRecording returning nil because writer status=%d", writer.status.rawValue)
+            reason = "Recording writer stopped before finalize (status=\(writer.status.rawValue), error=\(writer.error?.localizedDescription ?? "none"))."
           } else {
             NSLog("[SOPRecorder] finishRecording returning nil because no video frames were recorded")
+            reason = self.appendedFrameCount > 0
+              ? "Recording writer was unavailable at finalize after frames were accepted."
+              : "Recording file was not created because no video frames were recorded."
           }
           Task {
             await WorkerTelemetry.shared.record(
               "sop_recorder_finish",
               source: "media_upload",
-              stage: "missing_video",
+              stage: self.appendedFrameCount > 0 ? "writer_unavailable" : "missing_video",
               sessionID: self.sessionID,
               payload: [
                 "frame_count": self.appendedFrameCount,
                 "audio_input_chunks": self.inputAudioChunkCount,
                 "audio_output_chunks": self.outputAudioChunkCount,
                 "dropped_audio_chunks": self.droppedAudioChunkCount,
-                "reason": "no_video_frames_recorded"
+                "reason": reason,
+                "writer_status": writerStatus ?? NSNull(),
+                "writer_error": writerError ?? NSNull()
               ]
             )
+            let audioURL = await self.conversationAudioRecorder.finishAudioFile()
+            let audioFileSize = audioURL.flatMap { url -> Int? in
+              guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                return nil
+              }
+              return attributes[.size] as? Int
+            }
+            if let audioURL {
+              NSLog(
+                "[SOPRecorder] Returning audio-only sidecar after video writer was unavailable (audioURL=%@, bytes=%d)",
+                audioURL.path,
+                audioFileSize ?? 0
+              )
+            }
+            continuation.resume(returning: SopFinalizedRecording(
+              url: nil,
+              audioURL: audioURL,
+              failureMessage: reason
+            ))
           }
-          continuation.resume(returning: nil)
           return
         }
 
         self.isFinishing = true
         writerInput.markAsFinished()
         writer.finishWriting {
+          let videoURL = self.outputURL
+          let writerStatus = writer.status
+          let writerErrorDescription = writer.error?.localizedDescription
+
           Task {
-            let videoURL = self.outputURL
-            let audioURL = await self.conversationRecorder.finishAudioFile()
-            var finalURL = videoURL
-            if writer.status == .completed, let videoURL, let audioURL {
-              let mixedURL = videoURL
-                .deletingLastPathComponent()
-                .appendingPathComponent(videoURL.deletingPathExtension().lastPathComponent + "_mixed")
-                .appendingPathExtension("mp4")
-              if let muxedURL = await ConversationAudioMuxer.mux(
-                videoURL: videoURL,
-                audioURL: audioURL,
-                outputURL: mixedURL
-              ) {
-                finalURL = muxedURL
-                try? FileManager.default.removeItem(at: videoURL)
-                try? FileManager.default.removeItem(at: audioURL)
-              } else {
-                NSLog("[SOPRecorder] Mixed audio mux failed; returning video-only recording")
-              }
-            }
+            let finalURL = writerStatus == .completed ? videoURL : nil
+            let audioURL = await self.conversationAudioRecorder.finishAudioFile()
 
             let fileSize = finalURL.flatMap { url -> Int? in
               guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
@@ -1013,31 +1117,49 @@ private final class SopVideoRecorder: @unchecked Sendable {
               }
               return attributes[.size] as? Int
             }
-            NSLog(
-              "[SOPRecorder] finishWriting completed (status=%d, outputURL=%@, bytes=%d)",
-              writer.status.rawValue,
-              finalURL?.path ?? "nil",
-              fileSize ?? 0)
-            Task {
-              await WorkerTelemetry.shared.record(
-                "sop_recorder_finish",
-                source: "media_upload",
-                stage: writer.status == .completed ? "completed" : "failed",
-                sessionID: self.sessionID,
-                metricValue: Double(fileSize ?? 0),
-                metricUnit: "bytes",
-                payload: [
-                  "frame_count": self.appendedFrameCount,
-                  "file_size": fileSize ?? 0,
-                  "audio_input_chunks": self.inputAudioChunkCount,
-                  "audio_output_chunks": self.outputAudioChunkCount,
-                  "dropped_audio_chunks": self.droppedAudioChunkCount,
-                  "writer_status": writer.status.rawValue,
-                  "writer_error": writer.error?.localizedDescription ?? NSNull()
-                ]
-              )
+            let audioFileSize = audioURL.flatMap { url -> Int? in
+              guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                return nil
+              }
+              return attributes[.size] as? Int
             }
-            continuation.resume(returning: writer.status == .completed ? finalURL : nil)
+            NSLog(
+              "[SOPRecorder] finishWriting completed with split media (status=%d, videoURL=%@, videoBytes=%d, audioURL=%@, audioBytes=%d)",
+              writerStatus.rawValue,
+              finalURL?.path ?? "nil",
+              fileSize ?? 0,
+              audioURL?.path ?? "nil",
+              audioFileSize ?? 0)
+            await WorkerTelemetry.shared.record(
+              "sop_recorder_finish",
+              source: "media_upload",
+              stage: writerStatus == .completed ? "completed" : "failed",
+              sessionID: self.sessionID,
+              metricValue: Double(fileSize ?? 0),
+              metricUnit: "bytes",
+              payload: [
+                "frame_count": self.appendedFrameCount,
+                "file_size": fileSize ?? 0,
+                "audio_file_size": audioFileSize ?? NSNull(),
+                "audio_input_chunks": self.inputAudioChunkCount,
+                "audio_output_chunks": self.outputAudioChunkCount,
+                "dropped_audio_chunks": self.droppedAudioChunkCount,
+                "split_conversation_audio": audioURL != nil,
+                "writer_status": writerStatus.rawValue,
+                "writer_error": writerErrorDescription ?? NSNull()
+              ]
+            )
+            let failureMessage: String?
+            if writerStatus == .completed, finalURL != nil {
+              failureMessage = nil
+            } else {
+              failureMessage = "Recording writer failed during finalize (status=\(writerStatus.rawValue), error=\(writerErrorDescription ?? "none"))."
+            }
+            continuation.resume(returning: SopFinalizedRecording(
+              url: writerStatus == .completed ? finalURL : nil,
+              audioURL: audioURL,
+              failureMessage: failureMessage
+            ))
           }
         }
       }
@@ -1138,8 +1260,6 @@ private final class SopVideoRecorder: @unchecked Sendable {
       return
     }
     writer.add(input)
-    // Conversation audio is mixed into one AAC track during finishRecording(),
-    // so the live writer stays focused on video frames.
 
     guard writer.startWriting() else {
       NSLog("[SOPRecorder] startWriting failed: %@", writer.error?.localizedDescription ?? "unknown")
@@ -1152,195 +1272,6 @@ private final class SopVideoRecorder: @unchecked Sendable {
     self.writerInput = input
     self.pixelBufferAdaptor = adaptor
     self.outputURL = fileURL
-    drainPendingAudioChunks()
-  }
-
-  private func appendAudio(
-    _ data: Data,
-    sampleRate: Double,
-    source: AudioTrackKind
-  ) {
-    guard !data.isEmpty else { return }
-    let hostTime = CACurrentMediaTime()
-    queue.async { [weak self] in
-      guard let self, !self.isFinishing else { return }
-      switch source {
-      case .input:
-        self.inputAudioChunkCount += 1
-      case .output:
-        self.outputAudioChunkCount += 1
-      }
-      let chunk = PendingAudioChunk(
-        data: data,
-        sampleRate: sampleRate,
-        source: source,
-        hostTime: hostTime
-      )
-
-      guard self.writer?.status == .writing else {
-        self.pendingAudioChunks.append(chunk)
-        if self.pendingAudioChunks.count > self.maxPendingAudioChunks {
-          self.pendingAudioChunks.removeFirst(self.pendingAudioChunks.count - self.maxPendingAudioChunks)
-          self.droppedAudioChunkCount += 1
-        }
-        return
-      }
-
-      self.appendAudioChunkInternal(chunk)
-    }
-  }
-
-  private func drainPendingAudioChunks() {
-    guard !pendingAudioChunks.isEmpty else { return }
-    let chunks = pendingAudioChunks
-    pendingAudioChunks.removeAll()
-    for chunk in chunks {
-      appendAudioChunkInternal(chunk)
-    }
-  }
-
-  private func appendAudioChunkInternal(_ chunk: PendingAudioChunk) {
-    let audioInput: AVAssetWriterInput?
-    let formatDescription: CMAudioFormatDescription?
-    switch chunk.source {
-    case .input:
-      audioInput = inputAudioInput
-      formatDescription = inputAudioFormatDescription
-    case .output:
-      audioInput = outputAudioInput
-      formatDescription = outputAudioFormatDescription
-    }
-
-    guard let audioInput, let formatDescription else {
-      droppedAudioChunkCount += 1
-      return
-    }
-    guard audioInput.isReadyForMoreMediaData else {
-      droppedAudioChunkCount += 1
-      return
-    }
-    guard let sampleBuffer = Self.makeAudioSampleBuffer(
-      data: chunk.data,
-      sampleRate: chunk.sampleRate,
-      channels: GeminiConfig.audioChannels,
-      formatDescription: formatDescription,
-      presentationTime: CMTime(
-        seconds: max(0, chunk.hostTime - recordingStartHostTime),
-        preferredTimescale: 600
-      )
-    ) else {
-      droppedAudioChunkCount += 1
-      return
-    }
-
-    if !audioInput.append(sampleBuffer) {
-      droppedAudioChunkCount += 1
-      NSLog("[SOPRecorder] Failed appending %@ audio chunk", chunk.source.rawValue)
-    }
-  }
-
-  private func makeAudioInput(sampleRate: Double, channels: UInt32) -> AVAssetWriterInput {
-    let outputSettings: [String: Any] = [
-      AVFormatIDKey: kAudioFormatMPEG4AAC,
-      AVSampleRateKey: sampleRate,
-      AVNumberOfChannelsKey: Int(channels),
-      AVEncoderBitRateKey: 64_000
-    ]
-    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
-    input.expectsMediaDataInRealTime = true
-    return input
-  }
-
-  private static func makePCMFormatDescription(
-    sampleRate: Double,
-    channels: UInt32
-  ) -> CMAudioFormatDescription? {
-    var streamDescription = AudioStreamBasicDescription(
-      mSampleRate: sampleRate,
-      mFormatID: kAudioFormatLinearPCM,
-      mFormatFlags: AudioFormatFlags(kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked),
-      mBytesPerPacket: UInt32(MemoryLayout<Int16>.size) * channels,
-      mFramesPerPacket: 1,
-      mBytesPerFrame: UInt32(MemoryLayout<Int16>.size) * channels,
-      mChannelsPerFrame: channels,
-      mBitsPerChannel: UInt32(MemoryLayout<Int16>.size * 8),
-      mReserved: 0
-    )
-    var formatDescription: CMAudioFormatDescription?
-    let status = CMAudioFormatDescriptionCreate(
-      allocator: kCFAllocatorDefault,
-      asbd: &streamDescription,
-      layoutSize: 0,
-      layout: nil,
-      magicCookieSize: 0,
-      magicCookie: nil,
-      extensions: nil,
-      formatDescriptionOut: &formatDescription
-    )
-    guard status == noErr else { return nil }
-    return formatDescription
-  }
-
-  private static func makeAudioSampleBuffer(
-    data: Data,
-    sampleRate: Double,
-    channels: UInt32,
-    formatDescription: CMAudioFormatDescription,
-    presentationTime: CMTime
-  ) -> CMSampleBuffer? {
-    let bytesPerFrame = Int(MemoryLayout<Int16>.size * Int(channels))
-    guard bytesPerFrame > 0 else { return nil }
-    let sampleCount = data.count / bytesPerFrame
-    guard sampleCount > 0 else { return nil }
-
-    var blockBuffer: CMBlockBuffer?
-    var status = CMBlockBufferCreateWithMemoryBlock(
-      allocator: kCFAllocatorDefault,
-      memoryBlock: nil,
-      blockLength: data.count,
-      blockAllocator: nil,
-      customBlockSource: nil,
-      offsetToData: 0,
-      dataLength: data.count,
-      flags: 0,
-      blockBufferOut: &blockBuffer
-    )
-    guard status == noErr, let blockBuffer else { return nil }
-
-    status = data.withUnsafeBytes { rawBuffer in
-      guard let baseAddress = rawBuffer.baseAddress else { return OSStatus(-1) }
-      return CMBlockBufferReplaceDataBytes(
-        with: baseAddress,
-        blockBuffer: blockBuffer,
-        offsetIntoDestination: 0,
-        dataLength: data.count
-      )
-    }
-    guard status == noErr else { return nil }
-
-    let sampleDuration = CMTime(value: 1, timescale: CMTimeScale(sampleRate))
-    var timing = CMSampleTimingInfo(
-      duration: sampleDuration,
-      presentationTimeStamp: presentationTime,
-      decodeTimeStamp: .invalid
-    )
-    var sampleBuffer: CMSampleBuffer?
-    status = CMSampleBufferCreate(
-      allocator: kCFAllocatorDefault,
-      dataBuffer: blockBuffer,
-      dataReady: true,
-      makeDataReadyCallback: nil,
-      refcon: nil,
-      formatDescription: formatDescription,
-      sampleCount: sampleCount,
-      sampleTimingEntryCount: 1,
-      sampleTimingArray: &timing,
-      sampleSizeEntryCount: 0,
-      sampleSizeArray: nil,
-      sampleBufferOut: &sampleBuffer
-    )
-    guard status == noErr else { return nil }
-    return sampleBuffer
   }
 
   private static func normalizedSize(width: Int, height: Int) -> CGSize {
@@ -1847,7 +1778,8 @@ actor WorkerAdminLiveSessionCoordinator {
 
   func uploadPreparedVideoRecording(
     from fileURL: URL?,
-    preparedUpload: WorkerPreparedMediaUpload
+    preparedUpload: WorkerPreparedMediaUpload,
+    missingDataErrorOverride: String? = nil
   ) async -> WorkerMediaUploadResult {
     guard let sessionID else {
       return videoUploadFailureResult(errorMessage: "Recording upload session is missing.")
@@ -1869,7 +1801,8 @@ actor WorkerAdminLiveSessionCoordinator {
     } else {
       data = nil
       byteSize = 0
-      missingDataError = "Recording file was not created because no video frames were recorded."
+      missingDataError = missingDataErrorOverride
+        ?? "Recording file was not created because no video frames were recorded."
     }
 
     guard let data, !data.isEmpty else {
@@ -1904,6 +1837,39 @@ actor WorkerAdminLiveSessionCoordinator {
       data: data,
       byteSize: byteSize,
       missingDataError: missingDataError
+    )
+  }
+
+  func uploadConversationAudioRecording(from fileURL: URL?) async -> WorkerMediaUploadResult {
+    let byteSize: Int
+    let data: Data?
+    let missingDataError: String
+
+    if let fileURL {
+      data = await fileLoader(fileURL)
+      if let data {
+        byteSize = data.count
+        missingDataError = data.isEmpty
+          ? "Conversation audio file is empty."
+          : "Conversation audio file could not be loaded."
+      } else {
+        byteSize = 0
+        missingDataError = "Conversation audio file could not be loaded."
+      }
+    } else {
+      data = nil
+      byteSize = 0
+      missingDataError = "Conversation audio file was not created during finalize."
+    }
+
+    return await uploadAsset(
+      assetType: "audio",
+      filename: "ai-conversation.m4a",
+      contentType: "audio/mp4",
+      data: data,
+      byteSize: byteSize,
+      missingDataError: missingDataError,
+      source: "ai-conversation-audio"
     )
   }
 
@@ -2005,6 +1971,19 @@ actor WorkerAdminLiveSessionCoordinator {
         telemetry: telemetry
       )
     } catch {
+      if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+        WorkerLiveLogger.log(
+          "heartbeat_cancelled",
+          sessionID: sessionID,
+          roomCode: roomCode,
+          bucket: lastFrameBucket,
+          path: lastFramePath,
+          uploadState: "cancelled",
+          telemetry: telemetry
+        )
+        return
+      }
+
       let message = error.localizedDescription
       WorkerLiveLogger.log(
         "heartbeat_result",
@@ -2073,7 +2052,7 @@ actor WorkerAdminLiveSessionCoordinator {
       )
     }
 
-    let logPrefix = assetType == "frame" ? "frame" : "video"
+    let logPrefix = assetType == "frame" ? "frame" : assetType == "audio" ? "audio" : "video"
     let assetUploadStartedAt = CACurrentMediaTime()
 
     do {
@@ -2310,7 +2289,7 @@ actor WorkerAdminLiveSessionCoordinator {
       )
     }
 
-    let logPrefix = assetType == "frame" ? "frame" : "video"
+    let logPrefix = assetType == "frame" ? "frame" : assetType == "audio" ? "audio" : "video"
     let assetUploadStartedAt = CACurrentMediaTime()
 
     guard let data, !data.isEmpty else {
@@ -2670,11 +2649,16 @@ struct ShippedSessionRecord: Identifiable, Codable {
 private struct PendingWorkerRecording: Codable, Equatable {
   let sessionID: String
   let filePath: String
+  let source: String?
 }
 
 private enum PendingWorkerRecordingStore {
-  static func remember(defaultsKey: String, sessionID: String, fileURL: URL) {
-    let pending = PendingWorkerRecording(sessionID: sessionID, filePath: fileURL.path)
+  static func remember(defaultsKey: String, sessionID: String, fileURL: URL, source: String?) {
+    let pending = PendingWorkerRecording(
+      sessionID: sessionID,
+      filePath: fileURL.path,
+      source: source
+    )
     guard let encoded = try? JSONEncoder().encode(pending) else { return }
     UserDefaults.standard.set(encoded, forKey: defaultsKey)
   }
@@ -2887,6 +2871,8 @@ class StreamSessionViewModel: ObservableObject {
   @Published var dossierPipelineStatusMessage: String = ""
   @Published var dossierPipelineStatusKind: DossierPipelineStatusKind = .info
   @Published var dossierPipelineStatusTimestamp: String = ""
+  @Published var postRecordingProcessingState: PostRecordingProcessingState = .idle
+  @Published var postRecordingProcessingMessage: String = ""
   @Published var dossierSpotterHitCount: Int = 0
   @Published var shippedHistory: [ShippedSessionRecord] = []
   @Published var isSyncingOperations: Bool = false
@@ -3206,7 +3192,6 @@ class StreamSessionViewModel: ObservableObject {
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
   private var iPhoneCameraManager: IPhoneCameraManager?
-  private var conversationAudioRecorder: ConversationAudioRecorder?
   private var holdToTalkAudioLease: WorkerAudioRouteLease?
   private var viewerAudioRouteLease: WorkerAudioRouteLease?
   private let iPhoneAnalysisLane = IPhoneAnalysisLane()
@@ -3248,11 +3233,9 @@ class StreamSessionViewModel: ObservableObject {
     }
     geminiAssistant.onInputAudioChunk = { [weak self] data in
       self?.sopVideoRecorder?.appendInputAudio(data)
-      self?.conversationAudioRecorder?.appendInputAudio(data)
     }
     geminiAssistant.onOutputAudioChunk = { [weak self] data in
       self?.sopVideoRecorder?.appendOutputAudio(data)
-      self?.conversationAudioRecorder?.appendOutputAudio(data)
     }
     iPhoneAnalysisLane.onFrameReady = { [weak self] frame, completion in
       Task { @MainActor [weak self] in
@@ -3284,9 +3267,6 @@ class StreamSessionViewModel: ObservableObject {
           )
         }
         let shouldRecordAudit = self.isSopAuditRunning
-        if shouldRecordAudit {
-          self.sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
-        }
 
         guard self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) else { return }
         let sendablePixelBuffer = SendableStreamPixelBuffer(pixelBuffer: pixelBuffer)
@@ -3350,9 +3330,6 @@ class StreamSessionViewModel: ObservableObject {
             if shouldForwardToWebRTC {
               realtimeVideoForwarder.enqueuePixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
             }
-            if shouldRecordAudit {
-              self.sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
-            }
             guard self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) else { return }
             let sendablePixelBuffer = SendableStreamPixelBuffer(pixelBuffer: pixelBuffer)
             let imageRenderer = self.streamImageRenderer
@@ -3413,9 +3390,6 @@ class StreamSessionViewModel: ObservableObject {
             let timeStampNs = Self.rtcTimestampNs(from: sampleBuffer)
             if shouldForwardToWebRTC {
               realtimeVideoForwarder.enqueuePixelBuffer(pixelBuffer, timeStampNs: timeStampNs)
-            }
-            if shouldRecordAudit {
-              self.sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
             }
             if self.shouldQueueGlassesAnalysisFrame(now: CACurrentMediaTime()) {
               let sendablePixelBuffer = SendableStreamPixelBuffer(pixelBuffer: pixelBuffer)
@@ -3508,14 +3482,6 @@ class StreamSessionViewModel: ObservableObject {
     }
 
     handleAnalysisImageFrame(image, shouldRecordAudit: shouldRecordAudit)
-
-    if shouldRecordAudit {
-      if let pixelBuffer {
-        sopVideoRecorder?.appendPixelBuffer(pixelBuffer)
-      } else {
-        sopVideoRecorder?.appendFrame(image)
-      }
-    }
   }
 
   private func handleAnalysisImageFrame(_ image: UIImage, shouldRecordAudit: Bool) {
@@ -3527,6 +3493,7 @@ class StreamSessionViewModel: ObservableObject {
     geminiAssistant.sendVideoFrameIfThrottled(image: image)
 
     if shouldRecordAudit {
+      sopVideoRecorder?.appendFrame(image)
       Task { await syncLivePreviewFrameIfNeeded(image: image) }
     }
   }
@@ -4368,15 +4335,15 @@ class StreamSessionViewModel: ObservableObject {
     lastWorkerLiveHeartbeatFailureWarningAt = .distantPast
     if streamingMode == .iPhone {
       sopVideoRecorder = nil
-      conversationAudioRecorder = ConversationAudioRecorder(sessionID: sessionId)
     } else {
-      conversationAudioRecorder = nil
       sopVideoRecorder = SopVideoRecorder(sessionID: sessionId)
       if let fileURL = sopVideoRecorder?.outputURL {
-        rememberPendingRecording(sessionID: sessionId, fileURL: fileURL)
+        rememberPendingRecording(sessionID: sessionId, fileURL: fileURL, source: "stream-capture")
       }
     }
     isDossierUploading = false
+    postRecordingProcessingState = .idle
+    postRecordingProcessingMessage = ""
     dossierSpotterHitCount = 0
     updateDossierPipelineStatus("Recording execution...", kind: .info)
     lastSpotterInferenceTime = .distantPast
@@ -4408,7 +4375,11 @@ class StreamSessionViewModel: ObservableObject {
 
     if streamingMode == .iPhone {
       iPhoneCameraManager?.startRecording(sessionID: sessionId)
-      rememberPendingRecording(sessionID: sessionId, fileURL: expectedIPhoneRecordingURL(for: sessionId))
+      rememberPendingRecording(
+        sessionID: sessionId,
+        fileURL: expectedIPhoneRecordingURL(for: sessionId),
+        source: "phone-recording"
+      )
     }
 
     if isSopAuditRunning && !geminiAssistant.isGeminiActive {
@@ -4546,25 +4517,32 @@ class StreamSessionViewModel: ObservableObject {
     preparedUpload: WorkerPreparedMediaUpload?,
     wasIPhoneRecording: Bool,
     iPhoneCameraManager: IPhoneCameraManager?,
-    conversationAudioRecorder: ConversationAudioRecorder?,
-    sopVideoRecorder: SopVideoRecorder?
+    sopVideoRecorder: SopVideoRecorder?,
+    preFinalizedIPhoneRecordingURL: URL? = nil,
+    iPhoneRecordingWasPreStopped: Bool = false,
+    onComplete: (@MainActor @Sendable (WorkerMediaUploadResult) async -> Void)? = nil
   ) {
     let pendingDefaultsKey = pendingRecordingDefaultsKey
+    let recordingSource = wasIPhoneRecording ? "phone-recording" : "stream-capture"
 
     Task.detached(priority: .utility) {
       let backgroundTaskID = await SopMediaBackgroundTask.begin(name: "SOP media finalize")
-      let recordedVideoURL = await SopSessionMediaFinalizer.finishRecording(
+      let finalizedRecording = await SopSessionMediaFinalizer.finishRecording(
         wasIPhoneRecording: wasIPhoneRecording,
         iPhoneCameraManager: iPhoneCameraManager,
-        conversationAudioRecorder: conversationAudioRecorder,
-        sopVideoRecorder: sopVideoRecorder
+        sopVideoRecorder: sopVideoRecorder,
+        preFinalizedIPhoneRecordingURL: preFinalizedIPhoneRecordingURL,
+        iPhoneRecordingWasPreStopped: iPhoneRecordingWasPreStopped
       )
+      let recordedVideoURL = finalizedRecording.url
+      let recordedAudioURL = finalizedRecording.audioURL
 
       let result: WorkerMediaUploadResult
       if let workerAdminSync, let preparedUpload {
         result = await workerAdminSync.uploadPreparedVideoRecording(
           from: recordedVideoURL,
-          preparedUpload: preparedUpload
+          preparedUpload: preparedUpload,
+          missingDataErrorOverride: finalizedRecording.failureMessage
         )
       } else {
         result = WorkerMediaUploadResult(
@@ -4580,6 +4558,13 @@ class StreamSessionViewModel: ObservableObject {
         )
       }
 
+      let audioResult: WorkerMediaUploadResult?
+      if let workerAdminSync, let recordedAudioURL {
+        audioResult = await workerAdminSync.uploadConversationAudioRecording(from: recordedAudioURL)
+      } else {
+        audioResult = nil
+      }
+
       if result.succeeded {
         PendingWorkerRecordingStore.clear(defaultsKey: pendingDefaultsKey)
         if let recordedVideoURL {
@@ -4589,8 +4574,38 @@ class StreamSessionViewModel: ObservableObject {
         PendingWorkerRecordingStore.remember(
           defaultsKey: pendingDefaultsKey,
           sessionID: sessionID,
-          fileURL: recordedVideoURL
+          fileURL: recordedVideoURL,
+          source: recordingSource
         )
+      } else {
+        PendingWorkerRecordingStore.clear(defaultsKey: pendingDefaultsKey)
+        WorkerLiveLogger.log(
+          "session_media_background_finalize_discarded",
+          sessionID: sessionID,
+          assetType: "video",
+          byteSize: 0,
+          uploadState: "skipped",
+          error: result.errorMessage ?? "Recording finalize produced no local video."
+        )
+      }
+
+      if let audioResult {
+        if audioResult.succeeded, let recordedAudioURL {
+          try? FileManager.default.removeItem(at: recordedAudioURL)
+        }
+        WorkerLiveLogger.log(
+          "session_audio_background_finalize_completed",
+          sessionID: sessionID,
+          assetID: audioResult.assetID,
+          assetType: audioResult.assetType,
+          bucket: audioResult.bucket,
+          path: audioResult.path,
+          byteSize: audioResult.byteSize,
+          uploadState: audioResult.uploadState,
+          error: audioResult.errorMessage
+        )
+      } else if let recordedAudioURL {
+        try? FileManager.default.removeItem(at: recordedAudioURL)
       }
 
       WorkerLiveLogger.log(
@@ -4605,25 +4620,117 @@ class StreamSessionViewModel: ObservableObject {
         error: result.errorMessage
       )
 
+      if let onComplete {
+        await onComplete(result)
+      }
       await workerAdminSync?.flushTelemetryAndStop()
       await SopMediaBackgroundTask.end(backgroundTaskID)
     }
+  }
+
+  private func handleBackgroundMediaFinalizationComplete(
+    result: WorkerMediaUploadResult,
+    sessionID: String?,
+    roomCode: String?,
+    syncedToBackend: Bool,
+    wasIPhoneRecording: Bool,
+    historyRecordID: UUID
+  ) async {
+    let recordingLabel = wasIPhoneRecording ? "Phone recording" : "Session recording"
+    let finalStatus = result.isPending
+      ? "Upload pending"
+      : result.succeeded ? "Replay ready" : "Finalize failed"
+    updateHistoryRecord(id: historyRecordID, status: finalStatus)
+
+    if result.uploadState == "failed" {
+      let errorMessage = result.errorMessage ?? "Video finalize failed."
+      setCriticalOperationsSyncIssue(
+        phase: "media_finalize",
+        message: "\(recordingLabel) could not be finalized: \(errorMessage)"
+      )
+      updateDossierPipelineStatus("\(recordingLabel) processing failed.", kind: .error)
+      postRecordingProcessingState = .failed
+      postRecordingProcessingMessage = "\(recordingLabel) processing failed."
+    } else {
+      let successMessage = result.isPending
+        ? "\(recordingLabel) queued for upload."
+        : "\(recordingLabel) saved."
+      updateDossierPipelineStatus(successMessage, kind: .success)
+      postRecordingProcessingState = .completed
+      postRecordingProcessingMessage = successMessage
+    }
+
+    if let sessionID {
+      WorkerLiveLogger.log(
+        "session_end_completed",
+        sessionID: sessionID,
+        roomCode: roomCode,
+        assetID: result.assetID,
+        assetType: result.assetType,
+        bucket: result.bucket,
+        path: result.path,
+        byteSize: result.byteSize,
+        uploadState: result.uploadState,
+        error: result.errorMessage
+      )
+    }
+
+    isDossierUploading = false
+
+    if webrtcViewModel.isActive {
+      webrtcViewModel.stopSession()
+    }
+    workerAdminSync = nil
+
+    hasActiveHelpEscalation = false
+    shouldResumeAiSupportAfterBackOffice = false
+    resetLiveRoomSyncSnapshot()
+    activeExecutionSession = nil
+    currentSopSessionId = nil
+    activeCaptureSOP = nil
+    selectedSOP = nil
+    await syncGeminiSessionInstruction()
+    sopAuditSecondsRemaining = 0.0
+    if canCloseCurrentPackage {
+      packageClosureStatusMessage = "All required SOPs are complete. Close the package from NOW."
+    }
+    sopAuditStatusMessage = result.uploadState != "failed"
+      ? (syncedToBackend ? "Execution synced" : "Execution uploaded")
+      : "Execution ended with media issues"
+    isSpotterInferenceInFlight = false
+    showShipSuccessToast = result.uploadState != "failed"
+    if !wasIPhoneRecording {
+      await startHomeCameraPreviewIfNeeded()
+    }
+
+    try? await Task.sleep(nanoseconds: 2_000_000_000)
+    shouldDismissCapture = true
+    if showShipSuccessToast {
+      successToastTask?.cancel()
+      successToastTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        self?.showShipSuccessToast = false
+      }
+    }
+    isFinalizingAndShipping = false
   }
 
   func endAndShip(status: SopTerminationStatus, cancelCountdownTask: Bool = true) async {
     guard !isFinalizingAndShipping, isSopAuditRunning, currentSopSessionId != nil else { return }
     isFinalizingAndShipping = true
     stopHoldToTalk()
+
     let sessionID = currentSopSessionId
-    let syncedToBackend = activeExecutionSession != nil
+    let activeExecutionSessionAtEnd = activeExecutionSession
+    let syncedToBackend = activeExecutionSessionAtEnd != nil
     let completedSOP = selectedSOP
     let roomCodeAtEnd = webrtcViewModel.roomCode.isEmpty ? nil : webrtcViewModel.roomCode
     let workerAdminSyncAtEnd = workerAdminSync
     let wasIPhoneRecording = streamingMode == .iPhone
     let recordingSource = wasIPhoneRecording ? "phone-recording" : "stream-capture"
     let iPhoneCameraForFinalization = wasIPhoneRecording ? iPhoneCameraManager : nil
-    let conversationAudioRecorderForFinalization = conversationAudioRecorder
     let sopVideoRecorderForFinalization = sopVideoRecorder
+    let historyRecordID = UUID()
     let proofImages = proofImagesByTargetID
     let checklistPayload: [[String: Any]] = checklistItems.map {
       [
@@ -4644,13 +4751,34 @@ class StreamSessionViewModel: ObservableObject {
 
     isSopAuditRunning = false
     isDossierUploading = true
-    updateDossierPipelineStatus("Registering replay upload...", kind: .active)
+    postRecordingProcessingState = .processing
+    postRecordingProcessingMessage = "Processing previous recording..."
+    updateDossierPipelineStatus("Processing previous recording...", kind: .active)
     if cancelCountdownTask {
       sopCountdownTask?.cancel()
     }
     sopCountdownTask = nil
 
+    if !wasIPhoneRecording {
+      sopVideoRecorderForFinalization?.stopAcceptingFrames()
+    }
+    sopVideoRecorder = nil
+    proofImagesByTargetID = [:]
+    appendHistoryRecord(
+      ShippedSessionRecord(
+        id: historyRecordID,
+        timestamp: Date(),
+        sopName: completedSOP?.name ?? "Unknown SOP",
+        status: "Upload pending"
+      )
+    )
+
+    let preFinalizedIPhoneRecordingURL: URL?
+    let iPhoneRecordingWasPreStopped: Bool
     if wasIPhoneRecording {
+      preFinalizedIPhoneRecordingURL = await iPhoneCameraForFinalization?.stopRecording()
+      iPhoneCameraForFinalization?.stop()
+      iPhoneRecordingWasPreStopped = true
       resetIPhoneAnalysisLane()
       iPhoneCameraManager = nil
       iPhonePreviewSession = nil
@@ -4659,10 +4787,10 @@ class StreamSessionViewModel: ObservableObject {
       streamingStatus = .stopped
       streamingMode = .glasses
       geminiAssistant.streamingMode = .glasses
+    } else {
+      preFinalizedIPhoneRecordingURL = nil
+      iPhoneRecordingWasPreStopped = false
     }
-    sopVideoRecorder = nil
-    conversationAudioRecorder = nil
-    proofImagesByTargetID = [:]
 
     await workerAdminSyncAtEnd?.updateCurrentStepIndex(finalStepIndex)
     await workerAdminSyncAtEnd?.updateHelpRequested(false, sendImmediateHeartbeat: false)
@@ -4675,7 +4803,7 @@ class StreamSessionViewModel: ObservableObject {
       ) { [weak self] in
         guard let self else { return }
 
-        if activeExecutionSession != nil {
+        if activeExecutionSessionAtEnd != nil {
           await self.postExecutionEvent(
             type: "session_completed",
             payload: [
@@ -4710,7 +4838,7 @@ class StreamSessionViewModel: ObservableObject {
         errorMessage: "Worker admin sync was unavailable during teardown."
       )
 
-      if activeExecutionSession != nil {
+      if activeExecutionSessionAtEnd != nil {
         await postExecutionEvent(
           type: "session_completed",
           payload: [
@@ -4722,15 +4850,15 @@ class StreamSessionViewModel: ObservableObject {
         )
 
         await patchActiveExecutionSession(
-            ExecutionSessionPatch(
-              status: status == .allItemsChecked ? "completed" : "ended",
-              currentSopID: completedSOP?.remoteID,
-              currentStepIndex: finalStepIndex,
-              helpRequested: false,
-              endedAt: ISO8601DateFormatter().string(from: Date())
-            )
+          ExecutionSessionPatch(
+            status: status == .allItemsChecked ? "completed" : "ended",
+            currentSopID: completedSOP?.remoteID,
+            currentStepIndex: finalStepIndex,
+            helpRequested: false,
+            endedAt: ISO8601DateFormatter().string(from: Date())
           )
-        } else {
+        )
+      } else {
         updateDossierPipelineStatus("Execution ended locally. No backend session was active.", kind: .info)
       }
     }
@@ -4747,11 +4875,34 @@ class StreamSessionViewModel: ObservableObject {
       preparedUpload: preparedVideoUpload,
       wasIPhoneRecording: wasIPhoneRecording,
       iPhoneCameraManager: iPhoneCameraForFinalization,
-      conversationAudioRecorder: conversationAudioRecorderForFinalization,
-      sopVideoRecorder: sopVideoRecorderForFinalization
-    )
+      sopVideoRecorder: sopVideoRecorderForFinalization,
+      preFinalizedIPhoneRecordingURL: preFinalizedIPhoneRecordingURL,
+      iPhoneRecordingWasPreStopped: iPhoneRecordingWasPreStopped
+    ) { [weak self] result in
+      guard let self else { return }
+      await self.handleBackgroundMediaFinalizationComplete(
+        result: result,
+        sessionID: sessionID,
+        roomCode: roomCodeAtEnd,
+        syncedToBackend: syncedToBackend,
+        wasIPhoneRecording: wasIPhoneRecording,
+        historyRecordID: historyRecordID
+      )
+    }
 
-    if let activeExecutionSession {
+    if videoUploadResult.uploadState == "failed" {
+      let errorMessage = videoUploadResult.errorMessage ?? "Video upload reservation failed."
+      let recordingLabel = wasIPhoneRecording ? "Phone recording" : "Session recording"
+      setCriticalOperationsSyncIssue(
+        phase: "media_reservation",
+        message: "\(recordingLabel) upload could not be reserved: \(errorMessage)"
+      )
+      updateDossierPipelineStatus("\(recordingLabel) upload reservation failed.", kind: .error)
+    } else {
+      updateDossierPipelineStatus("Recording stopped. Processing replay...", kind: .active)
+    }
+
+    if let activeExecutionSession = activeExecutionSessionAtEnd {
       if let remoteSOPID = completedSOP?.remoteID {
         await createExecutionMemoryLink(
           sessionID: activeExecutionSession.id,
@@ -4772,81 +4923,6 @@ class StreamSessionViewModel: ObservableObject {
     if let completedSOP {
       markPendingTaskComplete(completedSOP)
     }
-
-    if videoUploadResult.uploadState == "failed" {
-      let errorMessage = videoUploadResult.errorMessage ?? "Video finalize failed."
-      let recordingLabel = wasIPhoneRecording ? "Phone recording" : "Session recording"
-      setCriticalOperationsSyncIssue(
-        phase: "media_reservation",
-        message: "\(recordingLabel) upload could not be reserved: \(errorMessage)"
-      )
-      updateDossierPipelineStatus("\(recordingLabel) upload reservation failed.", kind: .error)
-    } else {
-      updateDossierPipelineStatus(
-        wasIPhoneRecording ? "Phone recording upload pending." : "Session recording upload pending.",
-        kind: .success
-      )
-    }
-
-    isDossierUploading = false
-
-    appendHistoryRecord(
-      ShippedSessionRecord(
-        timestamp: Date(),
-        sopName: completedSOP?.name ?? "Unknown SOP",
-        status: videoUploadResult.isPending
-          ? "Upload pending"
-          : videoUploadResult.succeeded ? "Replay ready" : "Finalize failed"
-      )
-    )
-
-    if let sessionID {
-      WorkerLiveLogger.log(
-        "session_end_completed",
-        sessionID: sessionID,
-        roomCode: roomCodeAtEnd,
-        assetID: videoUploadResult.assetID,
-        assetType: videoUploadResult.assetType,
-        bucket: videoUploadResult.bucket,
-        path: videoUploadResult.path,
-        byteSize: videoUploadResult.byteSize,
-        uploadState: videoUploadResult.uploadState,
-        error: videoUploadResult.errorMessage
-      )
-    }
-
-    if webrtcViewModel.isActive {
-      webrtcViewModel.stopSession()
-    }
-    workerAdminSync = nil
-
-    hasActiveHelpEscalation = false
-    shouldResumeAiSupportAfterBackOffice = false
-    resetLiveRoomSyncSnapshot()
-    activeExecutionSession = nil
-    currentSopSessionId = nil
-    activeCaptureSOP = nil
-    selectedSOP = nil
-    await syncGeminiSessionInstruction()
-    sopAuditSecondsRemaining = 0.0
-    if canCloseCurrentPackage {
-      packageClosureStatusMessage = "All required SOPs are complete. Close the package from NOW."
-    }
-    sopAuditStatusMessage = videoUploadResult.uploadState != "failed"
-      ? (syncedToBackend ? "Execution synced" : "Execution uploaded")
-      : "Execution ended with media reservation issues"
-    isSpotterInferenceInFlight = false
-    shouldDismissCapture = true
-    showShipSuccessToast = true
-    if !wasIPhoneRecording {
-      await startHomeCameraPreviewIfNeeded()
-    }
-    successToastTask?.cancel()
-    successToastTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(nanoseconds: 2_000_000_000)
-      self?.showShipSuccessToast = false
-    }
-    isFinalizingAndShipping = false
   }
 
   // MARK: - iPhone Camera Mode
@@ -4870,7 +4946,7 @@ class StreamSessionViewModel: ObservableObject {
         preferredCaptureMode = .iPhone
         startIPhoneSession()
       } else if !showError {
-        showError("Camera permission denied. Please grant access in Settings.")
+        showError("Camera or microphone permission denied. Please grant access in Settings.")
       }
     }
   }
@@ -4880,7 +4956,7 @@ class StreamSessionViewModel: ObservableObject {
     if granted {
       startIPhoneSession()
     } else {
-      showError("Camera permission denied. Please grant access in Settings.")
+      showError("Camera or microphone permission denied. Please grant access in Settings.")
     }
   }
 
@@ -5069,6 +5145,18 @@ class StreamSessionViewModel: ObservableObject {
     saveHistoryToDefaults()
   }
 
+  private func updateHistoryRecord(id: UUID, status: String) {
+    guard let index = shippedHistory.firstIndex(where: { $0.id == id }) else { return }
+    let existing = shippedHistory[index]
+    shippedHistory[index] = ShippedSessionRecord(
+      id: existing.id,
+      timestamp: existing.timestamp,
+      sopName: existing.sopName,
+      status: status
+    )
+    saveHistoryToDefaults()
+  }
+
   private func loadHistoryFromDefaults() {
     guard let data = UserDefaults.standard.data(forKey: historyDefaultsKey) else { return }
     guard let decoded = try? JSONDecoder().decode([ShippedSessionRecord].self, from: data) else { return }
@@ -5078,13 +5166,15 @@ class StreamSessionViewModel: ObservableObject {
   private func saveHistoryToDefaults() {
     guard let encoded = try? JSONEncoder().encode(shippedHistory) else { return }
     UserDefaults.standard.set(encoded, forKey: historyDefaultsKey)
+    UserDefaults.standard.synchronize()
   }
 
-  private func rememberPendingRecording(sessionID: String, fileURL: URL) {
+  private func rememberPendingRecording(sessionID: String, fileURL: URL, source: String?) {
     PendingWorkerRecordingStore.remember(
       defaultsKey: pendingRecordingDefaultsKey,
       sessionID: sessionID,
-      fileURL: fileURL
+      fileURL: fileURL,
+      source: source
     )
   }
 
@@ -5095,6 +5185,103 @@ class StreamSessionViewModel: ObservableObject {
   private func loadPendingRecording() -> PendingWorkerRecording? {
     guard let data = UserDefaults.standard.data(forKey: pendingRecordingDefaultsKey) else { return nil }
     return try? JSONDecoder().decode(PendingWorkerRecording.self, from: data)
+  }
+
+  private func inspectPendingRecording(_ pendingRecording: PendingWorkerRecording) -> (
+    url: URL?,
+    discardReason: String?,
+    byteSize: Int?
+  ) {
+    let pendingURL = URL(fileURLWithPath: pendingRecording.filePath)
+    guard FileManager.default.fileExists(atPath: pendingURL.path) else {
+      return (nil, "missing_local_file", nil)
+    }
+
+    let byteSize: Int?
+    if let attributes = try? FileManager.default.attributesOfItem(atPath: pendingURL.path),
+       let size = attributes[.size] as? NSNumber {
+      byteSize = size.intValue
+    } else {
+      byteSize = nil
+    }
+
+    if byteSize == 0 {
+      return (nil, "empty_local_file", byteSize)
+    }
+
+    return (pendingURL, nil, byteSize)
+  }
+
+  private func shouldDiscardRecoveredRecordingFailure(_ result: WorkerMediaUploadResult) -> Bool {
+    guard let message = result.errorMessage?.lowercased() else { return false }
+    return message.contains("no video frames") ||
+      message.contains("recording file is empty") ||
+      message.contains("recording file could not be loaded") ||
+      message.contains("recording file was not created")
+  }
+
+  private func discardPendingRecording(
+    _ pendingRecording: PendingWorkerRecording,
+    fileURL: URL?,
+    reason: String,
+    errorMessage: String? = nil,
+    byteSize: Int? = nil
+  ) async {
+    clearPendingRecording()
+    if let fileURL {
+      try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    WorkerLiveLogger.log(
+      "pending_recording_recovery_discarded",
+      sessionID: pendingRecording.sessionID,
+      assetType: "video",
+      path: fileURL?.path ?? pendingRecording.filePath,
+      byteSize: byteSize,
+      uploadState: "skipped",
+      error: errorMessage ?? reason
+    )
+    await WorkerTelemetry.shared.record(
+      "pending_recording_recovery_discarded",
+      source: "media_upload",
+      stage: reason,
+      sessionID: pendingRecording.sessionID,
+      payload: [
+        "file_path": fileURL?.path ?? pendingRecording.filePath,
+        "byte_size": byteSize ?? NSNull(),
+        "error": errorMessage ?? NSNull()
+      ]
+    )
+  }
+
+  private func markRecoveredRecordingSessionEnded(
+    _ pendingRecording: PendingWorkerRecording,
+    uploadedVideo: Bool
+  ) async {
+    do {
+      _ = try await opsAPIClient.updateExecutionSession(
+        id: pendingRecording.sessionID,
+        patch: ExecutionSessionPatch(
+          status: "ended",
+          helpRequested: false,
+          endedAt: ISO8601DateFormatter().string(from: Date())
+        )
+      )
+    } catch {
+      if uploadedVideo {
+        setCriticalOperationsSyncIssue(
+          phase: "session_patch",
+          message: "Recovered video uploaded, but session end sync failed: \(error.localizedDescription)"
+        )
+      } else {
+        WorkerLiveLogger.log(
+          "pending_recording_session_end_patch_failed",
+          sessionID: pendingRecording.sessionID,
+          uploadState: "failed",
+          error: error.localizedDescription
+        )
+      }
+    }
   }
 
   private func expectedIPhoneRecordingURL(for sessionID: String) -> URL {
@@ -5111,8 +5298,21 @@ class StreamSessionViewModel: ObservableObject {
     }
 
     didAttemptPendingRecordingRecovery = true
-    let pendingURL = URL(fileURLWithPath: pendingRecording.filePath)
-    let recoveryURL = FileManager.default.fileExists(atPath: pendingURL.path) ? pendingURL : nil
+    let pendingFile = inspectPendingRecording(pendingRecording)
+    guard let recoveryURL = pendingFile.url else {
+      let discardURL = pendingFile.discardReason == "empty_local_file"
+        ? URL(fileURLWithPath: pendingRecording.filePath)
+        : nil
+      await discardPendingRecording(
+        pendingRecording,
+        fileURL: discardURL,
+        reason: pendingFile.discardReason ?? "unavailable_local_file",
+        byteSize: pendingFile.byteSize
+      )
+      await markRecoveredRecordingSessionEnded(pendingRecording, uploadedVideo: false)
+      return
+    }
+
     let recoverySync = WorkerAdminLiveSessionCoordinator(
       api: opsAPIClient,
       sessionID: pendingRecording.sessionID,
@@ -5122,13 +5322,19 @@ class StreamSessionViewModel: ObservableObject {
 
     let result = await recoverySync.uploadVideoRecording(
       from: recoveryURL,
-      source: "phone-recording"
+      source: pendingRecording.source ?? "session-recording"
     )
     if result.succeeded {
       clearPendingRecording()
-      if let recoveryURL {
-        try? FileManager.default.removeItem(at: recoveryURL)
-      }
+      try? FileManager.default.removeItem(at: recoveryURL)
+    } else if shouldDiscardRecoveredRecordingFailure(result) {
+      await discardPendingRecording(
+        pendingRecording,
+        fileURL: recoveryURL,
+        reason: "unrecoverable_local_recording",
+        errorMessage: result.errorMessage,
+        byteSize: result.byteSize
+      )
     } else {
       setCriticalOperationsSyncIssue(
         phase: "media_finalize",
@@ -5136,23 +5342,7 @@ class StreamSessionViewModel: ObservableObject {
       )
     }
 
-    do {
-      _ = try await opsAPIClient.updateExecutionSession(
-        id: pendingRecording.sessionID,
-        patch: ExecutionSessionPatch(
-          status: "ended",
-          helpRequested: false,
-          endedAt: ISO8601DateFormatter().string(from: Date())
-        )
-      )
-    } catch {
-      if result.succeeded {
-        setCriticalOperationsSyncIssue(
-          phase: "session_patch",
-          message: "Recovered video uploaded, but session end sync failed: \(error.localizedDescription)"
-        )
-      }
-    }
+    await markRecoveredRecordingSessionEnded(pendingRecording, uploadedVideo: result.succeeded)
   }
 
   private func requestSpeechPermissionsIfNeeded() {
@@ -5894,7 +6084,7 @@ class StreamSessionViewModel: ObservableObject {
       holdToTalkAudioLease = snapshot.lease
     case .viewer:
       viewerAudioRouteLease = snapshot.lease
-    case .aiGuide, .backOfficeWebRTC:
+    case .aiGuide, .backOfficeWebRTC, .iPhoneRecording, .handoff:
       break
     }
     return snapshot.fallbackMessage
@@ -6186,7 +6376,7 @@ class StreamSessionViewModel: ObservableObject {
     )
 
     if streamingMode == .glasses, let fileURL = sopVideoRecorder?.outputURL {
-      rememberPendingRecording(sessionID: sessionID, fileURL: fileURL)
+      rememberPendingRecording(sessionID: sessionID, fileURL: fileURL, source: "stream-capture")
     }
 
     await workerAdminSync?.enqueueFrameUpload(data: jpegData)
@@ -6535,6 +6725,19 @@ class StreamSessionViewModel: ObservableObject {
     }
     isLiveRoomHandoffInProgress = true
     defer { isLiveRoomHandoffInProgress = false }
+
+    let audioHandoffProtection = WorkerAudioRouteCoordinator.shared.protectAudioSession(
+      owner: .handoff,
+      reason: "ai_to_webrtc_support_handoff"
+    )
+    defer {
+      Task {
+        await WorkerAudioRouteCoordinator.shared.releaseAudioSessionProtection(
+          lease: audioHandoffProtection,
+          reason: "ai_to_webrtc_support_handoff_complete"
+        )
+      }
+    }
 
     if geminiAssistant.isGeminiActive {
       shouldResumeAiSupportAfterBackOffice = true

@@ -83,6 +83,10 @@ struct CaptureView: View {
           }
           .padding(12)
         }
+
+        if viewModel.postRecordingProcessingState != .idle {
+          postRecordingProcessingOverlay
+        }
       }
     }
     .navigationTitle(sop.name)
@@ -190,6 +194,92 @@ struct CaptureView: View {
     .animation(.spring(response: 0.25, dampingFraction: 0.65), value: finishButtonPulse)
     .animation(.easeInOut(duration: 0.2), value: isFinishingSOP)
     .disabled(isFinishingSOP)
+  }
+
+  private var postRecordingProcessingOverlay: some View {
+    let state = viewModel.postRecordingProcessingState
+    let isProcessing = state == .processing
+    let accentColor: Color = {
+      switch state {
+      case .idle, .processing:
+        return DesignSystem.colors.vibrantTeal
+      case .completed:
+        return DesignSystem.colors.deepGreen
+      case .failed:
+        return .red
+      }
+    }()
+    let iconName: String = {
+      switch state {
+      case .idle, .processing:
+        return "hourglass"
+      case .completed:
+        return "checkmark.seal.fill"
+      case .failed:
+        return "exclamationmark.triangle.fill"
+      }
+    }()
+    let title: String = {
+      switch state {
+      case .idle, .processing:
+        return "PROCESSING RECORDING"
+      case .completed:
+        return "RECORDING SAVED"
+      case .failed:
+        return "RECORDING FAILED"
+      }
+    }()
+
+    return ZStack {
+      Color.black.opacity(0.64)
+        .ignoresSafeArea()
+
+      VStack(spacing: 16) {
+        ZStack {
+          Circle()
+            .fill(accentColor.opacity(0.16))
+            .frame(width: 64, height: 64)
+
+          if isProcessing {
+            ProgressView()
+              .progressViewStyle(.circular)
+              .tint(accentColor)
+          } else {
+            Image(systemName: iconName)
+              .font(.system(size: 28, weight: .semibold))
+              .foregroundColor(accentColor)
+          }
+        }
+
+        VStack(spacing: 8) {
+          Text(title)
+            .font(DesignSystem.fonts.mono(size: 15, weight: .bold))
+            .foregroundColor(DesignSystem.colors.white)
+            .multilineTextAlignment(.center)
+
+          Text(viewModel.postRecordingProcessingMessage.isEmpty
+               ? "Processing previous recording..."
+               : viewModel.postRecordingProcessingMessage)
+            .font(DesignSystem.fonts.mono(size: 13, weight: .semibold))
+            .foregroundColor(DesignSystem.colors.white.opacity(0.82))
+            .multilineTextAlignment(.center)
+            .lineLimit(3)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .padding(.horizontal, 24)
+      .padding(.vertical, 26)
+      .frame(maxWidth: 320)
+      .background(DesignSystem.colors.deepNavy.opacity(0.92))
+      .overlay(
+        RoundedRectangle(cornerRadius: 8)
+          .stroke(accentColor.opacity(0.8), lineWidth: 1)
+      )
+      .clipShape(RoundedRectangle(cornerRadius: 8))
+      .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: 12)
+    }
+    .transition(.opacity)
+    .animation(.easeInOut(duration: 0.2), value: viewModel.postRecordingProcessingState)
   }
 
   private var aiGuideButton: some View {
