@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 import UIKit
 
@@ -138,10 +139,21 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
       try session.setActive(true, options: .notifyOthersOnDeactivation)
 
       var preferredInputName: String?
-      if let input = preferredBluetoothHandsFreeInput(session) {
-        try session.setPreferredInput(input)
-        preferredInputName = "\(input.portType.rawValue):\(input.portName)"
-        try session.setActive(true, options: .notifyOthersOnDeactivation)
+      switch mode {
+      case .iPhone:
+        if let input = preferredBuiltInInput(session) {
+          try session.setPreferredInput(input)
+          preferredInputName = "\(input.portType.rawValue):\(input.portName)"
+          try session.setActive(true, options: .notifyOthersOnDeactivation)
+        } else {
+          try session.setPreferredInput(nil)
+        }
+      case .glasses:
+        if let input = preferredBluetoothHandsFreeInput(session) {
+          try session.setPreferredInput(input)
+          preferredInputName = "\(input.portType.rawValue):\(input.portName)"
+          try session.setActive(true, options: .notifyOthersOnDeactivation)
+        }
       }
 
       let routeBeforeOverride = session.currentRoute
@@ -456,6 +468,12 @@ final class WorkerAudioRouteCoordinator: @unchecked Sendable {
     }
   }
 
+  private func preferredBuiltInInput(_ session: AVAudioSession) -> AVAudioSessionPortDescription? {
+    session.availableInputs?.first {
+      $0.portType == .builtInMic
+    }
+  }
+
   private func hasBluetoothHandsFreeRoute(_ route: AVAudioSessionRouteDescription) -> Bool {
     route.inputs.contains {
       $0.portType == .bluetoothHFP
@@ -487,6 +505,7 @@ struct WorkerNativeAudioCaptureChunk: Sendable {
   let channelCount: UInt32
   let bitsPerSample: UInt32
   let wavFormat: UInt16
+  let frameCount: UInt32
 }
 
 final class AudioManager: @unchecked Sendable {
@@ -658,7 +677,7 @@ final class AudioManager: @unchecked Sendable {
       if currentTapCount % 15 == 0 {
         print("[Audio Monitor] App Mic Level: \(rmsValue)")
       }
-      if let nativeChunk = self.nativeAudioCaptureChunk(from: buffer) {
+      if let nativeChunk = self.frozenNativeAudioCaptureChunk(from: buffer) {
         self.onNativeInputAudioCaptured?(nativeChunk)
       }
       let pcmData: Data
@@ -1046,10 +1065,11 @@ final class AudioManager: @unchecked Sendable {
 
   private func float32BufferToInt16Data(_ buffer: AVAudioPCMBuffer) -> Data {
     let frameCount = Int(buffer.frameLength)
-    guard frameCount > 0, let floatData = buffer.floatChannelData else { return Data() }
+    let samples = deepCopiedMonoFloat32Samples(from: buffer)
+    guard frameCount > 0, samples.count == frameCount else { return Data() }
     var int16Array = [Int16](repeating: 0, count: frameCount)
     for i in 0..<frameCount {
-      let sample = max(-1.0, min(1.0, floatData[0][i]))
+      let sample = max(-1.0, min(1.0, samples[i]))
       int16Array[i] = Int16(sample * Float(Int16.max))
     }
     return int16Array.withUnsafeBufferPointer { ptr in
@@ -1057,7 +1077,38 @@ final class AudioManager: @unchecked Sendable {
     }
   }
 
-  private func nativeAudioCaptureChunk(from buffer: AVAudioPCMBuffer) -> WorkerNativeAudioCaptureChunk? {
+  private func deepCopiedMonoFloat32Samples(from buffer: AVAudioPCMBuffer) -> [Float] {
+    let frameCount = Int(buffer.frameLength)
+    guard frameCount > 0, let floatData = buffer.floatChannelData else { return [] }
+
+    var samples = [Float](repeating: 0, count: frameCount)
+    samples.withUnsafeMutableBufferPointer { destination in
+      guard let destinationBase = destination.baseAddress else { return }
+      if buffer.format.isInterleaved {
+        let channelCount = max(1, Int(buffer.format.channelCount))
+        if channelCount == 1 {
+          memcpy(
+            UnsafeMutableRawPointer(destinationBase),
+            UnsafeRawPointer(floatData[0]),
+            frameCount * MemoryLayout<Float>.stride
+          )
+        } else {
+          for frameIndex in 0..<frameCount {
+            destinationBase[frameIndex] = floatData[0][frameIndex * channelCount]
+          }
+        }
+      } else {
+        memcpy(
+          UnsafeMutableRawPointer(destinationBase),
+          UnsafeRawPointer(floatData[0]),
+          frameCount * MemoryLayout<Float>.stride
+        )
+      }
+    }
+    return samples
+  }
+
+  private func frozenNativeAudioCaptureChunk(from buffer: AVAudioPCMBuffer) -> WorkerNativeAudioCaptureChunk? {
     let frameCount = Int(buffer.frameLength)
     let channelCount = Int(buffer.format.channelCount)
     guard frameCount > 0, channelCount > 0 else { return nil }
@@ -1065,49 +1116,83 @@ final class AudioManager: @unchecked Sendable {
     switch buffer.format.commonFormat {
     case .pcmFormatFloat32:
       guard let floatData = buffer.floatChannelData else { return nil }
-      var samples = [Float]()
-      samples.reserveCapacity(frameCount * channelCount)
       if buffer.format.isInterleaved {
         let totalSampleCount = frameCount * channelCount
-        samples.append(contentsOf: UnsafeBufferPointer(start: floatData[0], count: totalSampleCount))
+        let byteCount = totalSampleCount * MemoryLayout<Float>.stride
+        var data = Data(count: byteCount)
+        data.withUnsafeMutableBytes { destination in
+          guard let destinationBase = destination.baseAddress else { return }
+          memcpy(destinationBase, UnsafeRawPointer(floatData[0]), byteCount)
+        }
+        return WorkerNativeAudioCaptureChunk(
+          data: data,
+          sampleRate: buffer.format.sampleRate,
+          channelCount: UInt32(channelCount),
+          bitsPerSample: 32,
+          wavFormat: 3,
+          frameCount: UInt32(frameCount)
+        )
       } else {
-        for frameIndex in 0..<frameCount {
-          for channelIndex in 0..<channelCount {
-            samples.append(floatData[channelIndex][frameIndex])
+        let totalSampleCount = frameCount * channelCount
+        var samples = [Float](repeating: 0, count: totalSampleCount)
+        samples.withUnsafeMutableBufferPointer { destination in
+          guard let destinationBase = destination.baseAddress else { return }
+          for frameIndex in 0..<frameCount {
+            for channelIndex in 0..<channelCount {
+              destinationBase[frameIndex * channelCount + channelIndex] = floatData[channelIndex][frameIndex]
+            }
           }
         }
+        let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
+        return WorkerNativeAudioCaptureChunk(
+          data: data,
+          sampleRate: buffer.format.sampleRate,
+          channelCount: UInt32(channelCount),
+          bitsPerSample: 32,
+          wavFormat: 3,
+          frameCount: UInt32(frameCount)
+        )
       }
-      let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
-      return WorkerNativeAudioCaptureChunk(
-        data: data,
-        sampleRate: buffer.format.sampleRate,
-        channelCount: UInt32(channelCount),
-        bitsPerSample: 32,
-        wavFormat: 3
-      )
 
     case .pcmFormatInt16:
       guard let int16Data = buffer.int16ChannelData else { return nil }
-      var samples = [Int16]()
-      samples.reserveCapacity(frameCount * channelCount)
       if buffer.format.isInterleaved {
         let totalSampleCount = frameCount * channelCount
-        samples.append(contentsOf: UnsafeBufferPointer(start: int16Data[0], count: totalSampleCount))
+        let byteCount = totalSampleCount * MemoryLayout<Int16>.stride
+        var data = Data(count: byteCount)
+        data.withUnsafeMutableBytes { destination in
+          guard let destinationBase = destination.baseAddress else { return }
+          memcpy(destinationBase, UnsafeRawPointer(int16Data[0]), byteCount)
+        }
+        return WorkerNativeAudioCaptureChunk(
+          data: data,
+          sampleRate: buffer.format.sampleRate,
+          channelCount: UInt32(channelCount),
+          bitsPerSample: 16,
+          wavFormat: 1,
+          frameCount: UInt32(frameCount)
+        )
       } else {
-        for frameIndex in 0..<frameCount {
-          for channelIndex in 0..<channelCount {
-            samples.append(int16Data[channelIndex][frameIndex])
+        let totalSampleCount = frameCount * channelCount
+        var samples = [Int16](repeating: 0, count: totalSampleCount)
+        samples.withUnsafeMutableBufferPointer { destination in
+          guard let destinationBase = destination.baseAddress else { return }
+          for frameIndex in 0..<frameCount {
+            for channelIndex in 0..<channelCount {
+              destinationBase[frameIndex * channelCount + channelIndex] = int16Data[channelIndex][frameIndex]
+            }
           }
         }
+        let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
+        return WorkerNativeAudioCaptureChunk(
+          data: data,
+          sampleRate: buffer.format.sampleRate,
+          channelCount: UInt32(channelCount),
+          bitsPerSample: 16,
+          wavFormat: 1,
+          frameCount: UInt32(frameCount)
+        )
       }
-      let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
-      return WorkerNativeAudioCaptureChunk(
-        data: data,
-        sampleRate: buffer.format.sampleRate,
-        channelCount: UInt32(channelCount),
-        bitsPerSample: 16,
-        wavFormat: 1
-      )
 
     default:
       return nil

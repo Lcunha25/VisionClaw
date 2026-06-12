@@ -441,6 +441,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     let channelCount: UInt32
     let bitsPerSample: UInt32
     let wavFormat: UInt16
+    let frameCount: UInt32
     let hostTime: CFTimeInterval
   }
 
@@ -543,6 +544,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
           channelCount: chunk.channelCount,
           bitsPerSample: chunk.bitsPerSample,
           wavFormat: chunk.wavFormat,
+          frameCount: chunk.frameCount,
           hostTime: hostTime
         )
       )
@@ -868,9 +870,22 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     guard let firstChunk = chunks.first else { return Data() }
     var data = Data()
     for chunk in chunks where nativeAudioFormatMatches(chunk, firstChunk) {
-      data.append(chunk.data)
+      data.append(frameAlignedNativeData(from: chunk))
     }
     return data
+  }
+
+  private static func frameAlignedNativeData(from chunk: NativeAudioChunk) -> Data {
+    let byteCountPerFrame = Int(chunk.channelCount * chunk.bitsPerSample / 8)
+    guard byteCountPerFrame > 0 else { return Data() }
+
+    let expectedByteCount = Int(chunk.frameCount) * byteCountPerFrame
+    let alignedByteCount = min(chunk.data.count, expectedByteCount)
+    guard alignedByteCount > 0 else { return Data() }
+
+    let completeFrameByteCount = alignedByteCount - (alignedByteCount % byteCountPerFrame)
+    guard completeFrameByteCount > 0 else { return Data() }
+    return chunk.data.prefix(completeFrameByteCount)
   }
 
   private static func nativeAudioFormatMatches(_ left: NativeAudioChunk, _ right: NativeAudioChunk) -> Bool {
@@ -1010,7 +1025,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
 
     if chunk.wavFormat == 3, chunk.bitsPerSample == 32 {
       let totalSampleCount = chunk.data.count / MemoryLayout<Float>.size
-      let frameCount = totalSampleCount / channelCount
+      let frameCount = min(Int(chunk.frameCount), totalSampleCount / channelCount)
       guard frameCount > 0 else { return [] }
       return chunk.data.withUnsafeBytes { rawBuffer in
         guard let baseAddress = rawBuffer.bindMemory(to: Float.self).baseAddress else { return [] }
@@ -1026,7 +1041,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
 
     if chunk.wavFormat == 1, chunk.bitsPerSample == 16 {
       let totalSampleCount = chunk.data.count / MemoryLayout<Int16>.size
-      let frameCount = totalSampleCount / channelCount
+      let frameCount = min(Int(chunk.frameCount), totalSampleCount / channelCount)
       guard frameCount > 0 else { return [] }
       return chunk.data.withUnsafeBytes { rawBuffer in
         guard let baseAddress = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return [] }
@@ -1209,7 +1224,10 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
 
     let sampleRateValue = UInt32(sampleRate.rounded())
     let byteRate = sampleRateValue * UInt32(blockAlign)
-    let dataSize = UInt32(data.count)
+    let alignedDataSize = data.count - (data.count % Int(blockAlign))
+    guard alignedDataSize > 0, alignedDataSize <= Int(UInt32.max - 44) else { return nil }
+    let audioData = data.prefix(alignedDataSize)
+    let dataSize = UInt32(alignedDataSize)
 
     var wav = Data()
     wav.append(contentsOf: "RIFF".utf8)
@@ -1225,7 +1243,7 @@ private final class SopConversationAudioRecorder: @unchecked Sendable {
     appendLittleEndian(bitsPerSampleValue, to: &wav)
     wav.append(contentsOf: "data".utf8)
     appendLittleEndian(dataSize, to: &wav)
-    wav.append(data)
+    wav.append(audioData)
 
     do {
       try wav.write(to: outputURL, options: .atomic)
@@ -6547,6 +6565,13 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  private func audioRouteMode(for mode: StreamingMode) -> StreamingMode {
+    if mode == .glasses, SettingsManager.shared.phoneAudioForGlassesDemoEnabled {
+      return .iPhone
+    }
+    return mode
+  }
+
   private func stopCurrentCameraTransportOnly() async {
     switch streamingMode {
     case .iPhone:
@@ -6625,13 +6650,14 @@ class StreamSessionViewModel: ObservableObject {
       return webrtcViewModel.refreshSupportAudioRoute(captureMode: mode)
     }
 
+    let routeMode = audioRouteMode(for: mode)
     let owner: WorkerAudioRouteOwner =
       reason == .holdToTalk
         ? .holdToTalk
         : .viewer
     let snapshot = try WorkerAudioRouteCoordinator.shared.acquire(
       owner: owner,
-      mode: mode,
+      mode: routeMode,
       reason: reason == .holdToTalk ? "hold_to_talk" : "live_support",
       forceSpeaker: SettingsManager.shared.speakerOutputEnabled,
       preferredIOBufferDuration: 0.02

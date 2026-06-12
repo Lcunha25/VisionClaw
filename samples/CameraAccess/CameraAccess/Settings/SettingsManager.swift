@@ -26,6 +26,7 @@ final class SettingsManager {
     case signalBaseURL
     case webrtcSignalingURL
     case speakerOutputEnabled
+    case phoneAudioForGlassesDemoEnabled
     case videoStreamingEnabled
     case videoStreamingDefaultMigratedToOnDemand
     case proactiveNotificationsEnabled
@@ -166,6 +167,11 @@ final class SettingsManager {
     set { defaults.set(newValue, forKey: Key.speakerOutputEnabled.rawValue) }
   }
 
+  var phoneAudioForGlassesDemoEnabled: Bool {
+    get { defaults.bool(forKey: Key.phoneAudioForGlassesDemoEnabled.rawValue) }
+    set { defaults.set(newValue, forKey: Key.phoneAudioForGlassesDemoEnabled.rawValue) }
+  }
+
   // MARK: - Video
 
   var videoStreamingEnabled: Bool {
@@ -185,7 +191,7 @@ final class SettingsManager {
   func resetAll() {
     for key in [Key.workerLoginCode, .workerLoginCodeMigratedFromFastFoodDefault, .workerEmail, .opsBaseURL, .adminBaseURL, .signalBaseURL,
                 .webrtcSignalingURL,
-                .deviceID, .speakerOutputEnabled, .videoStreamingEnabled,
+                .deviceID, .speakerOutputEnabled, .phoneAudioForGlassesDemoEnabled, .videoStreamingEnabled,
                 .proactiveNotificationsEnabled] {
       defaults.removeObject(forKey: key.rawValue)
     }

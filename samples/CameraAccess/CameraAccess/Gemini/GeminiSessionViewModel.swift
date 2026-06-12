@@ -47,6 +47,13 @@ class GeminiSessionViewModel: ObservableObject {
   var onNativeInputAudioChunk: ((WorkerNativeAudioCaptureChunk) -> Void)?
   var onOutputAudioChunk: ((Data) -> Void)?
 
+  private var effectiveAudioMode: StreamingMode {
+    if streamingMode == .glasses, SettingsManager.shared.phoneAudioForGlassesDemoEnabled {
+      return .iPhone
+    }
+    return streamingMode
+  }
+
   init() {
     audioManager.setResetRestartAuthorization { [weak self] in
       guard let self else { return false }
@@ -90,7 +97,7 @@ class GeminiSessionViewModel: ObservableObject {
     startStateObservation()
 
     do {
-      try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
+      try audioManager.setupAudioSession(useIPhoneMode: effectiveAudioMode == .iPhone)
     } catch {
       sessionIntent = .idle
       await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
@@ -193,7 +200,7 @@ class GeminiSessionViewModel: ObservableObject {
       Task { @MainActor in
         guard self.isGeminiActive, !self.isStoppingSession else { return }
         let modelSpeaking = self.geminiService.isModelSpeaking
-        let speakerOnPhone = self.streamingMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
+        let speakerOnPhone = self.effectiveAudioMode == .iPhone || SettingsManager.shared.speakerOutputEnabled
         if speakerOnPhone && modelSpeaking { return }
         self.geminiService.sendAudio(data: data)
         if !modelSpeaking {
@@ -417,7 +424,7 @@ class GeminiSessionViewModel: ObservableObject {
     startStateObservation()
 
     do {
-      try audioManager.setupAudioSession(useIPhoneMode: streamingMode == .iPhone)
+      try audioManager.setupAudioSession(useIPhoneMode: effectiveAudioMode == .iPhone)
     } catch {
       if resetOnFailure {
         await resetToIdle(message: "Audio setup failed: \(error.localizedDescription)")
